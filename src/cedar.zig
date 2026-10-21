@@ -1051,56 +1051,33 @@ fn clamp01(v: f32) f32 {
 /// the covered area of every column: each piece adds full height for the
 /// columns past it and the far pieces cancel, which is why no sort is needed
 /// and why holes (opposite `dir`) fall out for free.
-fn colArea(xa: f32, ya: f32, xb: f32, yb: f32, c: f32) f32 {
+/// Integral of clamp(c + 1 - x(y), 0, 1) over [ya, yb] for a straight edge.
+///
+/// Substituting u = c + 1 - x turns the integrand into clamp(u, 0, 1), and
+/// substituting v = u turns the integral into an area under a clamped ramp --
+/// whose antiderivative needs no division and does not care how many times u
+/// crosses 0 or 1. That is what the piecewise-with-breakpoints version was
+/// buying with three divisions and a sort per column.
+///
+/// `inv_k` is dy/dx for the whole line, which is constant, so it is hoisted
+/// out of the column loop by the caller rather than recomputed here.
+inline fn colArea(xa: f32, ya: f32, xb: f32, yb: f32, c: f32, inv_k: f32) f32 {
     const dy = yb - ya;
     if (dy <= 0) return 0;
-
-    const dx = xb - xa;
-    if (@abs(dx) < 1e-9) return clamp01(c + 1 - @max(xa, c)) * dy;
-
-    const k = dx / dy;
-
-    // f(y) = clamp(c+1 - max(x(y), c), 0, 1) is piecewise linear, changing
-    // slope only where x(y) crosses c or c+1. Split there and the trapezoid
-    // rule is exact.
-    var ys: [4]f32 = undefined;
-    var n: usize = 0;
-    ys[n] = ya;
-    n += 1;
-    for ([_]f32{ c, c + 1 }) |level| {
-        const y = ya + (level - xa) / k;
-        if (y > ya and y < yb) {
-            ys[n] = y;
-            n += 1;
-        }
-    }
-    ys[n] = yb;
-    n += 1;
-
-    var i: usize = 1;
-    while (i < n) : (i += 1) {
-        var j = i;
-        while (j > 0 and ys[j - 1] > ys[j]) : (j -= 1) {
-            const t = ys[j - 1];
-            ys[j - 1] = ys[j];
-            ys[j] = t;
-        }
-    }
-
-    var total: f32 = 0;
-    i = 1;
-    while (i < n) : (i += 1) {
-        const p = ys[i - 1];
-        const q = ys[i];
-        if (q <= p) continue;
-        const fp = clamp01(c + 1 - @max(xa + (p - ya) * k, c));
-        const fq = clamp01(c + 1 - @max(xa + (q - ya) * k, c));
-        total += (fp + fq) * 0.5 * (q - p);
-    }
-    return total;
+    const ua = c + 1 - xa;
+    const ub = c + 1 - xb;
+    if (ub == ua) return clamp01(ua) * dy; // horizontal within this column
+    return -inv_k * (rampArea(ub) - rampArea(ua));
 }
 
-fn sweep(edges: []const Edge, w: u32, h: u32, scratch: []f32, coverage: []u8) GlyphError!void {
+/// Antiderivative of clamp(v, 0, 1) dv, from 0 to v.
+inline fn rampArea(v: f32) f32 {
+    if (v <= 0) return 0;
+    if (v >= 1) return v - 0.5;
+    return 0.5 * v * v;
+}
+
+fn sweep(edges: []Edge, w: u32, h: u32, scratch: []f32, coverage: []u8) GlyphError!void {
     // Two accumulators per row: the partial areas where an edge cuts a column,
     // and the tail an edge contributes to every column to its right.
     const need = @as(usize, w) * 2 + 2;
@@ -1111,31 +1088,64 @@ fn sweep(edges: []const Edge, w: u32, h: u32, scratch: []f32, coverage: []u8) Gl
 
     const wf: f32 = @floatFromInt(w);
     @memset(coverage, 0);
+    if (edges.len == 0) return;
 
-    var row: u32 = 0;
-    while (row < h) : (row += 1) {
+    // Sort by top edge (y is DOWN, so y0 is the top) so a row can stop as soon
+    // as it meets an edge that begins below it. Insertion sort: a glyph has
+    // tens of edges, they arrive nearly ordered, and this is once per glyph
+    // rather than once per row.
+    {
+        var i: usize = 1;
+        while (i < edges.len) : (i += 1) {
+            const e = edges[i];
+            var j = i;
+            while (j > 0 and edges[j - 1].y0 > e.y0) : (j -= 1) edges[j] = edges[j - 1];
+            edges[j] = e;
+        }
+    }
+
+    // Rows above and below every edge are already zero; walking them would
+    // clear the accumulators and scan the whole edge list to find nothing.
+    var bot = edges[0].y1;
+    for (edges) |e| bot = @max(bot, e.y1);
+    const row_lo: u32 = if (edges[0].y0 <= 0) 0 else @min(@as(u32, @intFromFloat(@floor(edges[0].y0))), h);
+    const row_hi: u32 = if (bot <= 0) 0 else @min(@as(u32, @intFromFloat(@ceil(bot))), h);
+
+    var start: usize = 0;
+    var row: u32 = row_lo;
+    while (row < row_hi) : (row += 1) {
         const y0: f32 = @floatFromInt(row);
         const y1 = y0 + 1;
         @memset(acc, 0);
         @memset(fill, 0);
 
-        for (edges) |e| {
-            if (e.y1 <= y0 or e.y0 >= y1) continue;
+        // An edge that ended above this row is done for every later row too.
+        while (start < edges.len and edges[start].y1 <= y0) : (start += 1) {}
+
+        var ei = start;
+        while (ei < edges.len) : (ei += 1) {
+            const e = edges[ei];
+            if (e.y0 >= y1) break; // sorted: nothing past here reaches this row
+            if (e.y1 <= y0) continue;
+
             const ya = @max(e.y0, y0);
             const yb = @min(e.y1, y1);
             if (ya >= yb) continue;
 
             const k = (e.x1 - e.x0) / (e.y1 - e.y0);
+            const inv_k = if (k != 0) 1 / k else 0;
             const xa = e.x0 + (ya - e.y0) * k;
             const xb = e.x0 + (yb - e.y0) * k;
             const s: f32 = if (e.dir > 0) 1 else -1;
             const xmax = @max(xa, xb);
 
             // Columns the edge may only partly cover.
-            var c = @max(@floor(@min(xa, xb)) - 1, 0);
-            const hi = @min(@ceil(xmax), wf);
+            const lo_f = @floor(@min(xa, xb)) - 1;
+            const hi_f = @min(@ceil(xmax), wf);
+            var c: usize = if (lo_f <= 0) 0 else @intFromFloat(lo_f);
+            const hi: usize = if (hi_f <= 0) 0 else @intFromFloat(hi_f);
             while (c < hi) : (c += 1) {
-                acc[@intFromFloat(c)] += s * colArea(xa, ya, xb, yb, c);
+                acc[c] += s * colArea(xa, ya, xb, yb, @floatFromInt(c), inv_k);
             }
 
             // Everything right of ceil(xmax) is covered for the edge's whole
@@ -1525,7 +1535,7 @@ test "sweep: a rectangle lands on half, full, half" {
 
     // Closed clockwise: down the right side at x=3.5, up the left at x=1.5.
     // Horizontals are omitted, as they contribute no area.
-    const edges = [_]Edge{
+    var edges = [_]Edge{
         .{ .x0 = 3.5, .y0 = 0, .x1 = 3.5, .y1 = 3, .dir = 1 },
         .{ .x0 = 1.5, .y0 = 0, .x1 = 1.5, .y1 = 3, .dir = -1 },
     };
@@ -1545,7 +1555,7 @@ test "sweep: a hole wound the other way cancels" {
     var cov: [5 * 2]u8 = undefined;
     var acc: [5 * 2 + 2]f32 = undefined;
 
-    const edges = [_]Edge{
+    var edges = [_]Edge{
         .{ .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 2, .dir = -1 }, // outer left
         .{ .x0 = 4, .y0 = 0, .x1 = 4, .y1 = 2, .dir = 1 }, // outer right
         .{ .x0 = 1, .y0 = 0, .x1 = 1, .y1 = 2, .dir = 1 }, // hole left
@@ -1596,7 +1606,7 @@ fn supersample(edges: []const Edge, w: usize, h: usize, n: usize, out: []u8) voi
 test "exact area agrees with brute-force supersampling on a triangle" {
     // Right triangle (1,1)-(12,1)-(1,12): the top edge is horizontal so it
     // drops out, leaving a slanted hypotenuse and one vertical side.
-    const edges = [_]Edge{
+    var edges = [_]Edge{
         .{ .x0 = 12, .y0 = 1, .x1 = 1, .y1 = 12, .dir = 1 }, // hypotenuse
         .{ .x0 = 1, .y0 = 1, .x1 = 1, .y1 = 12, .dir = -1 }, // vertical side
     };

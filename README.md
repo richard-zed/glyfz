@@ -39,9 +39,9 @@ What this is not, stated plainly so nothing below has to hedge:
   no colour fonts, no hinting, no vertical layout, no `post` table yet.
 - **Not better kerning.** Format 0, the same table stb reads, at parity with it.
   Formats 2 and 3, Apple's version 1, and GPOS are all absent.
-- **Not a faster rasteriser.** Parity at UI sizes, behind at display sizes. The
-  case for this library is the cache and the absence of an allocator, not the
-  sweep.
+- **Not a faster rasteriser.** Measured at parity at UI sizes and behind at
+  display sizes. The case for this library is the cache and the absence of an
+  allocator, not the sweep.
 - **"No allocator" is about ownership, not usage.** No `Allocator` parameter is
   taken; memory is still used, and sizing it is the caller's job (`needed()`).
 - **No silent substitution.** A malformed face is a typed error. GlyfZ never
@@ -98,20 +98,36 @@ while `OS/2` carries three, and on real faces they disagree: DejaVu Sans is
 1556/-492 typographic against 1901/-483 in `hhea`. Anything sizing a line by
 ascender-descender gets a different height depending on which pair it reads.
 
-## Scope, and what it is measured against
+## Scope
 
-The reference implementation is stb_truetype, vendored in `oracle/` purely so
-the suite can compare the two glyph by glyph. **stb is the reference, not the
-authority** -- where they disagree the OpenType spec decides, and the
-disagreement gets documented. Two exist: `cmap` format 4 applies `idDelta` to a
-value fetched through a non-zero `idRangeOffset` (stb returns it unchanged), and
-composite transforms are applied as given (stb multiplies by each column's norm,
-which squares a uniform scale). They agree on translate-only composites.
+`glyf`-based fonts, per the disclaimer above. The reference implementation
+during development was stb_truetype; **it is not vendored here**, so neither the
+differential nor the per-glyph comparison can be re-run from this repository.
+What they found is recorded below.
 
-## Verification
+Where the two disagreed, the OpenType spec decided, and the disagreement is
+documented rather than papered over. Two exist: `cmap` format 4 applies
+`idDelta` to a value fetched through a non-zero `idRangeOffset` (stb returns it
+unchanged), and composite transforms are applied as given (stb multiplies by
+each column's norm, which squares a uniform scale). They agree on translate-only
+composites.
 
-`zig build oracle -Dfont=<ttf>` compares against stb over a real face. On DejaVu
-Sans:
+## What was checked
+
+Two checks still in this repo:
+
+- **`zig build test`** -- the unit suite, 37 tests, no font file needed. The
+  coverage sweep is graded against brute-force supersampling and hand-computed
+  shapes, so it is never marked by its own algebra.
+- **`zig build fuzz -Dfont=<ttf>`** -- a truncated face at every 4000th byte,
+  plus 20,000 single-bit flips, deterministic. Every outcome has to be a scoped
+  error or a face that still behaves; a panic, an out-of-bounds read, a hang, or
+  a face that loads with no glyphs is a failure. Proven able to fail in both
+  directions: an impossible assertion turns it red, and running with no font
+  configured reports *skipped*, not passed.
+
+The third check was a glyph-by-glyph differential against stb_truetype on DejaVu
+Sans, run while stb was still vendored here:
 
 | check | result |
 |---|---|
@@ -122,24 +138,17 @@ Sans:
 | coverage, 37,140 rasterisations, 6.74M pixels | max delta 4/255, 0.01% of pixels differ by more than 2 |
 | kerning, 90,000 pairs (1,955 non-zero) | 0 mismatched |
 
-The comparisons are shown to be capable of failing, not assumed to pass: a
-one-unit box shift flags 6190/6190, a half-pixel phase shift drives coverage
-delta to 169, dropping the sweep's accumulator tail drives it to 255.
-
-`zig build fuzz -Dfont=<ttf>` is the other direction: a truncated face at every
-4000th byte, plus 20,000 single-bit flips, deterministic. Every outcome has to
-be a scoped error or a face that still behaves -- a panic, an out-of-bounds read,
-a hang, or a face that loads with no glyphs is a failure. It is shown to be able
-to fail in both directions too: an impossible assertion turns it red, and
-running it with no font configured reports *skipped*, not passed.
-
-Agreement with stb proves GlyfZ is not *different*. It does not prove GlyfZ is
-*right* -- which is why the spec, not the oracle, settles arguments.
+Those comparisons were shown to be capable of failing rather than assumed to
+pass: a one-unit box shift flagged 6190/6190, a half-pixel phase shift drove
+coverage delta to 169, and dropping the sweep's accumulator tail drove it to
+255. Agreement with stb proves GlyfZ is not *different*; it does not prove it is
+*right*, which is why the spec settles arguments.
 
 ## Measured cost
 
 Per glyph, ReleaseFast, 94 printable-ASCII glyphs, best of 40, three runs of the
-same binary (the spread is the honest precision):
+same binary (the spread is the honest precision). The stb column is from the
+same period as the differential above:
 
 | size | stb | glyfz raster | ratio | cache hit | vs stb |
 |---|---|---|---|---|---|
@@ -153,22 +162,28 @@ Read that honestly: the rasteriser is at parity at UI sizes and behind at
 display sizes. It is not faster than stb. The cache is where the win is, and it
 is a win stb cannot match at the call site, because stb has no cache at all.
 
+`zig build bench -Doptimize=ReleaseFast -Dfont=<ttf>` reproduces the raster,
+decode and cache columns, and nothing else, since there is no second
+implementation here to compare against.
+
 ## Build
 
 ```sh
 zig build                                     # compile
 zig build test                                # unit tests, no font needed
-zig build oracle -Dfont=/path/to/font.ttf     # differential against stb
-zig build bench  -Doptimize=ReleaseFast -Dfont=/path/to/font.ttf
-zig build fuzz   -Dfont=/path/to/font.ttf     # malformed input: rejected, never faulted
+zig build bench -Doptimize=ReleaseFast -Dfont=/path/to/font.ttf
+zig build fuzz  -Dfont=/path/to/font.ttf      # malformed input: rejected, never faulted
 ```
 
-No font is vendored, so the oracle, the bench and the fuzz step all need
-`-Dfont=` (or `GLYFZ_TEST_FONT` / `GLYFZ_BENCH_FONT`). Aim them at an awkward face
-on purpose.
+No font is vendored, so `bench` and `fuzz` both need `-Dfont=` (or
+`GLYFZ_BENCH_FONT` / `GLYFZ_TEST_FONT`). Aim them at an awkward face on purpose.
 
 ## Known gaps
 
+- **The external check is not reproducible here.** The differential and the
+  comparison numbers came from a harness against stb_truetype that no longer
+  ships in this repo. The unit suite and the fuzz sweeps are what a cloner can
+  run.
 - **No font selection.** `name` gives you the family string; finding a *file*
   with that family, and chaining to the next one when this face lacks a
   codepoint, is the caller's job. `hasCodepoint` answers the question a chain
@@ -177,13 +192,13 @@ on purpose.
   is a bump allocator, so filling it drops everything and `stats.flushes` says
   so. One alphabet at one size is not a UI.
 - **Composite flags are not audited.** `USE_MY_METRICS`, `ROUND_XY_TO_GRID` and
-  the scaled/unscaled component offset rules are shared with stb, so the
-  differential cannot see them. They need their own tests.
+  the scaled/unscaled component offset rules are shared with stb, so a
+  differential could not have seen them even when one was here. They need their
+  own tests.
 - **One consumer, reached by absolute path.** A Zig GUI toolkit links this from
   a machine-local path, which is not how anyone else would consume it. There is
   no published package.
 
 ## Licence
 
-MIT. See `LICENSE`. The vendored stb_truetype in `oracle/` is public domain or
-MIT at your option.
+MIT. See `LICENSE`.

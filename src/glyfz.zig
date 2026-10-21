@@ -1,4 +1,4 @@
-//! GlyfZ -- a TrueType rasteriser.
+//! GlyfZ -- a TrueType font parser and rasteriser.
 //!
 //! Reads `glyf`-based fonts, turns outlines into antialiased coverage masks,
 //! and keeps those masks between draws. It is not a shaper: no glyph
@@ -9,10 +9,11 @@
 //! 1. **No allocator and no IO.** The font is bytes the caller owns, and every
 //!    working buffer -- outlines, edges, coverage, and the glyph cache itself --
 //!    is the caller's too. Nothing here reaches outside them.
-//! 2. **The spec decides, not the reference.** `oracle/` carries stb_truetype as
-//!    a differential oracle. Where the two disagree the disagreement is a
-//!    finding to write down, not a bug in GlyfZ by default. Two are documented
-//!    at `cmapFormat4` and in the composite decoder.
+//! 2. **The spec decides, not the reference.** GlyfZ was developed against
+//!    stb_truetype as a differential oracle, which is no longer vendored here.
+//!    Where the two disagreed the disagreement is a finding to write down, not
+//!    a bug in GlyfZ by default. Two are documented at `cmapFormat4` and in the
+//!    composite decoder.
 //! 3. **Failures are scoped.** `LoadError` means discard the face;
 //!    `GlyphError` means this one glyph failed and the face is still good. GlyfZ
 //!    propagates both and never substitutes a glyph silently -- deciding to keep
@@ -729,8 +730,8 @@ pub const Font = struct {
 /// `idDelta` to the value fetched through `idRangeOffset`; stb returns the
 /// fetched value unchanged. On a font that combines a non-zero delta with a
 /// non-zero range offset the two disagree, and GlyfZ is the one following the
-/// spec. The oracle run reports that as a mismatch only if a font in test uses
-/// the combination; the synthetic test below pins our behaviour either way.
+/// spec. A differential run reports that as a mismatch only if a font in test
+/// uses the combination; the synthetic test below pins our behaviour either way.
 fn cmapFormat4(cm: []const u8, base: usize, cp: u21) GlyphError!u16 {
     if (cp > 0xFFFF) return 0;
     const c: u16 = @intCast(cp);

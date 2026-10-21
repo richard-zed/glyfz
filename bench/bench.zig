@@ -1,19 +1,14 @@
-//! GlyfZ vs stb_truetype, per glyph, as the call site actually pays for it.
+//! GlyfZ per glyph, as a call site actually pays for it.
 //!
-//! The claim this project rests on is that rasterising into a caller's buffer
-//! beats the malloc/free pair stb does per glyph per draw. That claim was
-//! unmeasured until this file existed, so this measures the real call shapes:
-//! stbtt_GetGlyphBitmapSubpixel + stbtt_FreeBitmap on one side, one `raster`
-//! into reused buffers on the other.
+//! Three numbers per size over the same glyph set: a rasterisation into
+//! caller-owned buffers, the decode-and-flatten half of it (so the gap is the
+//! coverage sweep), and a cache hit. The hit is the number the library is built
+//! around -- a hash lookup and a slice, against a full rasterise otherwise.
 //!
 //! ReleaseFast only. Debug numbers are ~10x worse and mean nothing here.
 
 const std = @import("std");
 const glyfz = @import("glyfz");
-
-const c = @cImport({
-    @cInclude("stb_truetype.h");
-});
 
 fn readFont(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -40,8 +35,6 @@ pub fn main() !void {
     defer gpa.free(data);
 
     const font = try glyfz.Font.init(data);
-    var info: c.stbtt_fontinfo = undefined;
-    if (c.stbtt_InitFont(&info, data.ptr, 0) == 0) return error.BadFont;
 
     // The glyphs a text run actually touches: printable ASCII through the font's
     // own cmap, so this is the mix a UI draws rather than a hand-picked best case.
@@ -67,26 +60,19 @@ pub fn main() !void {
     var cbuf: [1 << 21]u8 align(8) = undefined;
     var cache = try glyfz.Cache.init(&cbuf, .{ .arena = 1 << 20 });
 
-    std.debug.print("{d} glyphs from printable ASCII\n\n", .{n});
-    std.debug.print("{s:>6} {s:>11} {s:>11} {s:>11} {s:>8} {s:>11} {s:>9}\n", .{ "size", "stb ns", "glyfz ns", "decode ns", "ratio", "cached ns", "vs stb" });
+    std.debug.print("{d} glyphs from printable ASCII, {d} units per em\n\n", .{ n, font.units_per_em });
+    std.debug.print("{s:>6} {s:>11} {s:>11} {s:>11} {s:>9}\n", .{ "size", "raster ns", "decode ns", "cached ns", "raster/hit" });
 
     for ([_]u32{ 11, 16, 24, 34, 48 }) |size| {
         const scale = @as(f32, @floatFromInt(size)) / span;
         const reps: u32 = 40;
 
-        var best_stb: i128 = std.math.maxInt(i128);
-        var best_glyfz: i128 = std.math.maxInt(i128);
+        var best_raster: i128 = std.math.maxInt(i128);
         var best_decode: i128 = std.math.maxInt(i128);
 
-        // Warm both paths first: the first call loads caches and, for stb, the
-        // allocator's arenas.
+        // Warm first: the first call touches nothing reusable but pays for
+        // branch prediction and page faults on the buffers.
         for (glyphs[0..n]) |gid| {
-            var w: c_int = 0;
-            var h: c_int = 0;
-            var xo: c_int = 0;
-            var yo: c_int = 0;
-            const bmp = c.stbtt_GetGlyphBitmapSubpixel(&info, scale, scale, 0, 0, gid, &w, &h, &xo, &yo);
-            if (bmp != null) c.stbtt_FreeBitmap(bmp, null);
             _ = font.raster(gid, scale, 0, &pts, &ends, &edges, &scratch, &cov) catch continue;
         }
 
@@ -94,26 +80,14 @@ pub fn main() !void {
         while (r < reps) : (r += 1) {
             var t0 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
             for (glyphs[0..n]) |gid| {
-                var w: c_int = 0;
-                var h: c_int = 0;
-                var xo: c_int = 0;
-                var yo: c_int = 0;
-                const bmp = c.stbtt_GetGlyphBitmapSubpixel(&info, scale, scale, 0, 0, gid, &w, &h, &xo, &yo);
-                if (bmp != null) c.stbtt_FreeBitmap(bmp, null);
-            }
-            var t1 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
-            best_stb = @min(best_stb, t1 - t0);
-
-            t0 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
-            for (glyphs[0..n]) |gid| {
                 _ = font.raster(gid, scale, 0, &pts, &ends, &edges, &scratch, &cov) catch continue;
             }
-            t1 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
-            best_glyfz = @min(best_glyfz, t1 - t0);
+            var t1 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+            best_raster = @min(best_raster, t1 - t0);
 
             // Everything up to and including the flattened edges. The gap to
-            // `glyfz ns` is the coverage sweep, which tells us which half to
-            // fix instead of guessing.
+            // `raster ns` is the coverage sweep, which says which half to fix
+            // instead of guessing.
             t0 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
             for (glyphs[0..n]) |gid| {
                 const box = font.bitmapBox(gid, scale, 0) catch continue;
@@ -123,8 +97,6 @@ pub fn main() !void {
             best_decode = @min(best_decode, t1 - t0);
         }
 
-        const per_stb = @as(f64, @floatFromInt(best_stb)) / @as(f64, @floatFromInt(n));
-        const per_glyfz = @as(f64, @floatFromInt(best_glyfz)) / @as(f64, @floatFromInt(n));
         // Cached: warm the whole set (every one a miss), then time pure hits.
         const ppem: u16 = @intFromFloat(@round(scale * @as(f32, @floatFromInt(font.units_per_em))));
         for (glyphs[0..n]) |gid| _ = cache.mask(font, gid, ppem, .zero) catch continue;
@@ -137,9 +109,14 @@ pub fn main() !void {
             const t1 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
             best_cached = @min(best_cached, t1 - t0);
         }
-        const per_cached = @as(f64, @floatFromInt(best_cached)) / @as(f64, @floatFromInt(n));
 
-        const per_decode = @as(f64, @floatFromInt(best_decode)) / @as(f64, @floatFromInt(n));
-        std.debug.print("{d:>6} {d:>11.1} {d:>11.1} {d:>11.1} {d:>7.2}x {d:>11.1} {d:>8.1}x\n", .{ size, per_stb, per_glyfz, per_decode, per_stb / per_glyfz, per_cached, per_stb / per_cached });
+        const denom: f64 = @floatFromInt(n);
+        const per_raster = @as(f64, @floatFromInt(best_raster)) / denom;
+        const per_decode = @as(f64, @floatFromInt(best_decode)) / denom;
+        const per_cached = @as(f64, @floatFromInt(best_cached)) / denom;
+        std.debug.print("{d:>6} {d:>11.1} {d:>11.1} {d:>11.1} {d:>8.1}x\n", .{ size, per_raster, per_decode, per_cached, per_raster / per_cached });
     }
+
+    const s = cache.stats;
+    std.debug.print("\ncache: {d} hits, {d} misses, {d} flushes\n", .{ s.hits, s.misses, s.flushes });
 }

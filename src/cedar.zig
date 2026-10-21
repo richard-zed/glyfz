@@ -164,6 +164,7 @@ fn tag(comptime s: *const [4]u8) u32 {
 }
 
 const tag_cmap = tag("cmap");
+const tag_kern = tag("kern");
 const tag_head = tag("head");
 const tag_hhea = tag("hhea");
 const tag_hmtx = tag("hmtx");
@@ -174,6 +175,9 @@ const tag_loca = tag("loca");
 /// One loaded face. Borrows the bytes; they must outlive it.
 pub const Font = struct {
     data: []const u8 = &.{},
+    kern_span: Span = .{},
+    kern_ok: bool = false,
+    kern_tables: u16 = 0,
     units_per_em: u16 = 0,
     num_glyphs: u16 = 0,
     ascender: i16 = 0,
@@ -223,6 +227,7 @@ pub const Font = struct {
             const t = try u32At(bytes, rec);
             const span = Span{ .off = try u32At(bytes, rec + 8), .len = try u32At(bytes, rec + 12) };
             if (t == tag_cmap) self.cmap = span;
+            if (t == tag_kern) self.kern_span = span;
             if (t == tag_head) self.head = span;
             if (t == tag_hhea) self.hhea = span;
             if (t == tag_hmtx) self.hmtx = span;
@@ -291,6 +296,7 @@ pub const Font = struct {
         self.cmap_format = try self.selectCmap();
         if (self.cmap_format != 4 and self.cmap_format != 12) return error.UnsupportedCmap;
         try self.validateCmap();
+        self.kern_ok = self.validateKern();
 
         return self;
     }
@@ -311,6 +317,94 @@ pub const Font = struct {
     /// because a well-formed font lists it later. The alternative -- scoring
     /// records -- would pick a different subtable on some fonts and move text
     /// on a swap, for no gain.
+    /// True when the font carries a `kern` table Cedar could read. An absent
+    /// or malformed one is not an error -- kerning is decoration, and refusing
+    /// an otherwise good font over it would be worse -- but it is REPORTABLE,
+    /// so a caller can say so instead of wondering why text looks loose.
+    pub fn kerning(self: Font) bool {
+        return self.kern_ok;
+    }
+
+    /// Kerning adjustment between two glyphs, in FONT UNITS. Zero when the
+    /// font has no kern table, when this pair has no entry, or when the table
+    /// could not be validated.
+    ///
+    /// Format 0 only, which is what stb_truetype reads: modern fonts put most
+    /// kerning in GPOS instead, so a zero here does not mean the designer
+    /// intended no adjustment -- it means there is nothing this table can say.
+    pub fn kern(self: Font, left: u16, right: u16) i16 {
+        if (!self.kern_ok) return 0;
+        const kv: u32 = (@as(u32, left) << 16) | right;
+        var i: usize = 0;
+        while (i < self.kern_tables) : (i += 1) {
+            const at = self.kern_subtable(i) orelse return 0;
+            const pairs = at + 14;
+            const n = u16At(self.data, at + 6) catch return 0;
+
+            var lo: u32 = 0;
+            var hi: u32 = n;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const rec = pairs + @as(usize, mid) * 6;
+                const l = u16At(self.data, rec) catch return 0;
+                const r = u16At(self.data, rec + 2) catch return 0;
+                const key: u32 = (@as(u32, l) << 16) | r;
+                if (key < kv) {
+                    lo = mid + 1;
+                } else if (key > kv) {
+                    hi = mid;
+                } else {
+                    return i16At(self.data, rec + 4) catch 0;
+                }
+            }
+        }
+        return 0;
+    }
+
+    /// Offset of the nth `kern` subtable body, skipping any we do not read.
+    fn kern_subtable(self: Font, n: usize) ?usize {
+        var at: usize = self.kern_span.off + 4;
+        var seen: usize = 0;
+        var i: usize = 0;
+        while (i < self.kern_tables) : (i += 1) {
+            const len = u16At(self.data, at + 2) catch return null;
+            if (len < 6) return null;
+            if (seen == n) return at;
+            seen += 1;
+            at += len;
+        }
+        return null;
+    }
+
+    /// Walks the `kern` table once at load so a per-glyph lookup cannot read
+    /// outside it. Returns whether anything here is trustworthy.
+    fn validateKern(self: *Font) bool {
+        if (self.kern_span.len == 0) return false;
+        const version = u16At(self.data, self.kern_span.off) catch return false;
+        // Apple's version 1 layout is different and is not read here.
+        if (version != 0) return false;
+        const n = u16At(self.data, self.kern_span.off + 2) catch return false;
+        if (n == 0) return false;
+        self.kern_tables = n;
+
+        const end = @as(usize, self.kern_span.off) + self.kern_span.len;
+        var at: usize = self.kern_span.off + 4;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const len = u16At(self.data, at + 2) catch return false;
+            if (len < 6 or at + len > end) return false;
+            const coverage = u16At(self.data, at + 4) catch return false;
+            const format = coverage >> 8;
+            // Horizontal kerning only; format 0 is the only layout we read.
+            if (format == 0 and (coverage & 0x1) != 0) {
+                const pairs = u16At(self.data, at + 6) catch return false;
+                if (at + 14 + @as(usize, pairs) * 6 > at + len) return false;
+            }
+            at += len;
+        }
+        return true;
+    }
+
     /// Check the chosen subtable's own arrays fit before any lookup can walk
     /// them, so a font we cannot map fails at load rather than per glyph.
     fn validateCmap(self: Font) LoadError!void {

@@ -369,3 +369,36 @@ test "the coverage comparison notices a half-pixel shift" {
     try std.testing.expect(glyphs > 100);
     try std.testing.expect(max_delta > 20);
 }
+
+test "kerning matches stb_truetype" {
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.open(gpa);
+    defer fx.close();
+
+    try std.testing.expect(fx.font.kerning());
+
+    const n: u16 = @min(fx.font.num_glyphs, 300);
+    var checked: usize = 0;
+    var nonzero: usize = 0;
+    var bad: usize = 0;
+
+    var a: u16 = 0;
+    while (a < n) : (a += 1) {
+        var b: u16 = 0;
+        while (b < n) : (b += 1) {
+            const ours: i32 = fx.font.kern(a, b);
+            const theirs: i32 = c.stbtt_GetGlyphKernAdvance(&fx.info, a, b);
+            checked += 1;
+            if (theirs != 0) nonzero += 1;
+            if (ours != theirs) {
+                if (bad < 10) std.debug.print("kern ({d},{d}): cedar {d}, stb {d}\n", .{ a, b, ours, theirs });
+                bad += 1;
+            }
+        }
+    }
+
+    std.debug.print("kern: {d} pairs compared, {d} nonzero, {d} mismatched\n", .{ checked, nonzero, bad });
+    // The comparison has to include real kerning or it proves nothing.
+    try std.testing.expect(nonzero > 100);
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}

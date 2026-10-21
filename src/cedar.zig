@@ -33,6 +33,8 @@ pub const Error = error{
     UnsupportedCmap,
     /// A glyph id at or past `num_glyphs`.
     UnknownGlyph,
+    /// A collection was asked for a face past its end.
+    UnknownFontIndex,
     /// A composite glyph whose components are placed by matching points
     /// rather than by an offset. Rare; v1 does not decode it.
     UnsupportedComposite,
@@ -41,6 +43,11 @@ pub const Error = error{
     /// Composite glyphs nested deeper than `max_composite_depth`.
     CompositeTooDeep,
 };
+
+/// Worst-case decode sizes the font declares, so a caller can size scratch
+/// once instead of guessing. Zero for a `maxp` 0.5 font, which does not carry
+/// them -- and they are SIMPLE glyph maxima, so composites can exceed them.
+pub const Limits = struct { max_points: u16, max_contours: u16 };
 
 /// Vertical metrics in FONT UNITS. Scaling to pixels is the caller's job,
 /// because the divisor is a policy choice (see `unitsPerEm`).
@@ -164,19 +171,32 @@ pub const Font = struct {
     /// Parse the table directory and the metrics a caller needs up front.
     /// Fails loudly: a font Cedar cannot read should not silently measure zero.
     pub fn init(bytes: []const u8) Error!Font {
-        const sfnt = try u32At(bytes, 0);
-        switch (sfnt) {
+        return initIndex(bytes, 0);
+    }
+
+    /// Same, for the Nth face of a font collection (`.ttc`). The existing
+    /// backend asks stb for index 0 of every file, so a collection is a file
+    /// users can already point at and Cedar refused.
+    pub fn initIndex(bytes: []const u8, index: u32) Error!Font {
+        var base: usize = 0;
+        const v = try u32At(bytes, 0);
+        switch (v) {
             0x0001_0000, tag("true") => {},
+            tag("ttcf") => {
+                const count = try u32At(bytes, 8);
+                if (index >= count) return error.UnknownFontIndex;
+                base = try u32At(bytes, 12 + @as(usize, index) * 4);
+            },
             tag("OTTO") => return error.CffNotSupported,
             else => return error.NotSfnt,
         }
 
         var self: Font = .{ .data = bytes };
-        const n = try u16At(bytes, 4);
+        const n = try u16At(bytes, base + 4);
 
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            const rec = 12 + i * 16;
+            const rec = base + 12 + i * 16;
             const t = try u32At(bytes, rec);
             const span = Span{ .off = try u32At(bytes, rec + 8), .len = try u32At(bytes, rec + 12) };
             if (t == tag_cmap) self.cmap = span;
@@ -284,6 +304,14 @@ pub const Font = struct {
         var cur = Cursor{ .points = points, .ends = ends };
         try decodeInto(self, gid, &cur, 0);
         return .{ .points = points[0..cur.n], .ends = ends[0..cur.nc] };
+    }
+
+    /// What `maxp` says about the biggest glyph, for sizing caller scratch.
+    pub fn limits(self: Font) Error!Limits {
+        const data = try self.slice(self.maxp);
+        const version = try u32At(data, 0);
+        if (version < 0x0001_0000) return .{ .max_points = 0, .max_contours = 0 };
+        return .{ .max_points = try u16At(data, 6), .max_contours = try u16At(data, 8) };
     }
 
     /// The ink box the FONT DECLARES in the glyph header, or null for a blank
@@ -1408,4 +1436,38 @@ test "exact area agrees with brute-force supersampling on a triangle" {
     std.debug.print("triangle: worst delta {d}\n", .{worst});
     // 24x24 samples leave a little noise; a wrong integral would be far worse.
     try std.testing.expect(worst <= 6);
+}
+
+test "a font collection resolves its first face" {
+    // Wrap the synthetic font in a minimal ttcf header and check that the face
+    // inside is found at the recorded offset.
+    var inner: [2048]u8 = undefined;
+    const face = buildTestFont(&inner, false);
+
+    var buf: [4096]u8 = undefined;
+    @memset(&buf, 0);
+    w32(&buf, 0, tag("ttcf"));
+    w32(&buf, 4, 0x0001_0000); // version
+    w32(&buf, 8, 1); // numFonts
+    w32(&buf, 12, 16); // offset of face 0
+    @memcpy(buf[16 .. 16 + face.len], face);
+
+    // Table offsets inside a collection are file-relative, so shift each of the
+    // 7 records by the face's new position.
+    var i: usize = 0;
+    while (i < 7) : (i += 1) {
+        const at = 16 + 12 + i * 16 + 8;
+        w32(&buf, at, std.mem.readInt(u32, buf[at..][0..4], .big) + 16);
+    }
+
+    const f = try Font.init(buf[0 .. 16 + face.len]);
+    try std.testing.expectEqual(@as(u16, 1024), f.units_per_em);
+    try std.testing.expectError(error.UnknownFontIndex, Font.initIndex(buf[0 .. 16 + face.len], 1));
+}
+
+test "limits come from a maxp 1.0 table and are zero otherwise" {
+    var buf: [2048]u8 = undefined;
+    const f = try Font.init(buildTestFont(&buf, false));
+    // The synthetic font declares maxp 0.5, which has no such fields.
+    try std.testing.expectEqual(Limits{ .max_points = 0, .max_contours = 0 }, try f.limits());
 }

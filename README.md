@@ -99,6 +99,7 @@ zig build                                     # compile
 zig build test                                # unit tests, no font needed
 zig build oracle -Dfont=/path/to/font.ttf     # differential against stb
 zig build bench  -Doptimize=ReleaseFast -Dfont=/path/to/font.ttf
+zig build fuzz   -Dfont=/path/to/font.ttf     # malformed input: rejected, never faulted
 ```
 
 No font is vendored, so the oracle and the bench both need `-Dfont=` (or

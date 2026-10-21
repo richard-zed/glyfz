@@ -2,11 +2,15 @@
 
 A TrueType font parser and rasteriser for Zig 0.16. No allocator, glyph caching.
 
+## Disclaimer
+
+Basically everything here, outside of this disclaimer, and a bit more, was written by AI. 
+
+I'm using this for a UI library, didn't want to use the C dependency, kinda ported stb over to Zig. Removed the allocations in the library itself, added caching, and some other optimizations or attempts. And here we are. This has been used in that library already. With the cache hot, it performs better than stb. Cold, is a different story. The benchmark we have showed roughly parity. The real world comparison without caching was not as close. There were other issues though. I'm rambling. That's it. Hope you find this helpful.
+
 GlyfZ reads `glyf`-based fonts, turns outlines into antialiased coverage masks,
 and keeps those masks between draws. It is not a shaper: no glyph substitution,
 no fallback chain, no line breaking.
-
-<!-- Disclaimer goes here. Author-written. -->
 
 ```zig
 var font = try glyfz.Font.init(bytes);           // bytes are yours

@@ -20,8 +20,16 @@
 
 const std = @import("std");
 
-pub const Error = error{
-    /// A read ran past the end of the font.
+/// The only failure a bounds-checked reader can produce.
+const ReadError = error{Truncated};
+/// A table span that is absent or out of range: the only thing `slice` checks.
+const SpanError = error{ Truncated, MissingTable };
+
+/// Failures that mean the bytes will never work. Cedar has no second face to
+/// fall back to, so choosing another font is the caller's policy, not ours.
+pub const LoadError = error{
+    /// A read ran past the end of the font, or a table is shorter than the
+    /// fields the format defines for it.
     Truncated,
     /// Not an sfnt at all.
     NotSfnt,
@@ -31,18 +39,33 @@ pub const Error = error{
     MissingTable,
     /// No `cmap` subtable we can read (v1: formats 4 and 12).
     UnsupportedCmap,
-    /// A glyph id at or past `num_glyphs`.
-    UnknownGlyph,
     /// A collection was asked for a face past its end.
     UnknownFontIndex,
+    /// A field holds a value the format does not allow.
+    BadValue,
+};
+
+/// Failures confined to one glyph of an otherwise usable font: a caller can
+/// skip this glyph and keep drawing. A glyph is never silently substituted --
+/// a failure is visible, because an invisible missing character is worse.
+pub const GlyphError = error{
+    Truncated,
+    MissingTable,
+    /// A glyph id at or past `num_glyphs`.
+    UnknownGlyph,
     /// A composite glyph whose components are placed by matching points
     /// rather than by an offset. Rare; v1 does not decode it.
     UnsupportedComposite,
-    /// The caller's point or contour buffer is too small for this glyph.
+    /// The caller's point, contour, edge or coverage buffer is too small.
     BufferTooSmall,
-    /// Composite glyphs nested deeper than `max_composite_depth`.
+    /// Composite glyphs nested deeper than `max_composite_depth`, which is
+    /// what stops a font that references itself from eating the stack.
     CompositeTooDeep,
 };
+
+/// Everything either kind of call can return. Functions are declared with the
+/// narrower set so the compiler keeps them apart.
+pub const Error = LoadError || GlyphError;
 
 /// Worst-case decode sizes the font declares, so a caller can size scratch
 /// once instead of guessing. Zero for a `maxp` 0.5 font, which does not carry
@@ -170,14 +193,14 @@ pub const Font = struct {
 
     /// Parse the table directory and the metrics a caller needs up front.
     /// Fails loudly: a font Cedar cannot read should not silently measure zero.
-    pub fn init(bytes: []const u8) Error!Font {
+    pub fn init(bytes: []const u8) LoadError!Font {
         return initIndex(bytes, 0);
     }
 
     /// Same, for the Nth face of a font collection (`.ttc`). The existing
     /// backend asks stb for index 0 of every file, so a collection is a file
     /// users can already point at and Cedar refused.
-    pub fn initIndex(bytes: []const u8, index: u32) Error!Font {
+    pub fn initIndex(bytes: []const u8, index: u32) LoadError!Font {
         var base: usize = 0;
         const v = try u32At(bytes, 0);
         switch (v) {
@@ -211,8 +234,16 @@ pub const Font = struct {
         const head = try self.slice(self.head);
         const hhea = try self.slice(self.hhea);
         const maxp = try self.slice(self.maxp);
-        _ = try self.slice(self.hmtx);
+        const hmtx = try self.slice(self.hmtx);
         _ = try self.slice(self.glyf);
+
+        // Every field below is read at a fixed offset, so a table that is
+        // merely short would read into whatever follows it instead of failing.
+        // Lengths are checked against the format, not against "does the read
+        // stay inside the file".
+        if (head.len < 54) return error.Truncated;
+        if (hhea.len < 36) return error.Truncated;
+        if (maxp.len < 6) return error.Truncated;
 
         self.units_per_em = try u16At(head, 18);
         self.index_to_loc = try i16At(head, 50);
@@ -224,22 +255,47 @@ pub const Font = struct {
 
         if (self.units_per_em == 0) return error.MissingTable;
         if (self.num_hmetrics == 0) return error.MissingTable;
+        if (self.num_glyphs == 0) return error.BadValue;
+        // 0 is short `loca` (offsets in half-words), 1 is long. Anything else
+        // would make every glyph lookup read nonsense.
+        if (self.index_to_loc != 0 and self.index_to_loc != 1) return error.BadValue;
+        if (self.num_hmetrics > self.num_glyphs) return error.BadValue;
+
+        // Full advances for the first num_hmetrics glyphs, then one bearing each.
+        const hmtx_need = @as(usize, self.num_hmetrics) * 4 +
+            (@as(usize, self.num_glyphs) - self.num_hmetrics) * 2;
+        if (hmtx.len < hmtx_need) return error.Truncated;
 
         // `loca` is indexed up to num_glyphs inclusive. A table that is short
         // would let glyph lookups read into the next table, so check once here.
-        const loca_len = (try self.slice(self.loca)).len;
+        const loca = try self.slice(self.loca);
         const entry: usize = if (self.index_to_loc == 0) 2 else 4;
-        if (loca_len < (@as(usize, self.num_glyphs) + 1) * entry) return error.Truncated;
+        if (loca.len < (@as(usize, self.num_glyphs) + 1) * entry) return error.Truncated;
+
+        // Offsets must not go backwards: one that does makes a glyph's byte
+        // range invert, and every lookup after it is a guess.
+        var prev: u32 = 0;
+        var gi: usize = 0;
+        while (gi <= self.num_glyphs) : (gi += 1) {
+            const at: u32 = if (self.index_to_loc == 0)
+                @as(u32, try u16At(loca, gi * 2)) * 2
+            else
+                try u32At(loca, gi * 4);
+            if (at < prev) return error.Truncated;
+            if (@as(usize, at) > (try self.slice(self.glyf)).len) return error.Truncated;
+            prev = at;
+        }
 
         // Choose the character map once, so a font we cannot map fails at load
         // rather than per glyph.
         self.cmap_format = try self.selectCmap();
         if (self.cmap_format != 4 and self.cmap_format != 12) return error.UnsupportedCmap;
+        try self.validateCmap();
 
         return self;
     }
 
-    fn slice(self: Font, span: Span) Error![]const u8 {
+    fn slice(self: Font, span: Span) SpanError![]const u8 {
         if (span.len == 0) return error.MissingTable;
         const off: usize = span.off;
         const end = off + @as(usize, span.len);
@@ -255,7 +311,31 @@ pub const Font = struct {
     /// because a well-formed font lists it later. The alternative -- scoring
     /// records -- would pick a different subtable on some fonts and move text
     /// on a swap, for no gain.
-    fn selectCmap(self: *Font) Error!u16 {
+    /// Check the chosen subtable's own arrays fit before any lookup can walk
+    /// them, so a font we cannot map fails at load rather than per glyph.
+    fn validateCmap(self: Font) LoadError!void {
+        const cm = try self.slice(self.cmap);
+        if (cm.len < 2) return error.Truncated;
+        switch (self.cmap_format) {
+            4 => {
+                if (cm.len < 16) return error.Truncated;
+                const seg_x2 = try u16At(cm, 6);
+                if (seg_x2 == 0 or seg_x2 % 2 != 0) return error.BadValue;
+                // endCode, reservedPad, startCode, idDelta, idRangeOffset.
+                const need = 16 + @as(usize, seg_x2) * 4;
+                if (cm.len < need) return error.Truncated;
+            },
+            12 => {
+                if (cm.len < 16) return error.Truncated;
+                const n = try u32At(cm, 12);
+                const need = 16 + @as(usize, n) * 12;
+                if (cm.len < need) return error.Truncated;
+            },
+            else => return error.UnsupportedCmap,
+        }
+    }
+
+    fn selectCmap(self: *Font) LoadError!u16 {
         const cm = try self.slice(self.cmap);
         const n = try u16At(cm, 2);
         var chosen: ?u32 = null;
@@ -285,12 +365,13 @@ pub const Font = struct {
     }
 
     /// Glyph id for a codepoint. 0 means `.notdef`, per the format.
-    pub fn glyphIndex(self: Font, cp: u21) Error!u16 {
+    pub fn glyphIndex(self: Font, cp: u21) GlyphError!u16 {
         const cm = try self.slice(self.cmap);
         return switch (self.cmap_format) {
             4 => cmapFormat4(cm, 0, cp),
             12 => cmapFormat12(cm, 0, cp),
-            else => error.UnsupportedCmap,
+            // init refuses anything else, so this cannot be reached.
+            else => unreachable,
         };
     }
 
@@ -299,7 +380,7 @@ pub const Font = struct {
     /// No allocation anywhere: `points` and `ends` are scratch the caller
     /// owns and reuses. A blank glyph (or one with no contours) decodes to an
     /// empty outline rather than an error, because that is a legal glyph.
-    pub fn outline(self: Font, gid: u16, points: []Point, ends: []u16) Error!Outline {
+    pub fn outline(self: Font, gid: u16, points: []Point, ends: []u16) GlyphError!Outline {
         if (gid >= self.num_glyphs) return error.UnknownGlyph;
         var cur = Cursor{ .points = points, .ends = ends };
         try decodeInto(self, gid, &cur, 0);
@@ -307,7 +388,7 @@ pub const Font = struct {
     }
 
     /// What `maxp` says about the biggest glyph, for sizing caller scratch.
-    pub fn limits(self: Font) Error!Limits {
+    pub fn limits(self: Font) LoadError!Limits {
         const data = try self.slice(self.maxp);
         const version = try u32At(data, 0);
         if (version < 0x0001_0000) return .{ .max_points = 0, .max_contours = 0 };
@@ -318,7 +399,7 @@ pub const Font = struct {
     /// glyph. Deliberately the declared box rather than a computed one: it is
     /// what the previous backend sized its bitmaps from, so bitmaps stay the
     /// same size across the swap. `outlineBounds` is the computed alternative.
-    pub fn headerBox(self: Font, gid: u16) Error!?Box {
+    pub fn headerBox(self: Font, gid: u16) GlyphError!?Box {
         if (gid >= self.num_glyphs) return error.UnknownGlyph;
         const data = try glyphRange(self, gid);
         if (data.len == 0) return null;
@@ -335,7 +416,7 @@ pub const Font = struct {
     ///
     /// Font y points up and bitmap y points down, hence the negations: the
     /// top of the bitmap comes from the glyph's yMax.
-    pub fn bitmapBox(self: Font, gid: u16, scale: f32, phase_x: f32) Error!PixelBox {
+    pub fn bitmapBox(self: Font, gid: u16, scale: f32, phase_x: f32) GlyphError!PixelBox {
         const b = (try self.headerBox(gid)) orelse
             return .{ .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 };
         const f = struct {
@@ -363,7 +444,7 @@ pub const Font = struct {
         points: []Point,
         ends: []u16,
         edges: []Edge,
-    ) Error!usize {
+    ) GlyphError!usize {
         const o = try self.outline(gid, points, ends);
         var em = Emitter{
             .edges = edges,
@@ -394,7 +475,7 @@ pub const Font = struct {
         edges: []Edge,
         acc: []f32,
         coverage: []u8,
-    ) Error!Raster {
+    ) GlyphError!Raster {
         const box = try self.bitmapBox(gid, scale, phase_x);
         const w: u32 = if (box.x1 > box.x0) @intCast(box.x1 - box.x0) else 0;
         const h: u32 = if (box.y1 > box.y0) @intCast(box.y1 - box.y0) else 0;
@@ -414,7 +495,7 @@ pub const Font = struct {
     /// Horizontal metrics for a glyph. Ids past `numberOfHMetrics` repeat the
     /// last advance and read their bearing from the trailing array -- that is
     /// the format, not a shortcut.
-    pub fn hMetrics(self: Font, gid: u16) Error!HMetrics {
+    pub fn hMetrics(self: Font, gid: u16) GlyphError!HMetrics {
         if (gid >= self.num_glyphs) return error.UnknownGlyph;
         const hm = try self.slice(self.hmtx);
 
@@ -442,7 +523,7 @@ pub const Font = struct {
 /// non-zero range offset the two disagree, and Cedar is the one following the
 /// spec. The oracle run reports that as a mismatch only if a font in test uses
 /// the combination; the synthetic test below pins our behaviour either way.
-fn cmapFormat4(cm: []const u8, base: usize, cp: u21) Error!u16 {
+fn cmapFormat4(cm: []const u8, base: usize, cp: u21) GlyphError!u16 {
     if (cp > 0xFFFF) return 0;
     const c: u16 = @intCast(cp);
 
@@ -484,7 +565,7 @@ fn cmapFormat4(cm: []const u8, base: usize, cp: u21) Error!u16 {
 }
 
 /// Format 12: segmented coverage, the one that reaches past the BMP.
-fn cmapFormat12(cm: []const u8, base: usize, cp: u21) Error!u16 {
+fn cmapFormat12(cm: []const u8, base: usize, cp: u21) GlyphError!u16 {
     const n = try u32At(cm, base + 12);
     const groups = base + 16;
 
@@ -518,11 +599,11 @@ const Cursor = struct {
     ends: []u16,
     nc: usize = 0,
 
-    fn room(self: Cursor, count: usize) Error!void {
+    fn room(self: Cursor, count: usize) GlyphError!void {
         if (self.n + count > self.points.len) return error.BufferTooSmall;
     }
 
-    fn roomContour(self: Cursor) Error!void {
+    fn roomContour(self: Cursor) GlyphError!void {
         if (self.nc + 1 > self.ends.len) return error.BufferTooSmall;
     }
 };
@@ -535,7 +616,7 @@ const FlagWalk = struct {
     left: u32 = 0,
     cur: u8 = 0,
 
-    fn next(self: *FlagWalk, data: []const u8) Error!u8 {
+    fn next(self: *FlagWalk, data: []const u8) ReadError!u8 {
         if (self.left == 0) {
             self.cur = try u8At(data, self.at);
             self.at += 1;
@@ -555,7 +636,7 @@ fn f2dot14(raw: i16) f32 {
 }
 
 /// The glyph's byte range in `glyf`, via `loca`.
-fn glyphRange(self: Font, gid: u16) Error![]const u8 {
+fn glyphRange(self: Font, gid: u16) GlyphError![]const u8 {
     const loca = try self.slice(self.loca);
     const glyf = try self.slice(self.glyf);
     const i: usize = gid;
@@ -573,7 +654,7 @@ fn glyphRange(self: Font, gid: u16) Error![]const u8 {
     return glyf[a..b];
 }
 
-fn decodeInto(self: Font, gid: u16, cur: *Cursor, depth: u32) Error!void {
+fn decodeInto(self: Font, gid: u16, cur: *Cursor, depth: u32) GlyphError!void {
     const data = try glyphRange(self, gid);
     // A blank glyph: loca gives it an empty range.
     if (data.len == 0) return;
@@ -587,8 +668,14 @@ fn decodeInto(self: Font, gid: u16, cur: *Cursor, depth: u32) Error!void {
     }
 }
 
-fn decodeSimple(data: []const u8, n_contours: usize, cur: *Cursor) Error!void {
+fn decodeSimple(data: []const u8, n_contours: usize, cur: *Cursor) GlyphError!void {
     const ends_at = 10;
+    var ci: usize = 1;
+    while (ci < n_contours) : (ci += 1) {
+        if (try u16At(data, ends_at + ci * 2) <= try u16At(data, ends_at + (ci - 1) * 2)) {
+            return error.Truncated;
+        }
+    }
     const last_end = try u16At(data, ends_at + (n_contours - 1) * 2);
     const n: usize = @as(usize, last_end) + 1;
     try cur.room(n);
@@ -660,7 +747,7 @@ fn decodeSimple(data: []const u8, n_contours: usize, cur: *Cursor) Error!void {
 /// spec. The two agree on the common case -- accents placed by translation
 /// with no matrix -- and disagree on scaled composites, which is exactly the
 /// kind of thing the differential is there to point at.
-fn decodeComposite(self: Font, data: []const u8, cur: *Cursor, depth: u32) Error!void {
+fn decodeComposite(self: Font, data: []const u8, cur: *Cursor, depth: u32) GlyphError!void {
     if (depth >= max_composite_depth) return error.CompositeTooDeep;
 
     var p: usize = 10;
@@ -755,7 +842,7 @@ const Emitter = struct {
     oy: f32,
     flat_sq: f32,
 
-    fn line(self: *Emitter, x0: f32, y0: f32, x1: f32, y1: f32) Error!void {
+    fn line(self: *Emitter, x0: f32, y0: f32, x1: f32, y1: f32) GlyphError!void {
         const px0 = x0 * self.scale + self.phase_x - self.ox;
         const px1 = x1 * self.scale + self.phase_x - self.ox;
         const py0 = -y0 * self.scale - self.oy;
@@ -774,7 +861,7 @@ const Emitter = struct {
 
     /// Midpoint subdivision, stopping when the midpoint deviates from the chord
     /// by less than the flatness bound.
-    fn quad(self: *Emitter, fx: f32, fy: f32, cx: f32, cy: f32, tx: f32, ty: f32, depth: u8) Error!void {
+    fn quad(self: *Emitter, fx: f32, fy: f32, cx: f32, cy: f32, tx: f32, ty: f32, depth: u8) GlyphError!void {
         const mx = (fx + 2 * cx + tx) / 4;
         const my = (fy + 2 * cy + ty) / 4;
         const dx = (fx + tx) / 2 - mx;
@@ -787,7 +874,7 @@ const Emitter = struct {
         }
     }
 
-    fn contours(self: *Emitter, o: Outline) Error!void {
+    fn contours(self: *Emitter, o: Outline) GlyphError!void {
         var start: usize = 0;
         for (o.ends) |end| {
             const last: usize = end;
@@ -801,7 +888,7 @@ const Emitter = struct {
     /// begins with a control point (legal, and common) we either move to the
     /// next on-curve point or, when every point is off-curve, start from the
     /// midpoint between the last and first, which is a point on the curve.
-    fn contour(self: *Emitter, pts: []const Point, start: usize, n: usize) Error!void {
+    fn contour(self: *Emitter, pts: []const Point, start: usize, n: usize) GlyphError!void {
         if (n == 0) return;
 
         var on_rel: ?usize = null;
@@ -919,7 +1006,7 @@ fn colArea(xa: f32, ya: f32, xb: f32, yb: f32, c: f32) f32 {
     return total;
 }
 
-fn sweep(edges: []const Edge, w: u32, h: u32, scratch: []f32, coverage: []u8) Error!void {
+fn sweep(edges: []const Edge, w: u32, h: u32, scratch: []f32, coverage: []u8) GlyphError!void {
     // Two accumulators per row: the partial areas where an edge cuts a column,
     // and the tail an edge contributes to every column to its right.
     const need = @as(usize, w) * 2 + 2;
@@ -979,21 +1066,21 @@ fn sweep(edges: []const Edge, w: u32, h: u32, scratch: []f32, coverage: []u8) Er
 // bounds-checked big-endian reads
 // ---------------------------------------------------------------------------
 
-fn u8At(b: []const u8, off: usize) Error!u8 {
+fn u8At(b: []const u8, off: usize) ReadError!u8 {
     if (off >= b.len) return error.Truncated;
     return b[off];
 }
 
-fn u16At(b: []const u8, off: usize) Error!u16 {
+fn u16At(b: []const u8, off: usize) ReadError!u16 {
     if (off + 2 > b.len) return error.Truncated;
     return std.mem.readInt(u16, b[off..][0..2], .big);
 }
 
-fn i16At(b: []const u8, off: usize) Error!i16 {
+fn i16At(b: []const u8, off: usize) ReadError!i16 {
     return @bitCast(try u16At(b, off));
 }
 
-fn u32At(b: []const u8, off: usize) Error!u32 {
+fn u32At(b: []const u8, off: usize) ReadError!u32 {
     if (off + 4 > b.len) return error.Truncated;
     return std.mem.readInt(u32, b[off..][0..4], .big);
 }
@@ -1103,7 +1190,7 @@ fn buildTestFont(buf: []u8, with_fmt12: bool) []const u8 {
     w.u16v(0);
     w.u16v(0);
     w.u16v(1); // glyphIdArray[0]
-    w16(buf, len4_at, @intCast(w.at - f4));
+    w16(buf[0..], len4_at, @intCast(w.at - f4));
     w32(buf, rec0 + 4, @intCast(f4 - cmap_start));
 
     if (with_fmt12) {
@@ -1446,10 +1533,10 @@ test "a font collection resolves its first face" {
 
     var buf: [4096]u8 = undefined;
     @memset(&buf, 0);
-    w32(&buf, 0, tag("ttcf"));
-    w32(&buf, 4, 0x0001_0000); // version
-    w32(&buf, 8, 1); // numFonts
-    w32(&buf, 12, 16); // offset of face 0
+    w32(buf[0..], 0, tag("ttcf"));
+    w32(buf[0..], 4, 0x0001_0000); // version
+    w32(buf[0..], 8, 1); // numFonts
+    w32(buf[0..], 12, 16); // offset of face 0
     @memcpy(buf[16 .. 16 + face.len], face);
 
     // Table offsets inside a collection are file-relative, so shift each of the
@@ -1457,7 +1544,7 @@ test "a font collection resolves its first face" {
     var i: usize = 0;
     while (i < 7) : (i += 1) {
         const at = 16 + 12 + i * 16 + 8;
-        w32(&buf, at, std.mem.readInt(u32, buf[at..][0..4], .big) + 16);
+        w32(buf[0..], at, std.mem.readInt(u32, buf[at..][0..4], .big) + 16);
     }
 
     const f = try Font.init(buf[0 .. 16 + face.len]);
@@ -1470,4 +1557,78 @@ test "limits come from a maxp 1.0 table and are zero otherwise" {
     const f = try Font.init(buildTestFont(&buf, false));
     // The synthetic font declares maxp 0.5, which has no such fields.
     try std.testing.expectEqual(Limits{ .max_points = 0, .max_contours = 0 }, try f.limits());
+}
+
+// ---------------------------------------------------------------------------
+// malformed fonts: every check below has to be able to fail
+// ---------------------------------------------------------------------------
+
+/// The nth table record in the synthetic font: where its body starts and where
+/// its length field lives, so a test can break exactly one thing.
+fn recSpan(buf: []const u8, n: usize) struct { off: usize, len_at: usize } {
+    const at = 12 + n * 16;
+    return .{
+        .off = @intCast(std.mem.readInt(u32, buf[at + 8 ..][0..4], .big)),
+        .len_at = at + 12,
+    };
+}
+
+const rec_head = 3;
+const rec_hhea = 4;
+const rec_hmtx = 5;
+
+test "a table shorter than its fields is refused, not read past" {
+    var buf: [2048]u8 = undefined;
+    const font = buildTestFont(&buf, false);
+    // head carries fields out to offset 52; 20 bytes must not be accepted just
+    // because the next table happens to follow it.
+    w32(buf[0..], recSpan(&buf, rec_head).len_at, 20);
+    try std.testing.expectError(error.Truncated, Font.init(buf[0..font.len]));
+}
+
+test "hmtx too short for its metrics is refused" {
+    var buf: [2048]u8 = undefined;
+    const font = buildTestFont(&buf, false);
+    w32(buf[0..], recSpan(&buf, rec_hmtx).len_at, 5);
+    try std.testing.expectError(error.Truncated, Font.init(buf[0..font.len]));
+}
+
+test "more hmetrics than glyphs is refused" {
+    var buf: [2048]u8 = undefined;
+    const font = buildTestFont(&buf, false);
+    const hhea = recSpan(&buf, rec_hhea).off;
+    w16(buf[0..], hhea + 34, 9); // numberOfHMetrics, numGlyphs is 8
+    try std.testing.expectError(error.BadValue, Font.init(buf[0..font.len]));
+}
+
+test "loca that goes backwards is refused" {
+    var buf: [2048]u8 = undefined;
+    const font = buildTestFont(&buf, false);
+    const loca = recSpan(&buf, 2).off;
+    // Entries are 0,0,0,0,0,0,0,12,21; pushing entry 7 past entry 8 inverts the
+    // last glyph's byte range.
+    w16(buf[0..], loca + 7 * 2, 30);
+    try std.testing.expectError(error.Truncated, Font.init(buf[0..font.len]));
+}
+
+test "a cmap segment array larger than the subtable is refused" {
+    var buf: [2048]u8 = undefined;
+    const font = buildTestFont(&buf, false);
+    const f4 = recSpan(&buf, 0).off + 12; // format-4 subtable
+    w16(buf[0..], f4 + 6, 4000); // segCountX2
+    try std.testing.expectError(error.Truncated, Font.init(buf[0..font.len]));
+}
+
+test "a composite that refers to itself stops at the depth limit" {
+    var buf: [2048]u8 = undefined;
+    const font = buildTestFont(&buf, false);
+    const glyf = recSpan(&buf, 1).off;
+    // The triangle is 24 bytes; the composite starts after it. Its component
+    // glyph id is 2 bytes into the record, after the 10-byte header and flags.
+    w16(buf[0..], glyf + 24 + 12, 7); // point gid 7 at itself
+
+    const f = try Font.init(buf[0..font.len]);
+    var pts: [64]Point = undefined;
+    var ends: [8]u16 = undefined;
+    try std.testing.expectError(error.CompositeTooDeep, f.outline(7, &pts, &ends));
 }

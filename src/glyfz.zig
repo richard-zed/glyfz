@@ -1508,6 +1508,114 @@ pub const Cache = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// codepoint -> glyph lookup table
+// ---------------------------------------------------------------------------
+
+/// A codepoint-to-glyph table, so a repeated character does not walk the cmap
+/// again.
+///
+/// Measured on DejaVu Sans: a `glyphIndex` call costs about 450 ns and a cache
+/// hit on the raster costs about 85 ns, so in a real draw roughly four fifths
+/// of a glyph's cost is the map search, and the mask cache cannot touch any of
+/// it. The search is already a binary search, so the fix is not a better
+/// algorithm -- a dozen scattered `u16` reads across a multi-KB segment array
+/// is simply more memory traffic than a 8 KB table that stays resident.
+///
+/// Same contract as `Cache`: the caller owns the memory, there is no
+/// allocator, and `init` carves one buffer.
+pub const Lookup = struct {
+    pub const Options = struct {
+        /// A power of two divides evenly; anything else costs a modulo per
+        /// probe. 1024 slots is 8 KB, which fits in L1 with room to spare.
+        slots: u16 = 1024,
+    };
+
+    pub const Stats = struct {
+        hits: u64 = 0,
+        misses: u64 = 0,
+    };
+
+    /// What a draw asks for, in font units.
+    pub const Entry = struct {
+        gid: u16,
+        advance: u16,
+    };
+
+    /// No codepoint is 0xFFFFFFFF, so it marks a free slot.
+    const empty: u32 = 0xFFFF_FFFF;
+
+    const Slot = struct {
+        cp: u32 = empty,
+        gid: u16 = 0,
+        advance: u16 = 0,
+    };
+
+    slots: []Slot,
+    stats: Stats = .{},
+
+    /// How much memory `init` wants for this configuration.
+    pub fn needed(opts: Options) usize {
+        return @as(usize, opts.slots) * @sizeOf(Slot);
+    }
+
+    pub fn init(mem: []align(8) u8, opts: Options) error{BufferTooSmall}!Lookup {
+        if (opts.slots == 0 or mem.len < needed(opts)) return error.BufferTooSmall;
+        var off: usize = 0;
+        const slots = takeSlice(Slot, mem, &off, opts.slots);
+        var l = Lookup{ .slots = slots };
+        l.reset();
+        return l;
+    }
+
+    /// Glyph and advance for a codepoint, resolving it if this is the first
+    /// time. A failed resolution is not cached: it is rare, the caller has to
+    /// handle the error anyway, and caching it would need a second kind of slot
+    /// for no gain.
+    pub fn resolve(self: *Lookup, font: Font, cp: u21) GlyphError!Entry {
+        const key: u32 = @intCast(cp);
+        const start = self.probeStart(key);
+        var i: usize = 0;
+        var free_at: ?usize = null;
+        while (i < self.slots.len) : (i += 1) {
+            const idx = (start + i) % self.slots.len;
+            const s = &self.slots[idx];
+            if (s.cp == key) {
+                self.stats.hits += 1;
+                return .{ .gid = s.gid, .advance = s.advance };
+            }
+            if (s.cp == empty) {
+                free_at = idx;
+                break;
+            }
+        }
+
+        self.stats.misses += 1;
+        const gid = try font.glyphIndex(cp);
+        const advance = (try font.hMetrics(gid)).advance;
+        // First free slot on the run, or the home slot when the table is full.
+        // Overwriting the home slot is the cheapest eviction there is, and a
+        // caller cannot feel it: the next resolve simply recomputes.
+        self.slots[free_at orelse start] = .{ .cp = key, .gid = gid, .advance = advance };
+        return .{ .gid = gid, .advance = advance };
+    }
+
+    /// Every slot goes. Counters too -- unlike the raster cache's arena, which
+    /// flushes under memory pressure and counts it, this one only clears when
+    /// the caller asks, so a reset is a fresh measurement.
+    pub fn reset(self: *Lookup) void {
+        for (self.slots) |*s| s.cp = empty;
+        self.stats = .{};
+    }
+
+    fn probeStart(self: *Lookup, cp: u32) usize {
+        var key: u64 = cp;
+        key *%= 0x9E3779B97F4A7C15;
+        key ^= key >> 32;
+        return @as(usize, @truncate(key)) % self.slots.len;
+    }
+};
+
 fn takeSlice(comptime T: type, mem: []align(8) u8, off: *usize, n: usize) []T {
     const start = std.mem.alignForward(usize, off.*, @alignOf(T));
     off.* = start + n * @sizeOf(T);
@@ -2596,4 +2704,68 @@ test "hasCodepoint separates .notdef from a real glyph" {
     try std.testing.expect(!f.hasCodepoint('C'));
     // Beyond the subtable's reach entirely, and still just "absent".
     try std.testing.expect(!f.hasCodepoint(0x10FFFF));
+}
+
+test "lookup: a cached resolve agrees with the cmap and hmtx" {
+    var buf: [1024]u8 = undefined;
+    const f = try Font.init(buildTestFont(&buf, false));
+
+    var mem: [Lookup.needed(.{})]u8 align(8) = undefined;
+    var l = try Lookup.init(&mem, .{});
+
+    for ([_]u21{ 'A', 'B', 'C', 0x1F600, 'A', 'z', 0x20 }) |cp| {
+        const got = try l.resolve(f, cp);
+        try std.testing.expectEqual(try f.glyphIndex(cp), got.gid);
+        try std.testing.expectEqual((try f.hMetrics(got.gid)).advance, got.advance);
+    }
+}
+
+test "lookup: the second resolve is a hit, the first is not" {
+    var buf: [1024]u8 = undefined;
+    const f = try Font.init(buildTestFont(&buf, false));
+
+    var mem: [Lookup.needed(.{})]u8 align(8) = undefined;
+    var l = try Lookup.init(&mem, .{});
+
+    _ = try l.resolve(f, 'A');
+    try std.testing.expectEqual(@as(u64, 1), l.stats.misses);
+    try std.testing.expectEqual(@as(u64, 0), l.stats.hits);
+
+    _ = try l.resolve(f, 'A');
+    _ = try l.resolve(f, 'A');
+    try std.testing.expectEqual(@as(u64, 1), l.stats.misses);
+    try std.testing.expectEqual(@as(u64, 2), l.stats.hits);
+
+    // resolve must not mutate the font or the entry it hands back.
+    try std.testing.expectEqual(@as(u16, 6), (try l.resolve(f, 'A')).gid);
+}
+
+test "lookup: eviction never returns another codepoint's glyph" {
+    // Two slots and three codepoints force a collision and an eviction; every
+    // resolve must still be right. This is the failure the table can actually
+    // have -- a stale slot answering for a different character.
+    var buf: [1024]u8 = undefined;
+    const f = try Font.init(buildTestFont(&buf, false));
+
+    var mem: [Lookup.needed(.{ .slots = 2 })]u8 align(8) = undefined;
+    var l = try Lookup.init(&mem, .{ .slots = 2 });
+
+    var round: usize = 0;
+    while (round < 3) : (round += 1) {
+        for ([_]u21{ 'A', 'B', 'z' }) |cp| {
+            const got = try l.resolve(f, cp);
+            try std.testing.expectEqual(try f.glyphIndex(cp), got.gid);
+        }
+    }
+}
+
+test "lookup: a buffer the size asked for is enough, anything less is refused" {
+    const need = comptime Lookup.needed(.{ .slots = 16 });
+    var mem: [need]u8 align(8) = undefined;
+    try std.testing.expectEqual(@as(usize, 16 * @sizeOf(Lookup.Slot)), need);
+    _ = try Lookup.init(&mem, .{ .slots = 16 });
+
+    var small: [need - 1]u8 align(8) = undefined;
+    try std.testing.expectError(error.BufferTooSmall, Lookup.init(&small, .{ .slots = 16 }));
+    try std.testing.expectError(error.BufferTooSmall, Lookup.init(&mem, .{ .slots = 0 }));
 }

@@ -117,6 +117,61 @@ pub fn main() !void {
         std.debug.print("{d:>6} {d:>11.1} {d:>11.1} {d:>11.1} {d:>8.1}x\n", .{ size, per_raster, per_decode, per_cached, per_raster / per_cached });
     }
 
+    // The other half of a draw. Before a glyph can be rasterised, or found in
+    // the mask cache, its codepoint has to become a glyph index and its advance
+    // has to be read. That map search is not a cache hit and the mask cache
+    // cannot touch it, so it is measured on its own here.
+    var cps: [128]u21 = undefined;
+    var ncp: usize = 0;
+    cp = 33;
+    while (cp < 127) : (cp += 1) {
+        if (font.hasCodepoint(cp)) {
+            cps[ncp] = cp;
+            ncp += 1;
+        }
+    }
+
+    var lbuf: [1 << 14]u8 align(8) = undefined;
+    var lookup = try glyfz.Lookup.init(&lbuf, .{});
+
+    const look_reps: u32 = 500;
+    var best_map: i128 = std.math.maxInt(i128);
+    var best_lookup: i128 = std.math.maxInt(i128);
+
+    // Warm: every codepoint is a miss the first time through.
+    for (cps[0..ncp]) |c| {
+        _ = lookup.resolve(font, c) catch continue;
+    }
+    var lr: u32 = 0;
+    while (lr < look_reps) : (lr += 1) {
+        const t0 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+        for (cps[0..ncp]) |c| {
+            const gid = font.glyphIndex(c) catch continue;
+            _ = font.hMetrics(gid) catch continue;
+        }
+        const t1 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+        best_map = @min(best_map, t1 - t0);
+    }
+
+    lr = 0;
+    while (lr < look_reps) : (lr += 1) {
+        const t0 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+        for (cps[0..ncp]) |c| {
+            _ = lookup.resolve(font, c) catch continue;
+        }
+        const t1 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+        best_lookup = @min(best_lookup, t1 - t0);
+    }
+
+    const ldenom: f64 = @floatFromInt(ncp);
+    const per_map = @as(f64, @floatFromInt(best_map)) / ldenom;
+    const per_lookup = @as(f64, @floatFromInt(best_lookup)) / ldenom;
+    std.debug.print("\n{d} codepoints, printable ASCII through the cmap\n", .{ncp});
+    std.debug.print("  cmap + hmtx   {d:>10.1} ns/glyph\n", .{per_map});
+    std.debug.print("  lookup (hit)  {d:>10.1} ns/glyph {d:>8.1}x\n", .{ per_lookup, per_map / per_lookup });
+    const ls = lookup.stats;
+    std.debug.print("  lookup: {d} hits, {d} misses\n", .{ ls.hits, ls.misses });
+
     const s = cache.stats;
     std.debug.print("\ncache: {d} hits, {d} misses, {d} flushes\n", .{ s.hits, s.misses, s.flushes });
 }

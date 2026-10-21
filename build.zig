@@ -36,6 +36,23 @@ pub fn build(b: *std.Build) void {
         run_oracle.setEnvironmentVariable("CEDAR_TEST_FONT", f);
     }
 
+    // Malformed input: truncate and flip bits, on a real face. Separate test
+    // binary so the ordinary suite stays fast, and skipped when no font is
+    // configured rather than silently passing.
+    const fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("test/fuzz_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "cedar", .module = cedar_mod }},
+        .link_libc = true,
+    });
+    const fuzz_tests = b.addTest(.{ .root_module = fuzz_mod });
+    const run_fuzz = b.addRunArtifact(fuzz_tests);
+    run_fuzz.has_side_effects = true;
+    if (font_opt) |f| {
+        run_fuzz.setEnvironmentVariable("CEDAR_TEST_FONT", f);
+    }
+
     // Timing harness. stb is compiled in as the baseline, exactly as the
     // oracle does -- it is never part of what a consumer imports.
     const bench_mod = b.createModule(.{
@@ -55,6 +72,9 @@ pub fn build(b: *std.Build) void {
     }
     const bench_step = b.step("bench", "time cedar against stb_truetype (-Dfont=path)");
     bench_step.dependOn(&run_bench.step);
+
+    const fuzz_step = b.step("fuzz", "mangle the face under -Dfont (or CEDAR_TEST_FONT): truncations and bit flips");
+    fuzz_step.dependOn(&run_fuzz.step);
 
     const oracle_step = b.step("oracle", "differential against stb_truetype (-Dfont=path, or CEDAR_TEST_FONT)");
     oracle_step.dependOn(&run_oracle.step);

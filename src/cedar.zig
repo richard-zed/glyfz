@@ -2089,3 +2089,61 @@ test "the usage shown in the README compiles and runs" {
     try std.testing.expectEqual(m.pixels.len, @as(usize, m.w) * m.h);
     try std.testing.expectEqual(@as(u64, 1), cache.stats.misses);
 }
+
+// --- malformed input -------------------------------------------------------
+//
+// A font parser reads lengths and offsets that arrive from outside the
+// program, and every one of them is a chance to read somewhere it shouldn't.
+// The validation tests each break one field on purpose; this sweep breaks
+// everything, everywhere, including combinations no test author would think
+// of. A panic or an out-of-bounds read here fails the suite, which is the
+// point: the library is meant to reject garbage, never to fault on it.
+//
+// Truncations and single-bit flips are the two cheapest ways to reach a lot of
+// states quickly. Anything that loads has to behave, so a successful init is
+// followed through the glyph path rather than merely counted.
+
+fn sweepUse(bytes: []const u8, cmem: []align(8) u8, deep: bool) void {
+    const font = Font.init(bytes) catch return;
+    // A face that loaded has to be coherent, not just non-faulting.
+    std.debug.assert(font.units_per_em > 0);
+    std.debug.assert(font.num_glyphs > 0);
+
+    var cache = Cache.init(cmem, .{}) catch return;
+    var gid: u16 = 0;
+    const last: u16 = if (deep) 7 else 6;
+    while (gid <= last) : (gid += 1) {
+        _ = font.hMetrics(gid) catch {};
+        _ = font.bitmapBox(gid, 0.0175, 0) catch {};
+        _ = font.bitmapBox(gid, 0.0175, 0.5) catch {};
+        _ = cache.mask(font, gid, 13, .zero) catch {};
+    }
+    _ = font.kern(2, 3);
+    _ = font.kern(6, 7);
+    _ = font.kerning();
+}
+
+test "every truncation either loads cleanly or is rejected" {
+    var buf: [4096]u8 = undefined;
+    const base = buildTestFont(&buf, true);
+    var cmem: [192 * 1024]u8 align(8) = undefined;
+    var n: usize = 0;
+    while (n <= base.len) : (n += 1) sweepUse(base[0..n], &cmem, false);
+}
+
+test "every single-bit flip either loads cleanly or is rejected" {
+    var buf: [4096]u8 = undefined;
+    const base = buildTestFont(&buf, true);
+    var scratch: [4096]u8 = undefined;
+    var cmem: [192 * 1024]u8 align(8) = undefined;
+    var i: usize = 0;
+    while (i < base.len) : (i += 1) {
+        var bit: u3 = 0;
+        while (true) : (bit += 1) {
+            @memcpy(scratch[0..base.len], base);
+            scratch[i] ^= @as(u8, 1) << bit;
+            sweepUse(scratch[0..base.len], &cmem, false);
+            if (bit == 7) break;
+        }
+    }
+}

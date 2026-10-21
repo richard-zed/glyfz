@@ -94,6 +94,61 @@ pub const HMetrics = struct {
 
 /// One decoded outline point, in FONT UNITS. `on` is the on-curve flag: an
 /// off-curve point is a quadratic control point between its neighbours.
+/// The `name` table ids worth naming. The enum is documentation, not a
+/// restriction: `name` takes any id.
+pub const NameId = enum(u16) {
+    copyright = 0,
+    family = 1,
+    subfamily = 2,
+    unique_id = 3,
+    full = 4,
+    version = 5,
+    /// No space in a PostScript name, by the spec -- hence the underscore.
+    postscript = 6,
+    trademark = 7,
+    manufacturer = 8,
+    designer = 9,
+    description = 10,
+    vendor_url = 11,
+    designer_url = 12,
+    license = 13,
+    license_url = 14,
+    typographic_family = 16,
+    typographic_subfamily = 17,
+};
+
+/// The parts of `OS/2` a layout needs and `hhea` does not carry.
+///
+/// `hhea` gives one set of vertical metrics for every use; `OS/2` keeps the
+/// typographic set apart from the Windows set, which is why a line placed on
+/// one and clipped against the other is off by a few units. Cap height and
+/// x-height are what a box centres on; the ascent convention Elm uses
+/// (size/(ascender-descender)) is only one of four this table offers.
+pub const Os2 = struct {
+    version: u16,
+    /// usWeightClass: 400 regular, 700 bold.
+    weight: u16,
+    /// fsSelection: bit 0 italic, bit 5 bold, bit 6 regular.
+    selection: u16,
+    typo_ascender: i16,
+    typo_descender: i16,
+    typo_line_gap: i16,
+    win_ascent: u16,
+    win_descent: u16,
+    /// Version 2 and later. Null on an older table rather than zero, because
+    /// zero is a legal cap height and a guess would be indistinguishable.
+    cap_height: ?i16,
+    x_height: ?i16,
+
+    pub fn bold(self: Os2) bool {
+        return self.selection & 0x20 != 0;
+    }
+
+    pub fn italic(self: Os2) bool {
+        return self.selection & 0x01 != 0;
+    }
+};
+
 pub const Point = struct { x: i32, y: i32, on: bool };
 
 /// A glyph outline: all points, and the index of the LAST point of each
@@ -176,6 +231,8 @@ const tag_hmtx = tag("hmtx");
 const tag_maxp = tag("maxp");
 const tag_glyf = tag("glyf");
 const tag_loca = tag("loca");
+const tag_name = tag("name");
+const tag_os2 = tag("OS/2");
 
 /// One loaded face. Borrows the bytes; they must outlive it.
 pub const Font = struct {
@@ -199,6 +256,8 @@ pub const Font = struct {
     maxp: Span = .{},
     glyf: Span = .{},
     loca: Span = .{},
+    name_span: Span = .{},
+    os2_span: Span = .{},
 
     /// Parse the table directory and the metrics a caller needs up front.
     /// Fails loudly: a font Cedar cannot read should not silently measure zero.
@@ -239,6 +298,8 @@ pub const Font = struct {
             if (t == tag_maxp) self.maxp = span;
             if (t == tag_glyf) self.glyf = span;
             if (t == tag_loca) self.loca = span;
+            if (t == tag_name) self.name_span = span;
+            if (t == tag_os2) self.os2_span = span;
         }
 
         const head = try self.slice(self.head);
@@ -466,12 +527,57 @@ pub const Font = struct {
     /// Glyph id for a codepoint. 0 means `.notdef`, per the format.
     pub fn glyphIndex(self: Font, cp: u21) GlyphError!u16 {
         const cm = try self.slice(self.cmap);
-        return switch (self.cmap_format) {
-            4 => cmapFormat4(cm, 0, cp),
-            12 => cmapFormat12(cm, 0, cp),
+        const gid = switch (self.cmap_format) {
+            4 => try cmapFormat4(cm, 0, cp),
+            12 => try cmapFormat12(cm, 0, cp),
             // init refuses anything else, so this cannot be reached.
             else => unreachable,
         };
+        // A cmap is free to name a glyph the face does not contain -- a
+        // truncated or hand-edited font does it, and the format's terminal
+        // 0xFFFF segment maps whatever follows it arithmetically. Handing that
+        // number out would let `hasCodepoint` say yes to a glyph that cannot be
+        // drawn, and every later call would fail with a number in hand.
+        if (gid >= self.num_glyphs) return error.UnknownGlyph;
+        return gid;
+    }
+
+    /// True when the face maps this codepoint to a real glyph.
+    ///
+    /// Glyph 0 is `.notdef` by the format, so a codepoint that resolves to it
+    /// is ABSENT, not present-and-blank. A fallback chain asks this question,
+    /// and answering "yes" for a codepoint the face would draw as a box is the
+    /// bug the chain exists to prevent.
+    pub fn hasCodepoint(self: Font, cp: u21) bool {
+        const gid = self.glyphIndex(cp) catch return false;
+        return gid != 0;
+    }
+
+    /// A `name`-table string, decoded to UTF-8 into `out`.
+    ///
+    /// Null when the face carries no such record. Names are decoration like
+    /// kerning: no face fails to load for want of one, and a result shorter
+    /// than the name means a caller's buffer was too small.
+    pub fn name(self: Font, id: NameId, out: []u8) ?[]const u8 {
+        const tbl = self.slice(self.name_span) catch return null;
+        return nameRecord(tbl, @intFromEnum(id), out);
+    }
+
+    /// Family name, e.g. "DejaVu Sans". This is the string a theme file's font
+    /// name gets matched against, so it is the one that has to be exact.
+    pub fn family(self: Font, out: []u8) ?[]const u8 {
+        return self.name(.family, out);
+    }
+
+    /// Style within the family, e.g. "Bold Oblique".
+    pub fn style(self: Font, out: []u8) ?[]const u8 {
+        return self.name(.subfamily, out);
+    }
+
+    /// The `OS/2` numbers, or null when the face has no such table.
+    pub fn os2(self: Font) ?Os2 {
+        const tbl = self.slice(self.os2_span) catch return null;
+        return os2Table(tbl);
     }
 
     /// Decode a glyph's outline into the caller's buffers, in font units.
@@ -1435,6 +1541,154 @@ fn u32At(b: []const u8, off: usize) ReadError!u32 {
 // tests: a synthetic font, so the suite needs no font file
 // ---------------------------------------------------------------------------
 
+/// Reads that answer null instead of erroring. Optional tables use these:
+/// a short `name` or `OS/2` record must not charge the caller an error union
+/// it cannot act on, and absence is already legal for both.
+fn at16(b: []const u8, off: usize) ?u16 {
+    if (off + 2 > b.len) return null;
+    return std.mem.readInt(u16, b[off..][0..2], .big);
+}
+
+/// Parse an `OS/2` body. Version 0 ends at offset 78; later versions append,
+/// so a table long enough for the version it claims is accepted.
+fn os2Table(t: []const u8) ?Os2 {
+    const version = at16(t, 0) orelse return null;
+    const weight = at16(t, 4) orelse return null;
+    const selection = at16(t, 62) orelse return null;
+    const typo_asc = at16(t, 68) orelse return null;
+    const typo_desc = at16(t, 70) orelse return null;
+    const typo_gap = at16(t, 72) orelse return null;
+    const win_asc = at16(t, 74) orelse return null;
+    const win_desc = at16(t, 76) orelse return null;
+
+    // xHeight sits at 86 and sCapHeight at 88, and only from version 2. On a
+    // version 0 table those bytes are the reserved gap, so reading them would
+    // invent two numbers that look authoritative.
+    var x_height: ?i16 = null;
+    var cap_height: ?i16 = null;
+    if (version >= 2) {
+        x_height = @bitCast(at16(t, 86) orelse return null);
+        cap_height = @bitCast(at16(t, 88) orelse return null);
+    }
+
+    return .{
+        .version = version,
+        .weight = weight,
+        .selection = selection,
+        .typo_ascender = @bitCast(typo_asc),
+        .typo_descender = @bitCast(typo_desc),
+        .typo_line_gap = @bitCast(typo_gap),
+        .win_ascent = win_asc,
+        .win_descent = win_desc,
+        .cap_height = cap_height,
+        .x_height = x_height,
+    };
+}
+
+/// Pick the best `name` record for `id` and decode it into `out`.
+///
+/// Microsoft Unicode (3,1)/(3,10) wins over Apple Mac Roman (1,0), because the
+/// Windows record is UTF-16 and carries every script while the Mac record is a
+/// single-byte codepage. A Mac record is used only while it is pure ASCII:
+/// reproducing it exactly needs a 128-entry table, and guessing would put the
+/// wrong character in a string whose whole job is to be exact.
+fn nameRecord(tbl: []const u8, id: u16, out: []u8) ?[]const u8 {
+    const count = at16(tbl, 2) orelse return null;
+    const storage = at16(tbl, 4) orelse return null;
+
+    var best_rank: u8 = 0;
+    var best_off: usize = 0;
+    var best_len: usize = 0;
+    var best_wide = false;
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const r = 6 + i * 12;
+        const plat = at16(tbl, r) orelse break;
+        const enc = at16(tbl, r + 2) orelse break;
+        const nid = at16(tbl, r + 6) orelse break;
+        const len = at16(tbl, r + 8) orelse break;
+        const off = at16(tbl, r + 10) orelse break;
+        if (nid != id) continue;
+
+        var rank: u8 = 0;
+        var wide = false;
+        if (plat == 3 and (enc == 1 or enc == 10)) {
+            rank = 2;
+            wide = true;
+        } else if (plat == 0) {
+            rank = 1;
+            wide = true;
+        } else if (plat == 1 and enc == 0) {
+            rank = 1;
+        }
+        if (rank == 0) continue;
+
+        const start = @as(usize, storage) + @as(usize, off);
+        const end = start + @as(usize, len);
+        // A record that points outside the table is not a name we can read.
+        if (end > tbl.len) continue;
+
+        if (!wide) {
+            var ascii = true;
+            for (tbl[start..end]) |ch| {
+                if (ch >= 0x80) {
+                    ascii = false;
+                    break;
+                }
+            }
+            if (!ascii) continue;
+        }
+
+        // Strictly better only: the first record of the best rank wins, so the
+        // pick does not depend on how many duplicates a font ships.
+        if (rank > best_rank) {
+            best_rank = rank;
+            best_off = start;
+            best_len = end - start;
+            best_wide = wide;
+        }
+    }
+
+    if (best_rank == 0) return null;
+    const body = tbl[best_off..][0..best_len];
+    if (best_wide) return utf16beToUtf8(body, out);
+    const n = @min(body.len, out.len);
+    @memcpy(out[0..n], body[0..n]);
+    return out[0..n];
+}
+
+/// UTF-16 big-endian to UTF-8, truncated at a codepoint boundary when `out` is
+/// too small for the whole string.
+fn utf16beToUtf8(s: []const u8, out: []u8) []const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i + 2 <= s.len) {
+        const u = std.mem.readInt(u16, s[i..][0..2], .big);
+        i += 2;
+        var cp: u21 = @intCast(u);
+        if (u >= 0xD800 and u <= 0xDBFF) {
+            // High half of a surrogate pair. A lone one is not text, so it
+            // becomes a placeholder rather than disappearing silently.
+            if (i + 2 <= s.len) {
+                const lo = std.mem.readInt(u16, s[i..][0..2], .big);
+                if (lo >= 0xDC00 and lo <= 0xDFFF) {
+                    i += 2;
+                    cp = 0x10000 + ((@as(u21, u) - 0xD800) << 10) + (@as(u21, lo) - 0xDC00);
+                } else cp = '?';
+            } else cp = '?';
+        } else if (u >= 0xDC00 and u <= 0xDFFF) {
+            cp = '?';
+        }
+        var enc: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(cp, &enc) catch continue;
+        if (n + len > out.len) break;
+        @memcpy(out[n..][0..len], enc[0..len]);
+        n += len;
+    }
+    return out[0..n];
+}
+
 fn w16(b: []u8, at: usize, v: u16) void {
     std.mem.writeInt(u16, b[at..][0..2], v, .big);
 }
@@ -2146,4 +2400,187 @@ test "every single-bit flip either loads cleanly or is rejected" {
             if (bit == 7) break;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// name, OS/2, and codepoint coverage
+// ---------------------------------------------------------------------------
+
+const NameSrc = struct { plat: u16, enc: u16, id: u16, body: []const u8 };
+
+/// Lay out a `name` table body: header, one record per source, then the
+/// strings. Strings go in the order given, so a record's offset is test data
+/// rather than something the builder hides.
+fn buildName(buf: []u8, srcs: []const NameSrc) []const u8 {
+    const base: usize = 6 + srcs.len * 12;
+    w16(buf, 0, 0); // format 0
+    w16(buf, 2, @intCast(srcs.len));
+    w16(buf, 4, @intCast(base));
+    var off: usize = 0;
+    for (srcs, 0..) |src, i| {
+        const r = 6 + i * 12;
+        w16(buf, r, src.plat);
+        w16(buf, r + 2, src.enc);
+        w16(buf, r + 4, 0x409); // language: en-US, which the lookup ignores
+        w16(buf, r + 6, src.id);
+        w16(buf, r + 8, @intCast(src.body.len));
+        w16(buf, r + 10, @intCast(off));
+        @memcpy(buf[base + off ..][0..src.body.len], src.body);
+        off += src.body.len;
+    }
+    return buf[0 .. base + off];
+}
+
+/// ASCII to the UTF-16BE the Windows records use.
+fn utf16be(dst: []u8, src: []const u8) []const u8 {
+    for (src, 0..) |ch, i| {
+        dst[i * 2] = 0;
+        dst[i * 2 + 1] = ch;
+    }
+    return dst[0 .. src.len * 2];
+}
+
+test "a name record decodes from UTF-16 big endian" {
+    var tbuf: [256]u8 = undefined;
+    var sbuf: [64]u8 = undefined;
+    const tbl = buildName(&tbuf, &.{.{
+        .plat = 3,
+        .enc = 1,
+        .id = @intFromEnum(NameId.family),
+        .body = utf16be(&sbuf, "GlyfZ Sans"),
+    }});
+    var out: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("GlyfZ Sans", nameRecord(tbl, 1, &out).?);
+}
+
+test "Microsoft Unicode beats Mac Roman for the same name id" {
+    var tbuf: [256]u8 = undefined;
+    var sbuf: [64]u8 = undefined;
+    // The Mac record is listed FIRST, so a lookup that just took the first
+    // match would return "Mac Name" and this test would fail.
+    const tbl = buildName(&tbuf, &.{
+        .{ .plat = 1, .enc = 0, .id = 1, .body = "Mac Name" },
+        .{ .plat = 3, .enc = 1, .id = 1, .body = utf16be(&sbuf, "Win Name") },
+    });
+    var out: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Win Name", nameRecord(tbl, 1, &out).?);
+}
+
+test "a Mac Roman record with a high byte is skipped, not guessed" {
+    var tbuf: [256]u8 = undefined;
+    // 0xE9 is e-acute in Mac Roman and something else in every other codepage.
+    const tbl = buildName(&tbuf, &.{.{
+        .plat = 1,
+        .enc = 0,
+        .id = 1,
+        .body = "Caf\xe9",
+    }});
+    var out: [64]u8 = undefined;
+    try std.testing.expect(nameRecord(tbl, 1, &out) == null);
+}
+
+test "a name record pointing outside its table is not read" {
+    var tbuf: [256]u8 = undefined;
+    var sbuf: [64]u8 = undefined;
+    const body = utf16be(&sbuf, "Out There");
+    // The slice aliases tbuf, so breaking the offset after building is
+    // breaking the very table being read.
+    const tbl = buildName(&tbuf, &.{.{ .plat = 3, .enc = 1, .id = 1, .body = body }});
+    w16(tbuf[0..], 6 + 10, 4000); // string now points far past the table
+    var out: [64]u8 = undefined;
+    try std.testing.expect(nameRecord(tbl, 1, &out) == null);
+}
+
+test "a name truncated by a small buffer stops at a codepoint boundary" {
+    var tbuf: [256]u8 = undefined;
+    var sbuf: [64]u8 = undefined;
+    const tbl = buildName(&tbuf, &.{.{
+        .plat = 3,
+        .enc = 1,
+        .id = 1,
+        .body = utf16be(&sbuf, "GlyfZ"),
+    }});
+    var small: [3]u8 = undefined;
+    try std.testing.expectEqualStrings("Gly", nameRecord(tbl, 1, &small).?);
+    var empty: [0]u8 = undefined;
+    try std.testing.expectEqualStrings("", nameRecord(tbl, 1, &empty).?);
+}
+
+test "a surrogate pair decodes to one codepoint" {
+    var tbuf: [256]u8 = undefined;
+    var body: [4]u8 = undefined;
+    // U+1F600, as the two halves UTF-16 actually uses.
+    std.mem.writeInt(u16, body[0..2], 0xD83D, .big);
+    std.mem.writeInt(u16, body[2..4], 0xDE00, .big);
+    const tbl = buildName(&tbuf, &.{.{ .plat = 3, .enc = 10, .id = 1, .body = &body }});
+    var out: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("\u{1F600}", nameRecord(tbl, 1, &out).?);
+}
+
+/// A table long enough for the version it claims, with the fields a test
+/// needs set and everything else left zero.
+fn buildOs2(buf: []u8, version: u16, len: usize) []const u8 {
+    @memset(buf[0..len], 0);
+    w16(buf, 0, version);
+    w16(buf, 4, 700); // usWeightClass: bold
+    w16(buf, 62, 0x20); // fsSelection: bold bit
+    w16(buf, 68, @bitCast(@as(i16, 1556))); // sTypoAscender
+    w16(buf, 70, @bitCast(@as(i16, -492))); // sTypoDescender
+    w16(buf, 74, 1901); // usWinAscent
+    w16(buf, 76, 483); // usWinDescent
+    if (len >= 90) {
+        w16(buf, 86, 1118); // sxHeight
+        w16(buf, 88, 1493); // sCapHeight
+    }
+    return buf[0..len];
+}
+
+test "OS/2 keeps the typographic metrics apart from the Windows ones" {
+    var buf: [96]u8 = undefined;
+    const o = os2Table(buildOs2(&buf, 4, 96)).?;
+    try std.testing.expectEqual(@as(u16, 1556), @as(u16, @bitCast(o.typo_ascender)));
+    try std.testing.expectEqual(@as(i16, -492), o.typo_descender);
+    try std.testing.expectEqual(@as(u16, 1901), o.win_ascent);
+    try std.testing.expectEqual(@as(i16, 1493), o.cap_height.?);
+    try std.testing.expectEqual(@as(i16, 1118), o.x_height.?);
+    try std.testing.expect(o.bold());
+    try std.testing.expect(!o.italic());
+}
+
+test "OS/2 below version 2 reports no cap height rather than zero" {
+    var buf: [96]u8 = undefined;
+    const o = os2Table(buildOs2(&buf, 0, 78)).?;
+    // 1493 and 1118 are still in the buffer; a version 0 table must not read
+    // them out of the reserved gap.
+    try std.testing.expect(o.cap_height == null);
+    try std.testing.expect(o.x_height == null);
+    try std.testing.expectEqual(@as(u16, 0), o.version);
+}
+
+test "a table too short for OS/2 fields is refused" {
+    var buf: [96]u8 = undefined;
+    try std.testing.expect(os2Table(buildOs2(&buf, 0, 40)) == null);
+}
+
+test "a face without name or OS/2 answers null instead of failing" {
+    var buf: [2048]u8 = undefined;
+    const f = try Font.init(buildTestFont(&buf, false));
+    var out: [32]u8 = undefined;
+    try std.testing.expect(f.family(&out) == null);
+    try std.testing.expect(f.style(&out) == null);
+    try std.testing.expect(f.os2() == null);
+}
+
+test "hasCodepoint separates .notdef from a real glyph" {
+    var buf: [2048]u8 = undefined;
+    const f = try Font.init(buildTestFont(&buf, false));
+    // The synthetic face maps 'A' to the triangle and 'B' to glyph 2, so both
+    // are present even though only one is drawn by the tests.
+    try std.testing.expect(f.hasCodepoint('A'));
+    try std.testing.expect(f.hasCodepoint('B'));
+    // 'C' falls in the format's terminal segment, which maps it arithmetically
+    // to a glyph this face does not have. That is absent, not present.
+    try std.testing.expect(!f.hasCodepoint('C'));
+    // Beyond the subtable's reach entirely, and still just "absent".
+    try std.testing.expect(!f.hasCodepoint(0x10FFFF));
 }

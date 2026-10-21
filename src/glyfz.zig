@@ -150,6 +150,73 @@ pub const Os2 = struct {
     }
 };
 
+/// The header of the `post` table: how the face says it should be set.
+///
+/// NOT what makes a face italic. `italic_angle` reports a slant the face
+/// already has; it neither selects an italic face nor applies an oblique. A
+/// renderer picks the face from `OS/2.fsSelection` (`Os2.italic`) and, if it
+/// synthesises a slant, decides the angle itself. What lives here is the
+/// underline geometry and a declaration of the angle, which is useful for
+/// reporting and for a caller that wants to place a rule under text.
+///
+/// Only the 32-byte header every version shares is read. The version 2.0 glyph
+/// name array is not: nothing here needs a glyph's PostScript name.
+pub const Post = struct {
+    /// Degrees counter-clockwise from upright, as a 16.16 fixed point value.
+    /// 0 on an upright face, negative for a typical oblique.
+    italic_angle: f32,
+    /// Suggested underline offset in font units, y up from the baseline.
+    /// Real fonts disagree about sign and sometimes leave this at zero, so
+    /// treat it as a suggestion rather than a measurement.
+    underline_position: i16,
+    underline_thickness: i16,
+    /// What the font believes about its own pitch. Unreliable enough that a
+    /// caller wanting to know should compare advances instead; reported here
+    /// because the table declares it and hiding it would be worse.
+    is_fixed_pitch: bool,
+
+    /// Horizontal offset per unit of height that a synthetic oblique needs:
+    /// the tangent of the lean, positive for a glyph leaning right.
+    ///
+    /// Apply as `x' = x + shear * y` with y measured UP from the baseline. This
+    /// is the only use the angle has: selecting an italic FACE is
+    /// `OS/2.fsSelection` bit 0 or `head.macStyle` bit 1, both already parsed.
+    /// A face with a non-zero angle is not thereby "the italic".
+    pub fn shear(self: Post) f32 {
+        return std.math.tan(-self.italic_angle * std.math.pi / 180.0);
+    }
+
+    /// Where to draw a rule under text, in font units, y up.
+    ///
+    /// The table's own numbers are frequently absent or nonsense: a thickness
+    /// of 0 draws nothing, and a position at or above the baseline detaches the
+    /// rule from the text it underlines. Both are substituted with the usual
+    /// proportions -- 5% of the em for thickness, 10% below the baseline for
+    /// position -- rather than returned as-is, because a caller left to
+    /// reimplement the substitution gains nothing from having read the table.
+    /// The raw fields are public for anyone who would rather decide themselves.
+    pub fn underline(self: Post, upem: u16) Underline {
+        const em: i32 = @intCast(upem);
+        return .{
+            .position = if (self.underline_position < 0)
+                self.underline_position
+            else
+                @intCast(@divTrunc(-em, 10)),
+            .thickness = if (self.underline_thickness > 0)
+                self.underline_thickness
+            else
+                @intCast(@max(1, @divTrunc(em, 20))),
+        };
+    }
+};
+
+/// A rule under text, in font units, y up.
+pub const Underline = struct {
+    /// Baseline offset, negative when the rule hangs below the baseline.
+    position: i16,
+    thickness: i16,
+};
+
 pub const Point = struct { x: i32, y: i32, on: bool };
 
 /// A glyph outline: all points, and the index of the LAST point of each
@@ -218,6 +285,11 @@ pub fn outlineBounds(o: Outline) Box {
 /// uses and stops a malformed one from recursing forever.
 pub const max_composite_depth = 8;
 
+/// Composite component flag 0x0200: this component's metrics are the
+/// composite's metrics. It is how a font builds e.g. "a with acute" so the
+/// pair measures like the base letter instead of like its bounding box.
+const use_my_metrics: u16 = 0x0200;
+
 const Span = struct { off: u32 = 0, len: u32 = 0 };
 
 fn tag(comptime s: *const [4]u8) u32 {
@@ -234,6 +306,7 @@ const tag_glyf = tag("glyf");
 const tag_loca = tag("loca");
 const tag_name = tag("name");
 const tag_os2 = tag("OS/2");
+const tag_post = tag("post");
 
 /// One loaded face. Borrows the bytes; they must outlive it.
 pub const Font = struct {
@@ -259,6 +332,7 @@ pub const Font = struct {
     loca: Span = .{},
     name_span: Span = .{},
     os2_span: Span = .{},
+    post_span: Span = .{},
 
     /// Parse the table directory and the metrics a caller needs up front.
     /// Fails loudly: a font GlyfZ cannot read should not silently measure zero.
@@ -301,6 +375,7 @@ pub const Font = struct {
             if (t == tag_loca) self.loca = span;
             if (t == tag_name) self.name_span = span;
             if (t == tag_os2) self.os2_span = span;
+            if (t == tag_post) self.post_span = span;
         }
 
         const head = try self.slice(self.head);
@@ -581,6 +656,35 @@ pub const Font = struct {
         return os2Table(tbl);
     }
 
+    /// The `post` header, or null when the face has none -- or when it has one
+    /// too short to hold the header at all.
+    ///
+    /// Same policy as `os2` and `name`: this is decoration, so a table GlyfZ
+    /// cannot read costs the caller a fallback, never a face. A caller that
+    /// needs to tell "absent" from "broken" has to parse the table itself.
+    pub fn post(self: Font) ?Post {
+        const tbl = self.slice(self.post_span) catch return null;
+        // The header every version shares. A shorter table is a table GlyfZ
+        // cannot read, which for decoration means falling back -- the reads
+        // below are then in range by construction, not by luck.
+        if (tbl.len < 32) return null;
+        const angle: i32 = @bitCast(u32At(tbl, 4) catch return null);
+        return .{
+            .italic_angle = @as(f32, @floatFromInt(angle)) / 65536.0,
+            .underline_position = i16At(tbl, 8) catch return null,
+            .underline_thickness = i16At(tbl, 10) catch return null,
+            .is_fixed_pitch = (u32At(tbl, 12) catch return null) != 0,
+        };
+    }
+
+    /// Where to draw a rule under text, with the substitutions
+    /// `Post.underline` applies. Null when the face has no readable `post`
+    /// table at all, which is legal -- a caller then uses its own proportions.
+    pub fn underline(self: Font) ?Underline {
+        const p = self.post() orelse return null;
+        return p.underline(self.units_per_em);
+    }
+
     /// Decode a glyph's outline into the caller's buffers, in font units.
     ///
     /// No allocation anywhere: `points` and `ends` are scratch the caller
@@ -701,10 +805,41 @@ pub const Font = struct {
         return .{ .w = w, .h = h, .x0 = box.x0, .y0 = box.y0, .coverage = coverage[0..need] };
     }
 
-    /// Horizontal metrics for a glyph. Ids past `numberOfHMetrics` repeat the
-    /// last advance and read their bearing from the trailing array -- that is
-    /// the format, not a shortcut.
+    /// Horizontal metrics for a glyph, straight out of `hmtx`. Ids past
+    /// `numberOfHMetrics` repeat the last advance and read their bearing from
+    /// the trailing array -- that is the format, not a shortcut.
+    ///
+    /// This is the RAW read and it does not consult `USE_MY_METRICS`: answering
+    /// that means reading the glyph's own `glyf` header and walking its
+    /// component records, which is real per-call work on a path a draw loop
+    /// enters once per glyph. Use `hMetricsResolved` where the flag matters, or
+    /// `Lookup`, which resolves each codepoint once and caches the answer.
     pub fn hMetrics(self: Font, gid: u16) GlyphError!HMetrics {
+        if (gid >= self.num_glyphs) return error.UnknownGlyph;
+        return self.hMetricsFromTable(gid);
+    }
+
+    /// Horizontal metrics with `USE_MY_METRICS` honoured: a composite that
+    /// flags one component reports that component's metrics, which is what the
+    /// flag is for -- the accented letter measures like the letter. Chains
+    /// through nested composites and stops at the same depth bound the outline
+    /// decoder uses.
+    pub fn hMetricsResolved(self: Font, gid: u16) GlyphError!HMetrics {
+        return self.hMetricsDepth(gid, 0);
+    }
+
+    fn hMetricsDepth(self: Font, gid: u16, depth: u32) GlyphError!HMetrics {
+        if (gid >= self.num_glyphs) return error.UnknownGlyph;
+        // A component can point back at the composite, so the chain needs the
+        // same depth bound the outline decoder has.
+        if (depth < max_composite_depth) {
+            if (try self.metricSource(gid)) |src| return self.hMetricsDepth(src, depth + 1);
+        }
+        return self.hMetricsFromTable(gid);
+    }
+
+    /// The `hmtx` read itself, with no flag resolution above it.
+    fn hMetricsFromTable(self: Font, gid: u16) GlyphError!HMetrics {
         if (gid >= self.num_glyphs) return error.UnknownGlyph;
         const hm = try self.slice(self.hmtx);
 
@@ -717,6 +852,44 @@ pub const Font = struct {
         const advance = try u16At(hm, @as(usize, last) * 4);
         const lsb_at = @as(usize, self.num_hmetrics) * 4 + @as(usize, gid - self.num_hmetrics) * 2;
         return .{ .advance = advance, .lsb = try i16At(hm, lsb_at) };
+    }
+
+    /// The component a composite takes its metrics from, if it flags one.
+    ///
+    /// This walks the component records only far enough to answer that, so the
+    /// record layout is known in two places: here and in `decodeComposite`.
+    /// That duplication is deliberate. The decoder is byte-exact against the
+    /// reference rasteriser and is not worth restructuring for a flag lookup;
+    /// the two would also have to agree on the transform keywords, which is
+    /// where a subtle divergence would hide. What they MUST agree on is record
+    /// length, and that is four flag bits adding 0, 2, 4 or 8 bytes.
+    inline fn metricSource(self: Font, gid: u16) GlyphError!?u16 {
+        const data = try glyphRange(self, gid);
+        // An empty range is a blank glyph; a positive contour count is simple.
+        if (data.len == 0) return null;
+        if (try i16At(data, 0) >= 0) return null;
+
+        var p: usize = 10;
+        var flags: u16 = 1 << 5; // enter the loop
+        while (flags & (1 << 5) != 0) {
+            flags = try u16At(data, p);
+            p += 2;
+            const comp = try u16At(data, p);
+            p += 2;
+            if (flags & use_my_metrics != 0) return comp;
+
+            // Two arguments, whatever they mean: offsets or point numbers.
+            p += if (flags & 0x0001 != 0) 4 else 2;
+
+            if (flags & 0x0008 != 0) {
+                p += 2;
+            } else if (flags & 0x0040 != 0) {
+                p += 4;
+            } else if (flags & 0x0080 != 0) {
+                p += 8;
+            }
+        }
+        return null;
     }
 };
 
@@ -1010,6 +1183,20 @@ fn decodeComposite(self: Font, data: []const u8, cur: *Cursor, depth: u32) Glyph
             p += 2;
             d = f2dot14(try i16At(data, p));
             p += 2;
+        }
+
+        // SCALED_COMPONENT_OFFSET: the offset is expressed in the component's
+        // own space, so the matrix applies to it too. UNSCALED_COMPONENT_OFFSET
+        // -- and the common case of neither flag, which is Microsoft's reading
+        // and what most fonts were built against -- leave it alone.
+        // ROUND_XY_TO_GRID (0x0004) and OVERLAP_COMPOUND (0x0400) are
+        // grid-fitting hints: nothing here hints, and the points land on
+        // integers below anyway, so neither can change this output.
+        if (flags & 0x0800 != 0) {
+            const ox = a * dx + c * dy;
+            const oy = b * dx + d * dy;
+            dx = ox;
+            dy = oy;
         }
 
         const start = cur.n;
@@ -1592,7 +1779,9 @@ pub const Lookup = struct {
 
         self.stats.misses += 1;
         const gid = try font.glyphIndex(cp);
-        const advance = (try font.hMetrics(gid)).advance;
+        // Resolved, not raw: this runs once per new codepoint, which is the
+        // one place the USE_MY_METRICS lookup is free.
+        const advance = (try font.hMetricsResolved(gid)).advance;
         // First free slot on the run, or the home slot when the table is full.
         // Overwriting the home slot is the cheapest eviction there is, and a
         // caller cannot feel it: the next resolve simply recomputes.
@@ -1865,12 +2054,12 @@ fn buildTestFont(buf: []u8, with_fmt12: bool) []const u8 {
     var w = W{ .buf = buf };
 
     w.u32v(0x0001_0000); // sfnt version
-    w.u16v(7); // numTables
+    w.u16v(8); // numTables
     w.u16v(0);
     w.u16v(0);
     w.u16v(0);
     const rec_base = w.at;
-    w.zeros(7 * 16);
+    w.zeros(8 * 16);
 
     // --- cmap ---
     const cmap_start = w.at;
@@ -2022,8 +2211,18 @@ fn buildTestFont(buf: []u8, with_fmt12: bool) []const u8 {
     w.u16v(8); // numGlyphs
     const r_maxp = Rec{ .at = maxp_start, .len = w.at - maxp_start };
 
-    const tags = [_]u32{ tag_cmap, tag_glyf, tag_loca, tag_head, tag_hhea, tag_hmtx, tag_maxp };
-    const recs = [_]Rec{ r_cmap, r_glyf, r_loca, r_head, r_hhea, r_hmtx, r_maxp };
+    // --- post 2.0: the 32-byte header every version shares ---
+    const post_start = w.at;
+    w.u32v(0x0002_0000);
+    w.u32v(0xFFF3_8000); // italicAngle -12.5, 16.16 fixed point
+    w.i16v(-100); // underlinePosition
+    w.i16v(50); // underlineThickness
+    w.u32v(0); // isFixedPitch
+    w.zeros(16); // the four memory-usage fields
+    const r_post = Rec{ .at = post_start, .len = w.at - post_start };
+
+    const tags = [_]u32{ tag_cmap, tag_glyf, tag_loca, tag_head, tag_hhea, tag_hmtx, tag_maxp, tag_post };
+    const recs = [_]Rec{ r_cmap, r_glyf, r_loca, r_head, r_hhea, r_hmtx, r_maxp, r_post };
     for (tags, recs, 0..) |t, r, i| patchRec(buf, rec_base + i * 16, t, r.at, r.len);
 
     return buf[0..w.at];
@@ -2297,6 +2496,7 @@ fn recSpan(buf: []const u8, n: usize) struct { off: usize, len_at: usize } {
 const rec_head = 3;
 const rec_hhea = 4;
 const rec_hmtx = 5;
+const rec_post = 7;
 
 test "a table shorter than its fields is refused, not read past" {
     var buf: [2048]u8 = undefined;
@@ -2768,4 +2968,205 @@ test "lookup: a buffer the size asked for is enough, anything less is refused" {
     var small: [need - 1]u8 align(8) = undefined;
     try std.testing.expectError(error.BufferTooSmall, Lookup.init(&small, .{ .slots = 16 }));
     try std.testing.expectError(error.BufferTooSmall, Lookup.init(&mem, .{ .slots = 0 }));
+}
+
+test "post reads the italic angle and underline the face declares" {
+    var buf: [2048]u8 = undefined;
+    const f = try Font.init(buildTestFont(&buf, false));
+    const p = f.post() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(f32, -12.5), p.italic_angle);
+    try std.testing.expectEqual(@as(i16, -100), p.underline_position);
+    try std.testing.expectEqual(@as(i16, 50), p.underline_thickness);
+    try std.testing.expect(!p.is_fixed_pitch);
+}
+
+test "post is decoration: absent or short reads as null, never as a bad face" {
+    var buf: [2048]u8 = undefined;
+
+    // Absent: the record is there but declares nothing.
+    const font = buildTestFont(&buf, false);
+    w32(buf[0..], recSpan(&buf, rec_post).len_at, 0);
+    const absent = try Font.init(buf[0..font.len]);
+    try std.testing.expect(absent.post() == null);
+
+    // Present, but shorter than the header every version shares.
+    const font2 = buildTestFont(&buf, false);
+    w32(buf[0..], recSpan(&buf, rec_post).len_at, 16);
+    const short = try Font.init(buf[0..font2.len]);
+    try std.testing.expect(short.post() == null);
+}
+
+test "a composite flagging USE_MY_METRICS measures as its component" {
+    var buf: [2048]u8 = undefined;
+    const font = buildTestFont(&buf, false);
+    const glyf = recSpan(&buf, 1).off;
+    // The composite is gid 7; its single component record starts after the
+    // 10-byte glyph header.
+    const comp_rec = glyf + 24 + 10;
+    const comp_gid = comp_rec + 2;
+
+    // gid 7's own metrics. Every glyph past numberOfHMetrics shares the last
+    // advance, so a bearing alone would not be proof -- the component below is
+    // pointed at gid 1, which differs in BOTH fields.
+    {
+        const f = try Font.init(buf[0..font.len]);
+        try std.testing.expectEqual(HMetrics{ .advance = 700, .lsb = 80 }, try f.hMetricsResolved(7));
+    }
+
+    // Same component placement, no flag: the composite keeps its own metrics.
+    w16(buf[0..], comp_gid, 1);
+    {
+        const f = try Font.init(buf[0..font.len]);
+        try std.testing.expectEqual(HMetrics{ .advance = 700, .lsb = 80 }, try f.hMetricsResolved(7));
+    }
+
+    // Set the flag and the composite takes gid 1's metrics wholesale.
+    w16(buf[0..], comp_rec, 0x0003 | 0x0200);
+    {
+        const f = try Font.init(buf[0..font.len]);
+        try std.testing.expectEqual(HMetrics{ .advance = 600, .lsb = 20 }, try f.hMetricsResolved(7));
+        try std.testing.expectEqual(HMetrics{ .advance = 600, .lsb = 20 }, try f.hMetricsResolved(1));
+
+        // The raw read is not the resolved one, and that separation is the
+        // point: a draw loop that never asks about the flag never pays for it.
+        try std.testing.expectEqual(HMetrics{ .advance = 700, .lsb = 80 }, try f.hMetrics(7));
+    }
+
+    // A component that flags the composite itself still terminates, and lands
+    // on the composite's own metrics once the depth bound is reached.
+    w16(buf[0..], comp_gid, 7);
+    {
+        const f = try Font.init(buf[0..font.len]);
+        try std.testing.expectEqual(HMetrics{ .advance = 700, .lsb = 80 }, try f.hMetricsResolved(7));
+    }
+}
+
+test "the flag is per component, and only composites can carry it" {
+    var buf: [2048]u8 = undefined;
+    const font = buildTestFont(&buf, false);
+    const glyf = recSpan(&buf, 1).off;
+    const comp_rec = glyf + 24 + 10;
+
+    // A simple glyph has no component records to walk, so it always reports its
+    // own metrics -- the walk must not read glyph data as if it were a record.
+    {
+        const f = try Font.init(buf[0..font.len]);
+        try std.testing.expectEqual(HMetrics{ .advance = 700, .lsb = 70 }, try f.hMetricsResolved(6));
+    }
+
+    // The flag on a component naming the composite's OWN metrics changes
+    // nothing, which is the one case where "flag set" and "flag clear" have to
+    // agree: gid 7 pointing at nothing it would inherit.
+    w16(buf[0..], comp_rec, 0x0003 | 0x0200);
+    {
+        const f = try Font.init(buf[0..font.len]);
+        // Component is gid 6, whose bearing differs from gid 7's.
+        try std.testing.expectEqual(HMetrics{ .advance = 700, .lsb = 70 }, try f.hMetricsResolved(7));
+    }
+}
+
+test "post turns its numbers into a lean and a rule a renderer can use" {
+    var buf: [2048]u8 = undefined;
+    const f = try Font.init(buildTestFont(&buf, false));
+    const p = f.post() orelse return error.TestUnexpectedResult;
+
+    // -12.5 degrees leans right, so the shear is tan(+12.5).
+    try std.testing.expectApproxEqAbs(@as(f32, 0.22169466), p.shear(), 1e-5);
+
+    // The table's own numbers are usable here, so they are returned untouched.
+    const u = f.underline() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i16, -100), u.position);
+    try std.testing.expectEqual(@as(i16, 50), u.thickness);
+}
+
+test "post substitutes a rule for the nonsense fonts actually ship" {
+    var buf: [2048]u8 = undefined;
+    const font = buildTestFont(&buf, false);
+    // A zero thickness draws nothing and a position on the baseline detaches
+    // the rule from the text. Both are common, and neither is worth honouring.
+    const post_at = recSpan(&buf, rec_post).off;
+    w32(buf[0..], post_at + 8, 0); // underlinePosition and underlineThickness
+    const f = try Font.init(font);
+    const u = f.underline() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i16, -102), u.position); // -1024 / 10
+    try std.testing.expectEqual(@as(i16, 51), u.thickness); // 1024 / 20
+
+    // An upright face has no lean to synthesise.
+    w32(buf[0..], post_at + 4, 0);
+    const upright = try Font.init(font);
+    try std.testing.expectEqual(@as(f32, 0), (upright.post() orelse return error.TestUnexpectedResult).shear());
+}
+
+test "a scaled component offset is scaled, and the default is not" {
+    var buf: [2048]u8 = undefined;
+    const font = buildTestFont(&buf, false);
+    const glyf = recSpan(&buf, 1).off;
+    // The same 18-byte component record, re-laid out: byte args plus one scale
+    // instead of word args, so no other glyph moves and the record still ends
+    // exactly where it did.
+    const at = glyf + 24 + 10;
+    w16(buf[0..], at, 0x0002 | 0x0008); // XY values, WE_HAVE_A_SCALE
+    buf[at + 4] = 4; // dx
+    buf[at + 5] = 6; // dy
+    w16(buf[0..], at + 6, 0x2000); // scale 0.5
+
+    var pts: [16]Point = undefined;
+    var ends: [4]u16 = undefined;
+
+    // Neither offset flag: the matrix scales the OUTLINE but not the offset, so
+    // the triangle lands at 0.5 * p + (4, 6).
+    {
+        const f = try Font.init(font);
+        const o = try f.outline(7, &pts, &ends);
+        try std.testing.expectEqual(@as(usize, 3), o.points.len);
+        try std.testing.expectEqual(Point{ .x = 4, .y = 6, .on = true }, o.points[0]);
+        try std.testing.expectEqual(Point{ .x = 54, .y = 6, .on = true }, o.points[1]);
+        try std.testing.expectEqual(Point{ .x = 29, .y = 56, .on = true }, o.points[2]);
+    }
+
+    // SCALED_COMPONENT_OFFSET: the offset rides through the matrix too, so it
+    // becomes (0.5 * 4, 0.5 * 6) and the whole component moves.
+    w16(buf[0..], at, 0x0002 | 0x0008 | 0x0800);
+    {
+        const f = try Font.init(font);
+        const o = try f.outline(7, &pts, &ends);
+        try std.testing.expectEqual(Point{ .x = 2, .y = 3, .on = true }, o.points[0]);
+        try std.testing.expectEqual(Point{ .x = 52, .y = 3, .on = true }, o.points[1]);
+        try std.testing.expectEqual(Point{ .x = 27, .y = 53, .on = true }, o.points[2]);
+    }
+}
+
+test "Lookup stores the RESOLVED advance, so a hit cannot report a stale one" {
+    var buf: [2048]u8 = undefined;
+    const font = buildTestFont(&buf, false);
+    const glyf = recSpan(&buf, 1).off;
+    const comp_rec = glyf + 24 + 10;
+    const comp_gid = comp_rec + 2;
+
+    // The composite takes gid 1's metrics, which differ from its own in both
+    // fields, and 'B' is repointed at the composite so it is reachable from a
+    // codepoint the way a real accented letter would be.
+    w16(buf[0..], comp_gid, 1);
+    w16(buf[0..], comp_rec, 0x0003 | 0x0200);
+    w16(buf[0..], recSpan(&buf, 0).off + 42, 0xFFC5); // idDelta[1]: 'B' -> gid 7
+
+    const f = try Font.init(font);
+    try std.testing.expectEqual(@as(u16, 7), try f.glyphIndex(0x42));
+
+    // The two reads disagree, which is what makes the assertion below bite.
+    try std.testing.expectEqual(HMetrics{ .advance = 700, .lsb = 80 }, try f.hMetrics(7));
+    try std.testing.expectEqual(HMetrics{ .advance = 600, .lsb = 20 }, try f.hMetricsResolved(7));
+
+    var mem: [Lookup.needed(.{ .slots = 16 })]u8 align(8) = undefined;
+    var l = try Lookup.init(&mem, .{ .slots = 16 });
+
+    const first = try l.resolve(f, 0x42);
+    try std.testing.expectEqual(@as(u16, 7), first.gid);
+    try std.testing.expectEqual(@as(u16, 600), first.advance);
+    try std.testing.expectEqual(@as(u32, 1), l.stats.misses);
+
+    // Served from the slot, and still the resolved number.
+    const again = try l.resolve(f, 0x42);
+    try std.testing.expectEqual(@as(u16, 600), again.advance);
+    try std.testing.expectEqual(@as(u32, 1), l.stats.hits);
 }

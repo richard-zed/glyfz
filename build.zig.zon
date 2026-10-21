@@ -1,0 +1,13 @@
+.{
+    .name = .cedar,
+    .version = "0.0.1",
+    .fingerprint = 0x997bd4bb8cd43b08,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+}

@@ -639,7 +639,7 @@ pub const Font = struct {
     /// than the name means a caller's buffer was too small.
     pub fn name(self: Font, id: NameId, out: []u8) ?[]const u8 {
         const tbl = self.slice(self.name_span) catch return null;
-        return nameRecord(tbl, @intFromEnum(id), out);
+        return nameRecord(tbl, @backingInt(id), out);
     }
 
     /// Family name, e.g. "DejaVu Sans". This is the string a theme file's font
@@ -1489,11 +1489,11 @@ pub const Phase = enum(u2) { zero = 0, quarter = 1, half = 2, three_quarters = 3
 pub fn phaseOf(x: f32) Phase {
     const frac = x - @floor(x);
     const q: u32 = @intFromFloat(@floor(frac * 4.0 + 0.5));
-    return @enumFromInt(@as(u2, @intCast(q & 3)));
+    return @fromBackingInt(@intCast(@as(u2, @intCast(q & 3))));
 }
 
 pub fn phaseOffset(p: Phase) f32 {
-    return @as(f32, @floatFromInt(@intFromEnum(p))) * 0.25;
+    return @as(f32, @floatFromInt(@backingInt(p))) * 0.25;
 }
 
 /// A rasterised glyph, owned by the cache. Valid until the cache fills up and
@@ -1661,7 +1661,7 @@ pub const Cache = struct {
         // lattice would let two neighbouring sizes share a mask, which is the
         // wrong glyph by design; a caller that animates size loses hit rate
         // instead, and that is the honest failure.
-        var key: u64 = (@as(u64, gid) << 40) ^ (@as(u64, scale_key) << 2) ^ @intFromEnum(phase);
+        var key: u64 = (@as(u64, gid) << 40) ^ (@as(u64, scale_key) << 2) ^ @backingInt(phase);
         key *%= 0x9E3779B97F4A7C15;
         key ^= key >> 29;
         return @as(usize, key >> 16) % self.slots.len;
@@ -2774,7 +2774,7 @@ test "a name record decodes from UTF-16 big endian" {
     const tbl = buildName(&tbuf, &.{.{
         .plat = 3,
         .enc = 1,
-        .id = @intFromEnum(NameId.family),
+        .id = @backingInt(NameId.family),
         .body = utf16be(&sbuf, "GlyfZ Sans"),
     }});
     var out: [64]u8 = undefined;

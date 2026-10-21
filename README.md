@@ -41,14 +41,16 @@ Two properties are the whole point:
 | `OS/2` weight, selection, typographic and Windows metrics, cap and x-height | done |
 | `cmap` formats 4 and 12 | done |
 | `glyf` / `loca` outlines, simple and composite | done |
+| composite metrics (`USE_MY_METRICS`) and scaled component offsets | done |
 | coverage: exact-area sweep, caller-owned buffers | done |
 | load-time validation, scoped errors | done |
 | `name`, decoded to UTF-8, with an encoding preference | done |
 | `kern` format 0 | done |
 | `hasCodepoint`, for asking a fallback chain's question | done |
 | glyph cache, keyed on glyph + scale + phase | done |
+| codepoint lookup cache, carrying the resolved advance | done |
 | malformed input: truncation and bit-flip sweeps | done |
-| `post`: italic angle, underline | not started |
+| `post`: italic angle, underline, fixed pitch | done |
 | hinting, CFF/CFF2, variable axes, colour fonts, GPOS, kern 2/3 | out of scope |
 
 `kern` is format 0 only, which is what stb reads. Apple's version 1 layout is
@@ -80,6 +82,14 @@ while `OS/2` carries three, and on real faces they disagree: DejaVu Sans is
 1556/-492 typographic against 1901/-483 in `hhea`. Anything sizing a line by
 ascender-descender gets a different height depending on which pair it reads.
 
+`post()` is the same kind of table and gets the same treatment: the 32-byte
+header every version shares, and null when the table is absent or too short.
+`shear()` turns `italic_angle` into the tangent a synthetic oblique needs, and
+`underline(upem)` returns a position and thickness with the table's own zeros
+replaced by the usual proportions -- a zero thickness draws nothing, so handing
+it back would only make every caller reimplement the substitution. The angle
+does not select an italic face. `fsSelection` does that, and it is already read.
+
 ## Scope
 
 `glyf`-based fonts only. The reference implementation
@@ -88,17 +98,23 @@ differential nor the per-glyph comparison can be re-run from this repository.
 What they found is recorded below.
 
 Where the two disagreed, the OpenType spec decided, and the disagreement is
-documented rather than papered over. Two exist: `cmap` format 4 applies
-`idDelta` to a value fetched through a non-zero `idRangeOffset` (stb returns it
-unchanged), and composite transforms are applied as given (stb multiplies by
-each column's norm, which squares a uniform scale). They agree on translate-only
-composites.
+documented rather than papered over. Three exist, and all three are places the
+differential could not have voted on, because it was grading against stb:
+
+- `cmap` format 4 applies `idDelta` to a value fetched through a non-zero
+  `idRangeOffset`; stb returns that value unchanged.
+- Composite transforms are applied as given; stb multiplies by each column's
+  norm, which squares a uniform scale.
+- `SCALED_COMPONENT_OFFSET` is honoured; stb ignores the flag, so a transformed
+  component lands at its unscaled offset there and its scaled offset here.
+
+The first two agree on translate-only composites, and so does the third.
 
 ## What was checked
 
 Two checks still in this repo:
 
-- **`zig build test`** -- the unit suite, 37 tests, no font file needed. The
+- **`zig build test`** -- the unit suite, 49 tests, no font file needed. The
   coverage sweep is graded against brute-force supersampling and hand-computed
   shapes, so it is never marked by its own algebra.
 - **`zig build fuzz -Dfont=<ttf>`** -- a truncated face at every 4000th byte,
@@ -144,6 +160,10 @@ Read that honestly: the rasteriser is at parity at UI sizes and behind at
 display sizes. It is not faster than stb. The cache is where the win is, and it
 is a win stb cannot match at the call site, because stb has no cache at all.
 
+The cache-hit column came from the harness that no longer ships; `bench` prints
+its own cached figure, and the two have disagreed by several times over while the
+raster column matched. Treat that column as a magnitude, not a measurement.
+
 `zig build bench -Doptimize=ReleaseFast -Dfont=<ttf>` reproduces the raster,
 decode and cache columns, and nothing else, since there is no second
 implementation here to compare against.
@@ -173,13 +193,15 @@ No font is vendored, so `bench` and `fuzz` both need `-Dfont=` (or
 - **The cache flush policy is unmeasured under a real working set.** The arena
   is a bump allocator, so filling it drops everything and `stats.flushes` says
   so. One alphabet at one size is not a UI.
-- **Composite flags are not audited.** `USE_MY_METRICS`, `ROUND_XY_TO_GRID` and
-  the scaled/unscaled component offset rules are shared with stb, so a
-  differential could not have seen them even when one was here. They need their
-  own tests.
-- **One consumer, reached by absolute path.** A Zig GUI toolkit links this from
-  a machine-local path, which is not how anyone else would consume it. There is
-  no published package.
+- **No real face exercises the composite flags.** `USE_MY_METRICS` and the
+  scaled offset rule have their own tests, on a synthetic font, because DejaVu
+  Sans sets the metrics flag on 840 composites and not one advance changes. The
+  code follows the spec; no font here proves a rendering depends on it.
+  `ROUND_XY_TO_GRID` and `OVERLAP_COMPOUND` are grid-fitting hints, and an
+  unhinted rasteriser cannot honour either.
+- **The one consumer pins a commit.** A Zig GUI toolkit links this at a specific
+  revision rather than by version range, so an API change here reaches it only
+  when that pin is moved on purpose. Nothing else consumes GlyfZ.
 
 ## Licence
 

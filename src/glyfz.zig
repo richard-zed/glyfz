@@ -12,8 +12,11 @@
 //! 2. **The spec decides, not the reference.** GlyfZ was developed against
 //!    stb_truetype as a differential oracle, which is no longer vendored here.
 //!    Where the two disagreed the disagreement is a finding to write down, not
-//!    a bug in GlyfZ by default. Two are documented at `cmapFormat4` and in the
-//!    composite decoder.
+//!    a bug in GlyfZ by default. Three are documented: `cmapFormat4` applies
+//!    `idDelta` to a value fetched through a non-zero `idRangeOffset` where stb
+//!    does not, composite transforms are applied as given where stb multiplies by
+//!    each column's norm, and `SCALED_COMPONENT_OFFSET` is honoured where stb
+//!    ignores it entirely.
 //! 3. **Failures are scoped.** `LoadError` means discard the face;
 //!    `GlyphError` means this one glyph failed and the face is still good. GlyfZ
 //!    propagates both and never substitutes a glyph silently -- deciding to keep
@@ -831,7 +834,11 @@ pub const Font = struct {
     fn hMetricsDepth(self: Font, gid: u16, depth: u32) GlyphError!HMetrics {
         if (gid >= self.num_glyphs) return error.UnknownGlyph;
         // A component can point back at the composite, so the chain needs the
-        // same depth bound the outline decoder has.
+        // same depth bound the outline decoder has. Past the bound the walk
+        // stops and the glyph answers from its own hmtx rather than erroring:
+        // metrics are what layout needs, and refusing them would lose a whole
+        // line of text to a font's bad component record. The outline decoder is
+        // where a looping composite actually gets refused.
         if (depth < max_composite_depth) {
             if (try self.metricSource(gid)) |src| return self.hMetricsDepth(src, depth + 1);
         }

@@ -1167,6 +1167,216 @@ fn sweep(edges: []Edge, w: u32, h: u32, scratch: []f32, coverage: []u8) GlyphErr
 }
 
 // ---------------------------------------------------------------------------
+// glyph cache
+// ---------------------------------------------------------------------------
+
+/// Sub-pixel phase classes a cached mask can take. A mask is rasterised at one
+/// of these and then placed on a pixel boundary, so the residual offset inside
+/// the phase is dropped. Four classes hold that error under 1/8 px, which is
+/// finer than hinting moves a stem anyway -- and the alternative, keying on the
+/// exact float, turns the cache into a leak with extra steps.
+pub const Phase = enum(u2) { zero = 0, quarter = 1, half = 2, three_quarters = 3 };
+
+pub fn phaseOf(x: f32) Phase {
+    const frac = x - @floor(x);
+    const q: u32 = @intFromFloat(@floor(frac * 4.0 + 0.5));
+    return @enumFromInt(@as(u2, @intCast(q & 3)));
+}
+
+pub fn phaseOffset(p: Phase) f32 {
+    return @as(f32, @floatFromInt(@intFromEnum(p))) * 0.25;
+}
+
+/// A rasterised glyph, owned by the cache. Valid until the cache fills up and
+/// flushes; blit it before asking for the next glyph.
+pub const Mask = struct {
+    w: u32 = 0,
+    h: u32 = 0,
+    x0: i32 = 0,
+    y0: i32 = 0,
+    pixels: []const u8 = &.{},
+};
+
+/// Glyph masks kept between draws, so a repeated glyph costs a lookup instead
+/// of a rasterisation.
+///
+/// All of its memory is one caller-owned buffer. Cedar still does not allocate:
+/// the caller decides the size once, from `needed()`, and this carves that into
+/// the slot table, the outline scratch and the pixel arena.
+///
+/// The arena is a bump allocator and the policy when it fills is to drop
+/// everything. Reclaiming a dead mask from the middle of a bump region is not
+/// possible without a compaction pass, and a compaction pass costs more than
+/// re-rasterising a working set that did not fit in the first place. If the
+/// flush count is high, the buffer is too small -- that is the signal to look
+/// at, and it is reported rather than hidden.
+pub const Cache = struct {
+    pub const Options = struct {
+        slots: u16 = 512,
+        max_points: u16 = 1024,
+        max_ends: u16 = 256,
+        max_edges: u16 = 1024,
+        /// Widest box the sweep can accumulate, in pixels.
+        max_width: u16 = 256,
+        /// Pixel-arena bytes.
+        arena: u32 = 256 * 1024,
+    };
+
+    pub const Stats = struct {
+        hits: u64 = 0,
+        misses: u64 = 0,
+        flushes: u64 = 0,
+    };
+
+    const Slot = struct {
+        gid: u16 = 0,
+        ppem: u16 = 0,
+        phase: Phase = .zero,
+        off: u32 = 0,
+        w: u32 = 0,
+        h: u32 = 0,
+        x0: i32 = 0,
+        y0: i32 = 0,
+        valid: bool = false,
+    };
+
+    mem: []align(8) u8,
+    slots: []Slot,
+    points: []Point,
+    ends: []u16,
+    edges: []Edge,
+    scratch: []f32,
+    arena_at: usize,
+    arena_len: usize,
+    used: usize,
+    stats: Stats = .{},
+
+    /// How much memory `init` wants for this configuration.
+    pub fn needed(opts: Options) usize {
+        var total: usize = 0;
+        total += @as(usize, opts.slots) * @sizeOf(Slot);
+        total = std.mem.alignForward(usize, total, @alignOf(Point)) + @as(usize, opts.max_points) * @sizeOf(Point);
+        total = std.mem.alignForward(usize, total, @alignOf(u16)) + @as(usize, opts.max_ends) * @sizeOf(u16);
+        total = std.mem.alignForward(usize, total, @alignOf(Edge)) + @as(usize, opts.max_edges) * @sizeOf(Edge);
+        total = std.mem.alignForward(usize, total, @alignOf(f32)) + (@as(usize, opts.max_width) * 2 + 2) * @sizeOf(f32);
+        total = std.mem.alignForward(usize, total, 8) + @as(usize, opts.arena);
+        return total;
+    }
+
+    pub fn init(mem: []align(8) u8, opts: Options) GlyphError!Cache {
+        if (mem.len < needed(opts)) return error.BufferTooSmall;
+        var off: usize = 0;
+        const slots = takeSlice(Slot, mem, &off, opts.slots);
+        const points = takeSlice(Point, mem, &off, opts.max_points);
+        const ends = takeSlice(u16, mem, &off, opts.max_ends);
+        const edges = takeSlice(Edge, mem, &off, opts.max_edges);
+        const scratch = takeSlice(f32, mem, &off, @as(usize, opts.max_width) * 2 + 2);
+        const arena_at = std.mem.alignForward(usize, off, 8);
+
+        var c = Cache{
+            .mem = mem,
+            .slots = slots,
+            .points = points,
+            .ends = ends,
+            .edges = edges,
+            .scratch = scratch,
+            .arena_at = arena_at,
+            .arena_len = mem.len - arena_at,
+            .used = 0,
+        };
+        c.clear();
+        return c;
+    }
+
+    /// The mask for this glyph at this pixel size and phase, rasterising it if
+    /// it is not already held.
+    pub fn mask(self: *Cache, font: Font, gid: u16, ppem: u16, phase: Phase) GlyphError!Mask {
+        if (self.find(gid, ppem, phase)) |s| {
+            self.stats.hits += 1;
+            const at = self.arena_at + s.off;
+            return .{ .w = s.w, .h = s.h, .x0 = s.x0, .y0 = s.y0, .pixels = self.mem[at..][0 .. @as(usize, s.w) * s.h] };
+        }
+
+        self.stats.misses += 1;
+        if (ppem == 0 or font.units_per_em == 0) return .{};
+        const scale = @as(f32, @floatFromInt(ppem)) / @as(f32, @floatFromInt(font.units_per_em));
+        const ph = phaseOffset(phase);
+        const box = try font.bitmapBox(gid, scale, ph);
+        const w: u32 = if (box.x1 > box.x0) @intCast(box.x1 - box.x0) else 0;
+        const h: u32 = if (box.y1 > box.y0) @intCast(box.y1 - box.y0) else 0;
+        if (w == 0 or h == 0) return .{ .x0 = box.x0, .y0 = box.y0 };
+        const len = @as(usize, w) * h;
+
+        var slot = self.freeSlot(gid, ppem, phase);
+        if (slot == null or self.used + len > self.arena_len) {
+            self.clear();
+            if (len > self.arena_len) return error.BufferTooSmall;
+            slot = self.freeSlot(gid, ppem, phase);
+        }
+        const s = slot orelse return error.BufferTooSmall;
+        const at = self.arena_at + self.used;
+        const r = try font.raster(gid, scale, ph, self.points, self.ends, self.edges, self.scratch, self.mem[at..][0..len]);
+
+        s.* = .{
+            .gid = gid,
+            .ppem = ppem,
+            .phase = phase,
+            .off = @intCast(self.used),
+            .w = r.w,
+            .h = r.h,
+            .x0 = r.x0,
+            .y0 = r.y0,
+            .valid = true,
+        };
+        self.used += len;
+        return .{ .w = r.w, .h = r.h, .x0 = r.x0, .y0 = r.y0, .pixels = r.coverage };
+    }
+
+    /// Open addressing with linear probing. A linear scan over the slot table
+    /// would cost more than the rasterisation it is trying to avoid, which is
+    /// the whole reason the cache exists.
+    fn probeStart(self: *Cache, gid: u16, ppem: u16, phase: Phase) usize {
+        const key: u32 = (@as(u32, gid) << 18) | (@as(u32, ppem) << 2) | @intFromEnum(phase);
+        const h = key *% 2654435761;
+        return @as(usize, h >> 8) % self.slots.len;
+    }
+
+    fn find(self: *Cache, gid: u16, ppem: u16, phase: Phase) ?*Slot {
+        const start = self.probeStart(gid, ppem, phase);
+        var i: usize = 0;
+        while (i < self.slots.len) : (i += 1) {
+            const s = &self.slots[(start + i) % self.slots.len];
+            if (!s.valid) return null; // an empty slot ends the probe run
+            if (s.gid == gid and s.ppem == ppem and s.phase == phase) return s;
+        }
+        return null;
+    }
+
+    fn freeSlot(self: *Cache, gid: u16, ppem: u16, phase: Phase) ?*Slot {
+        const start = self.probeStart(gid, ppem, phase);
+        var i: usize = 0;
+        while (i < self.slots.len) : (i += 1) {
+            const s = &self.slots[(start + i) % self.slots.len];
+            if (!s.valid) return s;
+        }
+        return null;
+    }
+
+    fn clear(self: *Cache) void {
+        if (self.used != 0 or self.stats.flushes != 0) self.stats.flushes += 1;
+        for (self.slots) |*s| s.valid = false;
+        self.used = 0;
+    }
+};
+
+fn takeSlice(comptime T: type, mem: []align(8) u8, off: *usize, n: usize) []T {
+    const start = std.mem.alignForward(usize, off.*, @alignOf(T));
+    off.* = start + n * @sizeOf(T);
+    const p: [*]T = @ptrCast(@alignCast(mem.ptr + start));
+    return p[0..n];
+}
+
+// ---------------------------------------------------------------------------
 // bounds-checked big-endian reads
 // ---------------------------------------------------------------------------
 
@@ -1735,4 +1945,94 @@ test "a composite that refers to itself stops at the depth limit" {
     var pts: [64]Point = undefined;
     var ends: [8]u16 = undefined;
     try std.testing.expectError(error.CompositeTooDeep, f.outline(7, &pts, &ends));
+}
+
+test "a cached mask matches a direct rasterisation, and repeats are hits" {
+    var fb: [2048]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fb, false));
+
+    var pts: [256]Point = undefined;
+    var ends: [16]u16 = undefined;
+    var edges: [256]Edge = undefined;
+    var scratch: [2 * 64 + 2]f32 = undefined;
+    var cov: [64 * 64]u8 = undefined;
+
+    var cbuf: [64 * 1024]u8 align(8) = undefined;
+    var cache = try Cache.init(&cbuf, .{ .slots = 16, .max_points = 256, .max_edges = 256, .max_width = 64, .arena = 48 * 1024 });
+
+    const ppem: u16 = 16;
+    const scale = @as(f32, @floatFromInt(ppem)) / @as(f32, @floatFromInt(font.units_per_em));
+    const direct = try font.raster(6, scale, 0, &pts, &ends, &edges, &scratch, &cov);
+
+    const first = try cache.mask(font, 6, ppem, .zero);
+    try std.testing.expectEqual(@as(u64, 0), cache.stats.hits);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.misses);
+    try std.testing.expectEqual(direct.w, first.w);
+    try std.testing.expectEqual(direct.h, first.h);
+    try std.testing.expectEqualSlices(u8, direct.coverage, first.pixels);
+
+    const second = try cache.mask(font, 6, ppem, .zero);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.hits);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.misses);
+    try std.testing.expectEqualSlices(u8, first.pixels, second.pixels);
+}
+
+test "the cache key covers size and phase, not just the glyph" {
+    var fb: [2048]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fb, false));
+    var cbuf: [64 * 1024]u8 align(8) = undefined;
+    var cache = try Cache.init(&cbuf, .{ .slots = 16, .max_points = 256, .max_edges = 256, .max_width = 64, .arena = 48 * 1024 });
+
+    _ = try cache.mask(font, 6, 16, .zero);
+    _ = try cache.mask(font, 6, 16, .zero);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.hits);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.misses);
+
+    // A different size is a different mask, and so is a different phase.
+    _ = try cache.mask(font, 6, 17, .zero);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats.misses);
+    _ = try cache.mask(font, 6, 16, .half);
+    try std.testing.expectEqual(@as(u64, 3), cache.stats.misses);
+
+    _ = try cache.mask(font, 6, 16, .zero);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats.hits);
+}
+
+test "a full arena flushes instead of handing back stale pixels" {
+    var fb: [2048]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fb, false));
+
+    var pts: [256]Point = undefined;
+    var ends: [16]u16 = undefined;
+    var edges: [256]Edge = undefined;
+    var scratch: [2 * 64 + 2]f32 = undefined;
+    var cov: [64 * 64]u8 = undefined;
+
+    // Room for a couple of masks, so a spread of sizes must evict.
+    var cbuf: [64 * 1024]u8 align(8) = undefined;
+    var cache = try Cache.init(&cbuf, .{ .slots = 16, .max_points = 256, .max_edges = 256, .max_width = 64, .arena = 512 });
+
+    var ppem: u16 = 6;
+    var last: Mask = .{};
+    while (ppem < 40) : (ppem += 1) {
+        last = try cache.mask(font, 6, ppem, .zero);
+    }
+    try std.testing.expect(cache.stats.flushes > 0);
+
+    // Whatever survived the flush has to be a correct rasterisation of THIS
+    // key, which is the failure a stale offset would produce.
+    const scale = @as(f32, @floatFromInt(@as(u16, 39))) / @as(f32, @floatFromInt(font.units_per_em));
+    const direct = try font.raster(6, scale, 0, &pts, &ends, &edges, &scratch, &cov);
+    try std.testing.expectEqualSlices(u8, direct.coverage, last.pixels);
+}
+
+test "phase classes quantise to the nearest quarter pixel" {
+    try std.testing.expectEqual(Phase.zero, phaseOf(0.0));
+    try std.testing.expectEqual(Phase.zero, phaseOf(0.1));
+    try std.testing.expectEqual(Phase.quarter, phaseOf(0.2));
+    try std.testing.expectEqual(Phase.half, phaseOf(0.5));
+    try std.testing.expectEqual(Phase.three_quarters, phaseOf(0.8));
+    try std.testing.expectEqual(Phase.zero, phaseOf(1.0));
+    try std.testing.expectEqual(Phase.half, phaseOf(3.5));
+    try std.testing.expectEqual(@as(f32, 0.5), phaseOffset(.half));
 }

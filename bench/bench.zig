@@ -63,8 +63,12 @@ pub fn main() !void {
 
     const span: f32 = @floatFromInt(font.vMetrics().ascender - font.vMetrics().descender);
 
+    // The cache never allocates: one caller-owned buffer, carved internally.
+    var cbuf: [1 << 21]u8 align(8) = undefined;
+    var cache = try cedar.Cache.init(&cbuf, .{ .arena = 1 << 20 });
+
     std.debug.print("{d} glyphs from printable ASCII\n\n", .{n});
-    std.debug.print("{s:>6} {s:>11} {s:>11} {s:>11} {s:>8}\n", .{ "size", "stb ns", "cedar ns", "decode ns", "ratio" });
+    std.debug.print("{s:>6} {s:>11} {s:>11} {s:>11} {s:>8} {s:>11} {s:>9}\n", .{ "size", "stb ns", "cedar ns", "decode ns", "ratio", "cached ns", "vs stb" });
 
     for ([_]u32{ 11, 16, 24, 34, 48 }) |size| {
         const scale = @as(f32, @floatFromInt(size)) / span;
@@ -121,7 +125,21 @@ pub fn main() !void {
 
         const per_stb = @as(f64, @floatFromInt(best_stb)) / @as(f64, @floatFromInt(n));
         const per_cedar = @as(f64, @floatFromInt(best_cedar)) / @as(f64, @floatFromInt(n));
+        // Cached: warm the whole set (every one a miss), then time pure hits.
+        const ppem: u16 = @intFromFloat(@round(scale * @as(f32, @floatFromInt(font.units_per_em))));
+        for (glyphs[0..n]) |gid| _ = cache.mask(font, gid, ppem, .zero) catch continue;
+
+        var best_cached: i128 = std.math.maxInt(i128);
+        r = 0;
+        while (r < reps) : (r += 1) {
+            const t0 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+            for (glyphs[0..n]) |gid| _ = cache.mask(font, gid, ppem, .zero) catch continue;
+            const t1 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+            best_cached = @min(best_cached, t1 - t0);
+        }
+        const per_cached = @as(f64, @floatFromInt(best_cached)) / @as(f64, @floatFromInt(n));
+
         const per_decode = @as(f64, @floatFromInt(best_decode)) / @as(f64, @floatFromInt(n));
-        std.debug.print("{d:>6} {d:>11.1} {d:>11.1} {d:>11.1} {d:>7.2}x\n", .{ size, per_stb, per_cedar, per_decode, per_stb / per_cedar });
+        std.debug.print("{d:>6} {d:>11.1} {d:>11.1} {d:>11.1} {d:>7.2}x {d:>11.1} {d:>8.1}x\n", .{ size, per_stb, per_cedar, per_decode, per_stb / per_cedar, per_cached, per_stb / per_cached });
     }
 }

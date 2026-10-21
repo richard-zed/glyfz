@@ -1,6 +1,6 @@
 .{
     .name = .cedar,
-    .version = "0.0.1",
+    .version = "0.1.0",
     .fingerprint = 0x997bd4bb8cd43b08,
     .minimum_zig_version = "0.16.0",
     .paths = .{
@@ -9,5 +9,8 @@
         "src",
         "README.md",
         "LICENSE",
+        "bench",
+        "oracle",
+        "test",
     },
 }

@@ -1,22 +1,27 @@
 //! Cedar -- a TrueType rasteriser.
 //!
-//! Slice 1 is the table layer and glyph metrics: enough to answer "which glyph
-//! is this codepoint, how wide is it, and where is the baseline" without
-//! rasterising anything. Coverage follows, and it is the part that has to be
-//! right rather than merely plausible.
+//! Reads `glyf`-based fonts, turns outlines into antialiased coverage masks,
+//! and keeps those masks between draws. It is not a shaper: no glyph
+//! substitution, no fallback chain, no line breaking.
 //!
-//! What this is NOT: no hinting (the reference implementation, stb_truetype,
-//! skips it too, so unhinted is the bar), no CFF outlines, no variable axes, no
-//! colour fonts, no shaping or kerning. Cedar v1 reads `glyf`-based fonts.
+//! Three rules shape the code:
 //!
-//! Two rules that shape the code:
+//! 1. **No allocator and no IO.** The font is bytes the caller owns, and every
+//!    working buffer -- outlines, edges, coverage, and the glyph cache itself --
+//!    is the caller's too. Nothing here reaches outside them.
+//! 2. **The spec decides, not the reference.** `oracle/` carries stb_truetype as
+//!    a differential oracle. Where the two disagree the disagreement is a
+//!    finding to write down, not a bug in Cedar by default. Two are documented
+//!    at `cmapFormat4` and in the composite decoder.
+//! 3. **Failures are scoped.** `LoadError` means discard the face;
+//!    `GlyphError` means this one glyph failed and the face is still good. Cedar
+//!    propagates both and never substitutes a glyph silently -- deciding to keep
+//!    a last-good face needs a fallback chain, which belongs to the caller.
 //!
-//! 1. **No allocator and no IO.** The font is bytes the caller owns; nothing
-//!    here reaches outside them.
-//! 2. **The spec decides, not the reference.** `oracle/` carries stb_truetype
-//!    as a differential oracle. Where the two disagree, the disagreement is a
-//!    finding to write down, not a bug in Cedar by default. One such case is
-//!    already documented at `cmapFormat4`.
+//! Out of scope, deliberately: hinting (stb skips it, so unhinted is the bar),
+//! CFF/CFF2 outlines, variable axes, colour fonts, shaping and GPOS, kern
+//! formats 2/3 and Apple's version 1 layout, vertical layout, and Unicode
+//! normalisation or line breaking.
 
 const std = @import("std");
 
@@ -559,6 +564,9 @@ pub const Font = struct {
     /// `coverage` are the caller's, reused frame after frame -- which is the
     /// whole point of this existing, since the previous backend malloc'd and
     /// freed twice per glyph per draw.
+    ///
+    /// `edges` is SORTED IN PLACE (by top, so the sweep can stop early). Its
+    /// contents after the call are the same edges in a different order.
     pub fn raster(
         self: Font,
         gid: u16,
@@ -1263,7 +1271,7 @@ pub const Cache = struct {
         return total;
     }
 
-    pub fn init(mem: []align(8) u8, opts: Options) GlyphError!Cache {
+    pub fn init(mem: []align(8) u8, opts: Options) error{BufferTooSmall}!Cache {
         if (mem.len < needed(opts)) return error.BufferTooSmall;
         var off: usize = 0;
         const slots = takeSlice(Slot, mem, &off, opts.slots);
@@ -1284,7 +1292,7 @@ pub const Cache = struct {
             .arena_len = mem.len - arena_at,
             .used = 0,
         };
-        c.clear();
+        c.reset();
         return c;
     }
 
@@ -1309,7 +1317,7 @@ pub const Cache = struct {
 
         var slot = self.freeSlot(gid, ppem, phase);
         if (slot == null or self.used + len > self.arena_len) {
-            self.clear();
+            self.flush();
             if (len > self.arena_len) return error.BufferTooSmall;
             slot = self.freeSlot(gid, ppem, phase);
         }
@@ -1362,10 +1370,17 @@ pub const Cache = struct {
         return null;
     }
 
-    fn clear(self: *Cache) void {
-        if (self.used != 0 or self.stats.flushes != 0) self.stats.flushes += 1;
+    fn reset(self: *Cache) void {
         for (self.slots) |*s| s.valid = false;
         self.used = 0;
+    }
+
+    /// Everything goes. Counted, because a high flush count means the caller
+    /// sized the arena below the working set and that is worth being able to
+    /// see rather than infer from timings.
+    fn flush(self: *Cache) void {
+        self.reset();
+        self.stats.flushes += 1;
     }
 };
 
@@ -2035,4 +2050,25 @@ test "phase classes quantise to the nearest quarter pixel" {
     try std.testing.expectEqual(Phase.zero, phaseOf(1.0));
     try std.testing.expectEqual(Phase.half, phaseOf(3.5));
     try std.testing.expectEqual(@as(f32, 0.5), phaseOffset(.half));
+}
+
+test "the usage shown in the README compiles and runs" {
+    var fb: [2048]u8 = undefined;
+    const bytes = buildTestFont(&fb, false);
+    var storage: [64 * 1024]u8 align(8) = undefined;
+
+    var font = try Font.init(bytes); // bytes are yours
+    var cache = try Cache.init(&storage, .{
+        .slots = 16,
+        .max_points = 256,
+        .max_edges = 256,
+        .max_width = 64,
+        .arena = 16 * 1024,
+    }); // storage is yours
+    const gid = try font.glyphIndex('A');
+    const m = try cache.mask(font, gid, 16, .zero); // a hash lookup once warm
+
+    try std.testing.expect(m.w > 0 and m.h > 0);
+    try std.testing.expectEqual(m.pixels.len, @as(usize, m.w) * m.h);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.misses);
 }

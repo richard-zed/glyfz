@@ -72,6 +72,40 @@ pub const Outline = struct {
 /// rasteriser is about to map to pixels.
 pub const Box = struct { x0: i32, y0: i32, x1: i32, y1: i32 };
 
+/// A box in DEVICE PIXELS with y pointing down, which is the bitmap the
+/// rasteriser will produce: `x0`/`y0` are where its top-left pixel sits
+/// relative to the glyph origin, `y0` measured downward from the baseline.
+/// This is the convention the existing backend hands the caller, so a swap
+/// does not move text.
+pub const PixelBox = struct { x0: i32, y0: i32, x1: i32, y1: i32 };
+
+/// One flattened outline segment in BITMAP pixel space, y down, with
+/// `y0 <= y1`. `dir` is +1 if the contour runs downward along this edge and -1
+/// if it runs up; the rasteriser only uses it to sign the winding.
+pub const Edge = struct {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    dir: i8,
+};
+
+/// A rasterised glyph: `coverage[y*w + x]` is 0..255, and `x0`/`y0` say where
+/// the bitmap's top-left sits relative to the glyph origin, y down from the
+/// baseline -- the same numbers the previous backend returned.
+pub const Raster = struct {
+    w: u32,
+    h: u32,
+    x0: i32,
+    y0: i32,
+    coverage: []u8,
+};
+
+/// stb_truetype's curve flattening tolerance, in pixels. Cedar uses the same
+/// number so the two rasterisers are comparing the same polygons; an exact
+/// quadratic path would remove the tolerance altogether and is a later win.
+pub const flatten_tolerance: f32 = 0.35;
+
 pub fn outlineBounds(o: Outline) Box {
     if (o.points.len == 0) return .{ .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 };
     var b = Box{
@@ -250,6 +284,103 @@ pub const Font = struct {
         var cur = Cursor{ .points = points, .ends = ends };
         try decodeInto(self, gid, &cur, 0);
         return .{ .points = points[0..cur.n], .ends = ends[0..cur.nc] };
+    }
+
+    /// The ink box the FONT DECLARES in the glyph header, or null for a blank
+    /// glyph. Deliberately the declared box rather than a computed one: it is
+    /// what the previous backend sized its bitmaps from, so bitmaps stay the
+    /// same size across the swap. `outlineBounds` is the computed alternative.
+    pub fn headerBox(self: Font, gid: u16) Error!?Box {
+        if (gid >= self.num_glyphs) return error.UnknownGlyph;
+        const data = try glyphRange(self, gid);
+        if (data.len == 0) return null;
+        return Box{
+            .x0 = try i16At(data, 2),
+            .y0 = try i16At(data, 4),
+            .x1 = try i16At(data, 6),
+            .y1 = try i16At(data, 8),
+        };
+    }
+
+    /// Map `headerBox` to whole device pixels at `scale` (font units to
+    /// pixels), with an optional horizontal subpixel phase in pixels.
+    ///
+    /// Font y points up and bitmap y points down, hence the negations: the
+    /// top of the bitmap comes from the glyph's yMax.
+    pub fn bitmapBox(self: Font, gid: u16, scale: f32, phase_x: f32) Error!PixelBox {
+        const b = (try self.headerBox(gid)) orelse
+            return .{ .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 };
+        const f = struct {
+            fn v(i: i32, s: f32, add: f32) f32 {
+                return @as(f32, @floatFromInt(i)) * s + add;
+            }
+        };
+        return .{
+            .x0 = @intFromFloat(@floor(f.v(b.x0, scale, phase_x))),
+            .y0 = @intFromFloat(@floor(f.v(-b.y1, scale, 0))),
+            .x1 = @intFromFloat(@ceil(f.v(b.x1, scale, phase_x))),
+            .y1 = @intFromFloat(@ceil(f.v(-b.y0, scale, 0))),
+        };
+    }
+
+    /// Flatten the glyph into bitmap-space edges, written into `edges`, and
+    /// return how many. `box` is where the bitmap origin lands, so the edges
+    /// come out already relative to it.
+    pub fn edgesInto(
+        self: Font,
+        gid: u16,
+        scale: f32,
+        phase_x: f32,
+        box: PixelBox,
+        points: []Point,
+        ends: []u16,
+        edges: []Edge,
+    ) Error!usize {
+        const o = try self.outline(gid, points, ends);
+        var em = Emitter{
+            .edges = edges,
+            .scale = scale,
+            .phase_x = phase_x,
+            .ox = @floatFromInt(box.x0),
+            .oy = @floatFromInt(box.y0),
+            // Flatness is expressed in pixels, so in font units it scales.
+            .flat_sq = sq(flatten_tolerance / scale),
+        };
+        try em.contours(o);
+        return em.n;
+    }
+
+    /// Rasterise a glyph: flatten into `edges`, sweep into `coverage`.
+    ///
+    /// Nothing is allocated. `edges`, `acc` (one f32 per pixel column) and
+    /// `coverage` are the caller's, reused frame after frame -- which is the
+    /// whole point of this existing, since the previous backend malloc'd and
+    /// freed twice per glyph per draw.
+    pub fn raster(
+        self: Font,
+        gid: u16,
+        scale: f32,
+        phase_x: f32,
+        points: []Point,
+        ends: []u16,
+        edges: []Edge,
+        acc: []f32,
+        coverage: []u8,
+    ) Error!Raster {
+        const box = try self.bitmapBox(gid, scale, phase_x);
+        const w: u32 = if (box.x1 > box.x0) @intCast(box.x1 - box.x0) else 0;
+        const h: u32 = if (box.y1 > box.y0) @intCast(box.y1 - box.y0) else 0;
+
+        const empty = Raster{ .w = w, .h = h, .x0 = box.x0, .y0 = box.y0, .coverage = &.{} };
+        if (w == 0 or h == 0) return empty;
+
+        const need = @as(usize, w) * h;
+        if (coverage.len < need) return error.BufferTooSmall;
+        if (acc.len < @as(usize, w) * 2 + 2) return error.BufferTooSmall;
+
+        const n = try self.edgesInto(gid, scale, phase_x, box, points, ends, edges);
+        try sweep(edges[0..n], w, h, acc, coverage[0..need]);
+        return .{ .w = w, .h = h, .x0 = box.x0, .y0 = box.y0, .coverage = coverage[0..need] };
     }
 
     /// Horizontal metrics for a glyph. Ids past `numberOfHMetrics` repeat the
@@ -572,6 +703,247 @@ fn decodeComposite(self: Font, data: []const u8, cur: *Cursor, depth: u32) Error
         // WE_HAVE_INSTRUCTIONS follows the last component; nothing to decode.
         const len = try u16At(data, p);
         p += 2 + @as(usize, len);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// flattening and coverage
+// ---------------------------------------------------------------------------
+
+fn sq(v: f32) f32 {
+    return v * v;
+}
+
+/// Turns contours into bitmap-space edges. Curves are subdivided in FONT space
+/// against a flatness bound, which is how stb_truetype does it -- mirroring the
+/// criterion keeps both rasterisers comparing the same polygons instead of two
+/// slightly different ones.
+const Emitter = struct {
+    edges: []Edge,
+    n: usize = 0,
+    scale: f32,
+    phase_x: f32,
+    ox: f32,
+    oy: f32,
+    flat_sq: f32,
+
+    fn line(self: *Emitter, x0: f32, y0: f32, x1: f32, y1: f32) Error!void {
+        const px0 = x0 * self.scale + self.phase_x - self.ox;
+        const px1 = x1 * self.scale + self.phase_x - self.ox;
+        const py0 = -y0 * self.scale - self.oy;
+        const py1 = -y1 * self.scale - self.oy;
+        // A horizontal edge contributes no area to a row.
+        if (py0 == py1) return;
+        if (self.n == self.edges.len) return error.BufferTooSmall;
+
+        var e = Edge{ .x0 = px0, .y0 = py0, .x1 = px1, .y1 = py1, .dir = 1 };
+        if (py0 > py1) {
+            e = .{ .x0 = px1, .y0 = py1, .x1 = px0, .y1 = py0, .dir = -1 };
+        }
+        self.edges[self.n] = e;
+        self.n += 1;
+    }
+
+    /// Midpoint subdivision, stopping when the midpoint deviates from the chord
+    /// by less than the flatness bound.
+    fn quad(self: *Emitter, fx: f32, fy: f32, cx: f32, cy: f32, tx: f32, ty: f32, depth: u8) Error!void {
+        const mx = (fx + 2 * cx + tx) / 4;
+        const my = (fy + 2 * cy + ty) / 4;
+        const dx = (fx + tx) / 2 - mx;
+        const dy = (fy + ty) / 2 - my;
+        if (depth < 16 and dx * dx + dy * dy > self.flat_sq) {
+            try self.quad(fx, fy, (fx + cx) / 2, (fy + cy) / 2, mx, my, depth + 1);
+            try self.quad(mx, my, (cx + tx) / 2, (cy + ty) / 2, tx, ty, depth + 1);
+        } else {
+            try self.line(fx, fy, tx, ty);
+        }
+    }
+
+    fn contours(self: *Emitter, o: Outline) Error!void {
+        var start: usize = 0;
+        for (o.ends) |end| {
+            const last: usize = end;
+            if (last < start or last >= o.points.len) return error.Truncated;
+            try self.contour(o.points, start, last - start + 1);
+            start = last + 1;
+        }
+    }
+
+    /// One closed contour. The start point has to be on-curve; if the contour
+    /// begins with a control point (legal, and common) we either move to the
+    /// next on-curve point or, when every point is off-curve, start from the
+    /// midpoint between the last and first, which is a point on the curve.
+    fn contour(self: *Emitter, pts: []const Point, start: usize, n: usize) Error!void {
+        if (n == 0) return;
+
+        var on_rel: ?usize = null;
+        var k: usize = 0;
+        while (k < n) : (k += 1) {
+            if (pts[start + k].on) {
+                on_rel = k;
+                break;
+            }
+        }
+
+        var cur: Point = undefined;
+        var first_step: usize = undefined;
+        if (on_rel) |r| {
+            cur = pts[start + r];
+            first_step = 1;
+        } else {
+            const a = pts[start + n - 1];
+            const b = pts[start];
+            cur = .{ .x = @divTrunc(a.x + b.x, 2), .y = @divTrunc(a.y + b.y, 2), .on = true };
+            first_step = 0;
+        }
+        const begin = cur;
+        const r = on_rel orelse 0;
+
+        var ctrl: ?Point = null;
+        var i = first_step;
+        while (i <= n) : (i += 1) {
+            // Walk the contour cyclically FROM the start point, wrapping back
+            // into this contour's own points -- not past its end.
+            const p = pts[start + (r + i) % n];
+            if (p.on) {
+                if (ctrl) |c| {
+                    try self.quad(@floatFromInt(cur.x), @floatFromInt(cur.y), @floatFromInt(c.x), @floatFromInt(c.y), @floatFromInt(p.x), @floatFromInt(p.y), 0);
+                    ctrl = null;
+                } else {
+                    try self.line(@floatFromInt(cur.x), @floatFromInt(cur.y), @floatFromInt(p.x), @floatFromInt(p.y));
+                }
+                cur = p;
+            } else {
+                if (ctrl) |c| {
+                    const m = Point{ .x = @divTrunc(c.x + p.x, 2), .y = @divTrunc(c.y + p.y, 2), .on = true };
+                    try self.quad(@floatFromInt(cur.x), @floatFromInt(cur.y), @floatFromInt(c.x), @floatFromInt(c.y), @floatFromInt(m.x), @floatFromInt(m.y), 0);
+                    cur = m;
+                }
+                ctrl = p;
+            }
+        }
+
+        if (ctrl) |c| {
+            try self.quad(@floatFromInt(cur.x), @floatFromInt(cur.y), @floatFromInt(c.x), @floatFromInt(c.y), @floatFromInt(begin.x), @floatFromInt(begin.y), 0);
+        } else {
+            try self.line(@floatFromInt(cur.x), @floatFromInt(cur.y), @floatFromInt(begin.x), @floatFromInt(begin.y));
+        }
+    }
+};
+
+fn clamp01(v: f32) f32 {
+    return std.math.clamp(v, 0, 1);
+}
+
+/// The exact area of column `c` inside one row that lies to the RIGHT of the
+/// edge piece running (xa,ya)-(xb,yb).
+///
+/// Summed over the pieces of a closed contour and sign-flipped, these cancel to
+/// the covered area of every column: each piece adds full height for the
+/// columns past it and the far pieces cancel, which is why no sort is needed
+/// and why holes (opposite `dir`) fall out for free.
+fn colArea(xa: f32, ya: f32, xb: f32, yb: f32, c: f32) f32 {
+    const dy = yb - ya;
+    if (dy <= 0) return 0;
+
+    const dx = xb - xa;
+    if (@abs(dx) < 1e-9) return clamp01(c + 1 - @max(xa, c)) * dy;
+
+    const k = dx / dy;
+
+    // f(y) = clamp(c+1 - max(x(y), c), 0, 1) is piecewise linear, changing
+    // slope only where x(y) crosses c or c+1. Split there and the trapezoid
+    // rule is exact.
+    var ys: [4]f32 = undefined;
+    var n: usize = 0;
+    ys[n] = ya;
+    n += 1;
+    for ([_]f32{ c, c + 1 }) |level| {
+        const y = ya + (level - xa) / k;
+        if (y > ya and y < yb) {
+            ys[n] = y;
+            n += 1;
+        }
+    }
+    ys[n] = yb;
+    n += 1;
+
+    var i: usize = 1;
+    while (i < n) : (i += 1) {
+        var j = i;
+        while (j > 0 and ys[j - 1] > ys[j]) : (j -= 1) {
+            const t = ys[j - 1];
+            ys[j - 1] = ys[j];
+            ys[j] = t;
+        }
+    }
+
+    var total: f32 = 0;
+    i = 1;
+    while (i < n) : (i += 1) {
+        const p = ys[i - 1];
+        const q = ys[i];
+        if (q <= p) continue;
+        const fp = clamp01(c + 1 - @max(xa + (p - ya) * k, c));
+        const fq = clamp01(c + 1 - @max(xa + (q - ya) * k, c));
+        total += (fp + fq) * 0.5 * (q - p);
+    }
+    return total;
+}
+
+fn sweep(edges: []const Edge, w: u32, h: u32, scratch: []f32, coverage: []u8) Error!void {
+    // Two accumulators per row: the partial areas where an edge cuts a column,
+    // and the tail an edge contributes to every column to its right.
+    const need = @as(usize, w) * 2 + 2;
+    if (scratch.len < need) return error.BufferTooSmall;
+    const acc = scratch[0..w];
+    const fill = scratch[w .. @as(usize, w) * 2 + 1];
+    if (coverage.len < @as(usize, w) * h) return error.BufferTooSmall;
+
+    const wf: f32 = @floatFromInt(w);
+    @memset(coverage, 0);
+
+    var row: u32 = 0;
+    while (row < h) : (row += 1) {
+        const y0: f32 = @floatFromInt(row);
+        const y1 = y0 + 1;
+        @memset(acc, 0);
+        @memset(fill, 0);
+
+        for (edges) |e| {
+            if (e.y1 <= y0 or e.y0 >= y1) continue;
+            const ya = @max(e.y0, y0);
+            const yb = @min(e.y1, y1);
+            if (ya >= yb) continue;
+
+            const k = (e.x1 - e.x0) / (e.y1 - e.y0);
+            const xa = e.x0 + (ya - e.y0) * k;
+            const xb = e.x0 + (yb - e.y0) * k;
+            const s: f32 = if (e.dir > 0) 1 else -1;
+            const xmax = @max(xa, xb);
+
+            // Columns the edge may only partly cover.
+            var c = @max(@floor(@min(xa, xb)) - 1, 0);
+            const hi = @min(@ceil(xmax), wf);
+            while (c < hi) : (c += 1) {
+                acc[@intFromFloat(c)] += s * colArea(xa, ya, xb, yb, c);
+            }
+
+            // Everything right of ceil(xmax) is covered for the edge's whole
+            // height in this row, which is what makes a closed contour cancel.
+            const t = @ceil(xmax);
+            const tail: usize = if (t <= 0) 0 else if (t >= wf) w else @intFromFloat(t);
+            fill[tail] += s * (yb - ya);
+        }
+
+        var run: f32 = 0;
+        const at = @as(usize, row) * w;
+        var c: usize = 0;
+        while (c < w) : (c += 1) {
+            run += fill[c];
+            const v = clamp01(@abs(acc[c] + run));
+            coverage[at + c] = @intFromFloat(@round(v * 255.0));
+        }
     }
 }
 
@@ -928,4 +1300,112 @@ test "rejects what it cannot read" {
     const head_rec = 12 + 1 * 16;
     std.mem.writeInt(u32, copy[head_rec + 8 ..][0..4], 999_999, .big);
     try std.testing.expectError(error.Truncated, Font.init(copy));
+}
+
+// ---------------------------------------------------------------------------
+// raster tests: hand-computed shapes first, supersampling as a referee
+// ---------------------------------------------------------------------------
+
+fn covAt(cov: []const u8, w: usize, x: usize, row: usize) u8 {
+    return cov[row * w + x];
+}
+
+test "sweep: a rectangle lands on half, full, half" {
+    var cov: [6 * 3]u8 = undefined;
+    var acc: [6 * 2 + 2]f32 = undefined;
+
+    // Closed clockwise: down the right side at x=3.5, up the left at x=1.5.
+    // Horizontals are omitted, as they contribute no area.
+    const edges = [_]Edge{
+        .{ .x0 = 3.5, .y0 = 0, .x1 = 3.5, .y1 = 3, .dir = 1 },
+        .{ .x0 = 1.5, .y0 = 0, .x1 = 1.5, .y1 = 3, .dir = -1 },
+    };
+    try sweep(&edges, 6, 3, &acc, &cov);
+
+    var row: usize = 0;
+    while (row < 3) : (row += 1) {
+        try std.testing.expectEqual(@as(u8, 0), covAt(&cov, 6, 0, row));
+        try std.testing.expectEqual(@as(u8, 128), covAt(&cov, 6, 1, row));
+        try std.testing.expectEqual(@as(u8, 255), covAt(&cov, 6, 2, row));
+        try std.testing.expectEqual(@as(u8, 128), covAt(&cov, 6, 3, row));
+        try std.testing.expectEqual(@as(u8, 0), covAt(&cov, 6, 4, row));
+    }
+}
+
+test "sweep: a hole wound the other way cancels" {
+    var cov: [5 * 2]u8 = undefined;
+    var acc: [5 * 2 + 2]f32 = undefined;
+
+    const edges = [_]Edge{
+        .{ .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 2, .dir = -1 }, // outer left
+        .{ .x0 = 4, .y0 = 0, .x1 = 4, .y1 = 2, .dir = 1 }, // outer right
+        .{ .x0 = 1, .y0 = 0, .x1 = 1, .y1 = 2, .dir = 1 }, // hole left
+        .{ .x0 = 2, .y0 = 0, .x1 = 2, .y1 = 2, .dir = -1 }, // hole right
+    };
+    try sweep(&edges, 5, 2, &acc, &cov);
+
+    try std.testing.expectEqual(@as(u8, 255), covAt(&cov, 5, 0, 0));
+    try std.testing.expectEqual(@as(u8, 0), covAt(&cov, 5, 1, 0));
+    try std.testing.expectEqual(@as(u8, 255), covAt(&cov, 5, 2, 0));
+    try std.testing.expectEqual(@as(u8, 255), covAt(&cov, 5, 3, 0));
+    try std.testing.expectEqual(@as(u8, 0), covAt(&cov, 5, 4, 0));
+}
+
+/// Coverage by brute force: the referee the exact accumulator is checked
+/// against, so the accumulator is not graded by its own algebra.
+fn supersample(edges: []const Edge, w: usize, h: usize, n: usize, out: []u8) void {
+    @memset(out, 0);
+    var row: usize = 0;
+    while (row < h) : (row += 1) {
+        var c: usize = 0;
+        while (c < w) : (c += 1) {
+            var hits: usize = 0;
+            var sy: usize = 0;
+            while (sy < n) : (sy += 1) {
+                const py = @as(f32, @floatFromInt(row)) + (@as(f32, @floatFromInt(sy)) + 0.5) / @as(f32, @floatFromInt(n));
+                var sx: usize = 0;
+                while (sx < n) : (sx += 1) {
+                    const px = @as(f32, @floatFromInt(c)) + (@as(f32, @floatFromInt(sx)) + 0.5) / @as(f32, @floatFromInt(n));
+                    // nonzero winding: sum the direction of edges crossing the
+                    // upward ray from the sample point.
+                    var wind: i32 = 0;
+                    for (edges) |e| {
+                        if (py < e.y0 or py >= e.y1) continue;
+                        const k = (e.x1 - e.x0) / (e.y1 - e.y0);
+                        const x = e.x0 + (py - e.y0) * k;
+                        if (x > px) wind += e.dir;
+                    }
+                    if (wind != 0) hits += 1;
+                }
+            }
+            const frac = @as(f32, @floatFromInt(hits)) / @as(f32, @floatFromInt(n * n));
+            out[row * w + c] = @intFromFloat(@round(frac * 255.0));
+        }
+    }
+}
+
+test "exact area agrees with brute-force supersampling on a triangle" {
+    // Right triangle (1,1)-(12,1)-(1,12): the top edge is horizontal so it
+    // drops out, leaving a slanted hypotenuse and one vertical side.
+    const edges = [_]Edge{
+        .{ .x0 = 12, .y0 = 1, .x1 = 1, .y1 = 12, .dir = 1 }, // hypotenuse
+        .{ .x0 = 1, .y0 = 1, .x1 = 1, .y1 = 12, .dir = -1 }, // vertical side
+    };
+    const w = 14;
+    const h = 14;
+
+    var exact: [w * h]u8 = undefined;
+    var brute: [w * h]u8 = undefined;
+    var acc: [w * 2 + 2]f32 = undefined;
+    try sweep(&edges, w, h, &acc, &exact);
+    supersample(&edges, w, h, 24, &brute);
+
+    var worst: i32 = 0;
+    for (exact, brute) |a, b| {
+        const d = @as(i32, a) - @as(i32, b);
+        worst = @max(worst, if (d < 0) -d else d);
+    }
+    std.debug.print("triangle: worst delta {d}\n", .{worst});
+    // 24x24 samples leave a little noise; a wrong integral would be far worse.
+    try std.testing.expect(worst <= 6);
 }

@@ -191,3 +191,181 @@ test "the comparison itself notices a one-unit shift" {
     try std.testing.expect(shifted.mismatched == shifted.checked);
     try std.testing.expectEqual(@as(usize, 0), exact.mismatched);
 }
+
+test "pixel boxes match stb_truetype at several sizes and phases" {
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.open(gpa);
+    defer fx.close();
+
+    // The scale Elm uses: pixels per font unit at a given pixel height. It is
+    // NOT size/upem -- that difference is the trap.
+    const span: f32 = @floatFromInt(fx.font.ascender - fx.font.descender);
+
+    var bad: usize = 0;
+    var checked: usize = 0;
+    for ([_]f32{ 9, 11, 16, 34 }) |size| {
+        for ([_]f32{ 0, 0.25, 0.5 }) |phase| {
+            const scale = size / span;
+            var gid: u16 = 0;
+            while (gid < fx.font.num_glyphs) : (gid += 1) {
+                const ours = try fx.font.bitmapBox(gid, scale, phase);
+                var ix0: c_int = 0;
+                var iy0: c_int = 0;
+                var ix1: c_int = 0;
+                var iy1: c_int = 0;
+                c.stbtt_GetGlyphBitmapBoxSubpixel(&fx.info, gid, scale, scale, phase, 0, &ix0, &iy0, &ix1, &iy1);
+                checked += 1;
+                if (ours.x0 != ix0 or ours.y0 != iy0 or ours.x1 != ix1 or ours.y1 != iy1) {
+                    if (bad < 10) std.debug.print(
+                        "gid {d} size {d} phase {d}: cedar [{d},{d}..{d},{d}] stb [{d},{d}..{d},{d}]\n",
+                        .{ gid, size, phase, ours.x0, ours.y0, ours.x1, ours.y1, ix0, iy0, ix1, iy1 },
+                    );
+                    bad += 1;
+                }
+            }
+        }
+    }
+    std.debug.print("boxes: {d} compared, {d} mismatched\n", .{ checked, bad });
+    try std.testing.expect(checked > 1000);
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "coverage matches stb_truetype's rasteriser" {
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.open(gpa);
+    defer fx.close();
+
+    const span: f32 = @floatFromInt(fx.font.ascender - fx.font.descender);
+
+    var pts: [8192]cedar.Point = undefined;
+    var ends: [512]u16 = undefined;
+    var edges: [8192]cedar.Edge = undefined;
+    var scratch: [1024]f32 = undefined;
+    var ours_buf: [256 * 256]u8 = undefined;
+
+    var glyphs: usize = 0;
+    var pixels: usize = 0;
+    var over2: usize = 0;
+    var max_delta: u32 = 0;
+    var box_mismatch: usize = 0;
+    var skipped: usize = 0;
+
+    for ([_]f32{ 11, 16, 34 }) |size| {
+        for ([_]f32{ 0, 0.5 }) |phase| {
+            const scale = size / span;
+            var gid: u16 = 0;
+            while (gid < fx.font.num_glyphs) : (gid += 1) {
+                const r = fx.font.raster(
+                    gid,
+                    scale,
+                    phase,
+                    &pts,
+                    &ends,
+                    &edges,
+                    &scratch,
+                    &ours_buf,
+                ) catch |e| switch (e) {
+                    error.BufferTooSmall, error.UnsupportedComposite => {
+                        skipped += 1;
+                        continue;
+                    },
+                    else => return e,
+                };
+
+                var w: c_int = 0;
+                var h: c_int = 0;
+                var xoff: c_int = 0;
+                var yoff: c_int = 0;
+                const theirs = c.stbtt_GetGlyphBitmapSubpixel(&fx.info, scale, scale, phase, 0, gid, &w, &h, &xoff, &yoff);
+                defer if (theirs != null) c.stbtt_FreeBitmap(theirs, null);
+
+                if (w <= 0 or h <= 0) continue;
+                if (r.w != @as(u32, @intCast(w)) or r.h != @as(u32, @intCast(h)) or
+                    r.x0 != xoff or r.y0 != yoff)
+                {
+                    box_mismatch += 1;
+                    continue;
+                }
+
+                glyphs += 1;
+                var i: usize = 0;
+                const n = @as(usize, @intCast(w)) * @as(usize, @intCast(h));
+                while (i < n) : (i += 1) {
+                    const a: i32 = r.coverage[i];
+                    const b: i32 = theirs[i];
+                    const d: u32 = @intCast(if (a > b) a - b else b - a);
+                    if (d > max_delta) max_delta = d;
+                    if (d > 2) over2 += 1;
+                }
+                pixels += n;
+            }
+        }
+    }
+
+    std.debug.print(
+        "coverage: {d} glyphs, {d} pixels, max delta {d}, over2 {d} ({d:.4}%), box mismatch {d}, skipped {d}\n",
+        .{ glyphs, pixels, max_delta, over2, 100.0 * @as(f64, @floatFromInt(over2)) / @as(f64, @floatFromInt(pixels)), box_mismatch, skipped },
+    );
+    try std.testing.expectEqual(@as(usize, 0), box_mismatch);
+    // Not vacuous: real coverage was compared.
+    try std.testing.expect(glyphs > 1000);
+    try std.testing.expect(pixels > 1_000_000);
+    // The gate. Two independent implementations of the same spec, mirroring
+    // each other's flattening tolerance, should agree this closely; anything
+    // looser means a real disagreement hiding in the average.
+    try std.testing.expect(max_delta <= 8);
+    const frac = @as(f64, @floatFromInt(over2)) / @as(f64, @floatFromInt(pixels));
+    try std.testing.expect(frac <= 0.001);
+}
+
+test "the coverage comparison notices a half-pixel shift" {
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.open(gpa);
+    defer fx.close();
+
+    const span: f32 = @floatFromInt(fx.font.ascender - fx.font.descender);
+    const scale = 16 / span;
+
+    var pts: [8192]cedar.Point = undefined;
+    var ends: [512]u16 = undefined;
+    var edges: [8192]cedar.Edge = undefined;
+    var scratch: [1024]f32 = undefined;
+    var ours_buf: [256 * 256]u8 = undefined;
+
+    var max_delta: u32 = 0;
+    var glyphs: usize = 0;
+    var gid: u16 = 0;
+    while (gid < fx.font.num_glyphs and glyphs < 400) : (gid += 1) {
+        // Rasterise half a pixel to the right of where stb is asked to.
+        const r = fx.font.raster(gid, scale, 0.5, &pts, &ends, &edges, &scratch, &ours_buf) catch continue;
+
+        var w: c_int = 0;
+        var h: c_int = 0;
+        var xoff: c_int = 0;
+        var yoff: c_int = 0;
+        const theirs = c.stbtt_GetGlyphBitmapSubpixel(&fx.info, scale, scale, 0, 0, gid, &w, &h, &xoff, &yoff);
+        defer if (theirs != null) c.stbtt_FreeBitmap(theirs, null);
+
+        if (w <= 0 or h <= 0) continue;
+        // A shifted glyph can be one pixel wider, so compare the overlap.
+        const cw: usize = @min(@as(usize, r.w), @as(usize, @intCast(w)));
+        const ch: usize = @min(@as(usize, r.h), @as(usize, @intCast(h)));
+        if (cw == 0 or ch == 0) continue;
+
+        var y: usize = 0;
+        while (y < ch) : (y += 1) {
+            var x: usize = 0;
+            while (x < cw) : (x += 1) {
+                const a: i32 = r.coverage[y * r.w + x];
+                const b: i32 = theirs[y * @as(usize, @intCast(w)) + x];
+                const d: u32 = @intCast(@abs(a - b));
+                if (d > max_delta) max_delta = d;
+            }
+        }
+        glyphs += 1;
+    }
+
+    std.debug.print("control: {d} glyphs, max delta {d} under a half-pixel shift\n", .{ glyphs, max_delta });
+    try std.testing.expect(glyphs > 100);
+    try std.testing.expect(max_delta > 20);
+}

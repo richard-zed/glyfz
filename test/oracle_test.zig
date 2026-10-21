@@ -6,7 +6,7 @@
 //! purpose.
 
 const std = @import("std");
-const cedar = @import("cedar");
+const cedar = @import("glyfz");
 
 const c = @cImport({
     @cInclude("stb_truetype.h");

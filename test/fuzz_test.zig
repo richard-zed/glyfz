@@ -15,7 +15,7 @@
 //! does not: any LoadError or GlyphError, which is the library doing its job.
 
 const std = @import("std");
-const cedar = @import("cedar");
+const cedar = @import("glyfz");
 
 fn readFont(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     var threaded: std.Io.Threaded = .init(gpa, .{});

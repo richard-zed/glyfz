@@ -9,7 +9,7 @@
 //! ReleaseFast only. Debug numbers are ~10x worse and mean nothing here.
 
 const std = @import("std");
-const cedar = @import("cedar");
+const cedar = @import("glyfz");
 
 const c = @cImport({
     @cInclude("stb_truetype.h");

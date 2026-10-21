@@ -8,7 +8,7 @@ pub fn build(b: *std.Build) void {
 
     // The library: pure Zig, no libc, no C, no allocator.
     const cedar_mod = b.addModule("cedar", .{
-        .root_source_file = b.path("src/cedar.zig"),
+        .root_source_file = b.path("src/glyfz.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("test/oracle_test.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "cedar", .module = cedar_mod }},
+        .imports = &.{.{ .name = "glyfz", .module = cedar_mod }},
         .link_libc = true,
     });
     oracle_mod.addCSourceFile(.{ .file = b.path("oracle/stb_impl.c"), .flags = &.{} });
@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("test/fuzz_test.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "cedar", .module = cedar_mod }},
+        .imports = &.{.{ .name = "glyfz", .module = cedar_mod }},
         .link_libc = true,
     });
     const fuzz_tests = b.addTest(.{ .root_module = fuzz_mod });
@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("bench/bench.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "cedar", .module = cedar_mod }},
+        .imports = &.{.{ .name = "glyfz", .module = cedar_mod }},
         .link_libc = true,
     });
     bench_mod.addCSourceFile(.{ .file = b.path("oracle/stb_impl.c"), .flags = &.{} });

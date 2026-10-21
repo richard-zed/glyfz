@@ -1,14 +1,14 @@
-# Cedar
+# GlyfZ
 
-A TrueType rasteriser in Zig.
+A TrueType font parser, rasteriser and glyph cache for Zig. No allocator, no IO.
 
-Cedar reads `glyf`-based fonts, turns outlines into antialiased coverage masks,
+GlyfZ reads `glyf`-based fonts, turns outlines into antialiased coverage masks,
 and keeps those masks between draws. It is not a shaper: no glyph substitution,
 no fallback chain, no line breaking.
 
 ```zig
-var font = try cedar.Font.init(bytes);           // bytes are yours
-var cache = try cedar.Cache.init(&storage, .{}); // so is the cache's memory
+var font = try glyfz.Font.init(bytes);           // bytes are yours
+var cache = try glyfz.Cache.init(&storage, .{}); // so is the cache's memory
 const gid = try font.glyphIndex('A');
 const m = try cache.mask(font, gid, 16, .zero);  // a hash lookup once warm
 ```
@@ -20,7 +20,7 @@ Two properties are the whole point:
 - **No allocator, no IO, no libc.** The font is bytes you own. Every working
   buffer -- outlines, edges, coverage, and the glyph cache -- is yours too.
 - **Glyph masks are cached.** `stbtt_GetCodepointBitmap` allocates, rasterises
-  and frees on every draw, per glyph. A Cedar cache hit is a hash lookup and a
+  and frees on every draw, per glyph. A GlyfZ cache hit is a hash lookup and a
   slice.
 
 ## Status
@@ -72,7 +72,7 @@ The comparisons are shown to be capable of failing, not assumed to pass: a
 one-unit box shift flags 6190/6190, a half-pixel phase shift drives coverage
 delta to 169, dropping the sweep's accumulator tail drives it to 255.
 
-Agreement with stb proves Cedar is not *different*. It does not prove Cedar is
+Agreement with stb proves GlyfZ is not *different*. It does not prove GlyfZ is
 *right* -- which is why the spec, not the oracle, settles arguments.
 
 ## Measured cost

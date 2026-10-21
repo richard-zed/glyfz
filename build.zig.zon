@@ -1,7 +1,7 @@
 .{
-    .name = .cedar,
+    .name = .glyfz,
     .version = "0.1.0",
-    .fingerprint = 0x997bd4bb8cd43b08,
+    .fingerprint = 0x44971327fc516c34,
     .minimum_zig_version = "0.16.0",
     .paths = .{
         "build.zig",

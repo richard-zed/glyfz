@@ -1238,7 +1238,7 @@ pub const Cache = struct {
 
     const Slot = struct {
         gid: u16 = 0,
-        ppem: u16 = 0,
+        scale_key: u32 = 0,
         phase: Phase = .zero,
         off: u32 = 0,
         w: u32 = 0,
@@ -1298,16 +1298,31 @@ pub const Cache = struct {
 
     /// The mask for this glyph at this pixel size and phase, rasterising it if
     /// it is not already held.
+    /// A mask at a pixel size, for callers who think in ppem.
     pub fn mask(self: *Cache, font: Font, gid: u16, ppem: u16, phase: Phase) GlyphError!Mask {
-        if (self.find(gid, ppem, phase)) |s| {
+        if (ppem == 0 or font.units_per_em == 0) return .{};
+        const scale = @as(f32, @floatFromInt(ppem)) / @as(f32, @floatFromInt(font.units_per_em));
+        return self.maskAt(font, gid, scale, phase);
+    }
+
+    /// A mask at whatever scale the caller actually uses.
+    ///
+    /// ppem is only one convention for turning a point size into a scale, and
+    /// it is not the one a UI toolkit necessarily has: Elm derives its scale
+    /// from `size / (ascender - descender)`, which has nothing to do with
+    /// unitsPerEm. Handing the cache a ppem would therefore silently rasterise
+    /// at a different size than the caller lays out with. The scale is the
+    /// primitive; ppem is the convenience wrapper above.
+    pub fn maskAt(self: *Cache, font: Font, gid: u16, scale: f32, phase: Phase) GlyphError!Mask {
+        const scale_key: u32 = @bitCast(scale);
+        if (self.find(gid, scale_key, phase)) |s| {
             self.stats.hits += 1;
             const at = self.arena_at + s.off;
             return .{ .w = s.w, .h = s.h, .x0 = s.x0, .y0 = s.y0, .pixels = self.mem[at..][0 .. @as(usize, s.w) * s.h] };
         }
 
         self.stats.misses += 1;
-        if (ppem == 0 or font.units_per_em == 0) return .{};
-        const scale = @as(f32, @floatFromInt(ppem)) / @as(f32, @floatFromInt(font.units_per_em));
+        if (!(scale > 0) or font.units_per_em == 0) return .{};
         const ph = phaseOffset(phase);
         const box = try font.bitmapBox(gid, scale, ph);
         const w: u32 = if (box.x1 > box.x0) @intCast(box.x1 - box.x0) else 0;
@@ -1315,11 +1330,11 @@ pub const Cache = struct {
         if (w == 0 or h == 0) return .{ .x0 = box.x0, .y0 = box.y0 };
         const len = @as(usize, w) * h;
 
-        var slot = self.freeSlot(gid, ppem, phase);
+        var slot = self.freeSlot(gid, scale_key, phase);
         if (slot == null or self.used + len > self.arena_len) {
             self.flush();
             if (len > self.arena_len) return error.BufferTooSmall;
-            slot = self.freeSlot(gid, ppem, phase);
+            slot = self.freeSlot(gid, scale_key, phase);
         }
         const s = slot orelse return error.BufferTooSmall;
         const at = self.arena_at + self.used;
@@ -1327,7 +1342,7 @@ pub const Cache = struct {
 
         s.* = .{
             .gid = gid,
-            .ppem = ppem,
+            .scale_key = scale_key,
             .phase = phase,
             .off = @intCast(self.used),
             .w = r.w,
@@ -1340,28 +1355,30 @@ pub const Cache = struct {
         return .{ .w = r.w, .h = r.h, .x0 = r.x0, .y0 = r.y0, .pixels = r.coverage };
     }
 
-    /// Open addressing with linear probing. A linear scan over the slot table
-    /// would cost more than the rasterisation it is trying to avoid, which is
-    /// the whole reason the cache exists.
-    fn probeStart(self: *Cache, gid: u16, ppem: u16, phase: Phase) usize {
-        const key: u32 = (@as(u32, gid) << 18) | (@as(u32, ppem) << 2) | @intFromEnum(phase);
-        const h = key *% 2654435761;
-        return @as(usize, h >> 8) % self.slots.len;
+    fn probeStart(self: *Cache, gid: u16, scale_key: u32, phase: Phase) usize {
+        // The scale enters the key by its raw bits. Quantising it onto a size
+        // lattice would let two neighbouring sizes share a mask, which is the
+        // wrong glyph by design; a caller that animates size loses hit rate
+        // instead, and that is the honest failure.
+        var key: u64 = (@as(u64, gid) << 40) ^ (@as(u64, scale_key) << 2) ^ @intFromEnum(phase);
+        key *%= 0x9E3779B97F4A7C15;
+        key ^= key >> 29;
+        return @as(usize, key >> 16) % self.slots.len;
     }
 
-    fn find(self: *Cache, gid: u16, ppem: u16, phase: Phase) ?*Slot {
-        const start = self.probeStart(gid, ppem, phase);
+    fn find(self: *Cache, gid: u16, scale_key: u32, phase: Phase) ?*Slot {
+        const start = self.probeStart(gid, scale_key, phase);
         var i: usize = 0;
         while (i < self.slots.len) : (i += 1) {
             const s = &self.slots[(start + i) % self.slots.len];
             if (!s.valid) return null; // an empty slot ends the probe run
-            if (s.gid == gid and s.ppem == ppem and s.phase == phase) return s;
+            if (s.gid == gid and s.scale_key == scale_key and s.phase == phase) return s;
         }
         return null;
     }
 
-    fn freeSlot(self: *Cache, gid: u16, ppem: u16, phase: Phase) ?*Slot {
-        const start = self.probeStart(gid, ppem, phase);
+    fn freeSlot(self: *Cache, gid: u16, scale_key: u32, phase: Phase) ?*Slot {
+        const start = self.probeStart(gid, scale_key, phase);
         var i: usize = 0;
         while (i < self.slots.len) : (i += 1) {
             const s = &self.slots[(start + i) % self.slots.len];

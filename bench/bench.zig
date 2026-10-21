@@ -1,4 +1,4 @@
-//! Cedar vs stb_truetype, per glyph, as the call site actually pays for it.
+//! GlyfZ vs stb_truetype, per glyph, as the call site actually pays for it.
 //!
 //! The claim this project rests on is that rasterising into a caller's buffer
 //! beats the malloc/free pair stb does per glyph per draw. That claim was
@@ -9,7 +9,7 @@
 //! ReleaseFast only. Debug numbers are ~10x worse and mean nothing here.
 
 const std = @import("std");
-const cedar = @import("glyfz");
+const glyfz = @import("glyfz");
 
 const c = @cImport({
     @cInclude("stb_truetype.h");
@@ -22,7 +22,7 @@ fn readFont(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn fontPath() ![]const u8 {
-    const p = std.c.getenv("CEDAR_BENCH_FONT") orelse return error.NoFont;
+    const p = std.c.getenv("GLYFZ_BENCH_FONT") orelse return error.NoFont;
     return std.mem.span(p);
 }
 
@@ -33,13 +33,13 @@ pub fn main() !void {
     const gpa = std.heap.page_allocator;
 
     const path = fontPath() catch {
-        std.debug.print("set CEDAR_BENCH_FONT to a TTF\n", .{});
+        std.debug.print("set GLYFZ_BENCH_FONT to a TTF\n", .{});
         return error.NoFont;
     };
     const data = try readFont(gpa, path);
     defer gpa.free(data);
 
-    const font = try cedar.Font.init(data);
+    const font = try glyfz.Font.init(data);
     var info: c.stbtt_fontinfo = undefined;
     if (c.stbtt_InitFont(&info, data.ptr, 0) == 0) return error.BadFont;
 
@@ -55,9 +55,9 @@ pub fn main() !void {
         n += 1;
     }
 
-    var pts: [8192]cedar.Point = undefined;
+    var pts: [8192]glyfz.Point = undefined;
     var ends: [512]u16 = undefined;
-    var edges: [8192]cedar.Edge = undefined;
+    var edges: [8192]glyfz.Edge = undefined;
     var scratch: [1024]f32 = undefined;
     var cov: [256 * 256]u8 = undefined;
 
@@ -65,17 +65,17 @@ pub fn main() !void {
 
     // The cache never allocates: one caller-owned buffer, carved internally.
     var cbuf: [1 << 21]u8 align(8) = undefined;
-    var cache = try cedar.Cache.init(&cbuf, .{ .arena = 1 << 20 });
+    var cache = try glyfz.Cache.init(&cbuf, .{ .arena = 1 << 20 });
 
     std.debug.print("{d} glyphs from printable ASCII\n\n", .{n});
-    std.debug.print("{s:>6} {s:>11} {s:>11} {s:>11} {s:>8} {s:>11} {s:>9}\n", .{ "size", "stb ns", "cedar ns", "decode ns", "ratio", "cached ns", "vs stb" });
+    std.debug.print("{s:>6} {s:>11} {s:>11} {s:>11} {s:>8} {s:>11} {s:>9}\n", .{ "size", "stb ns", "glyfz ns", "decode ns", "ratio", "cached ns", "vs stb" });
 
     for ([_]u32{ 11, 16, 24, 34, 48 }) |size| {
         const scale = @as(f32, @floatFromInt(size)) / span;
         const reps: u32 = 40;
 
         var best_stb: i128 = std.math.maxInt(i128);
-        var best_cedar: i128 = std.math.maxInt(i128);
+        var best_glyfz: i128 = std.math.maxInt(i128);
         var best_decode: i128 = std.math.maxInt(i128);
 
         // Warm both paths first: the first call loads caches and, for stb, the
@@ -109,10 +109,10 @@ pub fn main() !void {
                 _ = font.raster(gid, scale, 0, &pts, &ends, &edges, &scratch, &cov) catch continue;
             }
             t1 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
-            best_cedar = @min(best_cedar, t1 - t0);
+            best_glyfz = @min(best_glyfz, t1 - t0);
 
             // Everything up to and including the flattened edges. The gap to
-            // `cedar ns` is the coverage sweep, which tells us which half to
+            // `glyfz ns` is the coverage sweep, which tells us which half to
             // fix instead of guessing.
             t0 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
             for (glyphs[0..n]) |gid| {
@@ -124,7 +124,7 @@ pub fn main() !void {
         }
 
         const per_stb = @as(f64, @floatFromInt(best_stb)) / @as(f64, @floatFromInt(n));
-        const per_cedar = @as(f64, @floatFromInt(best_cedar)) / @as(f64, @floatFromInt(n));
+        const per_glyfz = @as(f64, @floatFromInt(best_glyfz)) / @as(f64, @floatFromInt(n));
         // Cached: warm the whole set (every one a miss), then time pure hits.
         const ppem: u16 = @intFromFloat(@round(scale * @as(f32, @floatFromInt(font.units_per_em))));
         for (glyphs[0..n]) |gid| _ = cache.mask(font, gid, ppem, .zero) catch continue;
@@ -140,6 +140,6 @@ pub fn main() !void {
         const per_cached = @as(f64, @floatFromInt(best_cached)) / @as(f64, @floatFromInt(n));
 
         const per_decode = @as(f64, @floatFromInt(best_decode)) / @as(f64, @floatFromInt(n));
-        std.debug.print("{d:>6} {d:>11.1} {d:>11.1} {d:>11.1} {d:>7.2}x {d:>11.1} {d:>8.1}x\n", .{ size, per_stb, per_cedar, per_decode, per_stb / per_cedar, per_cached, per_stb / per_cached });
+        std.debug.print("{d:>6} {d:>11.1} {d:>11.1} {d:>11.1} {d:>7.2}x {d:>11.1} {d:>8.1}x\n", .{ size, per_stb, per_glyfz, per_decode, per_stb / per_glyfz, per_cached, per_stb / per_cached });
     }
 }

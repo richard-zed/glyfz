@@ -6,7 +6,7 @@
 //! validation tests break one field at a time on a hand-built face; this sweeps
 //! a real one, badly, everywhere.
 //!
-//! Point CEDAR_TEST_FONT at a TTF (or run `zig build fuzz -Dfont=...`). No font
+//! Point GLYFZ_TEST_FONT at a TTF (or run `zig build fuzz -Dfont=...`). No font
 //! is vendored, so the run is reproducible for anyone with a font rather than
 //! pinned to one file.
 //!
@@ -15,7 +15,7 @@
 //! does not: any LoadError or GlyphError, which is the library doing its job.
 
 const std = @import("std");
-const cedar = @import("glyfz");
+const glyfz = @import("glyfz");
 
 fn readFont(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -25,7 +25,7 @@ fn readFont(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
 
 fn fontPath() ![]const u8 {
     // 0.16 dropped std.posix.getenv; this test links libc for it.
-    const p = std.c.getenv("CEDAR_TEST_FONT") orelse return error.SkipZigTest;
+    const p = std.c.getenv("GLYFZ_TEST_FONT") orelse return error.SkipZigTest;
     return std.mem.span(p);
 }
 
@@ -36,12 +36,12 @@ fn rnd() u64 {
 }
 
 fn use(b: []const u8, cmem: []align(8) u8, deep: bool) !void {
-    const font = cedar.Font.init(b) catch return;
+    const font = glyfz.Font.init(b) catch return;
     // Loading is a promise that the face is coherent.
     try std.testing.expect(font.units_per_em > 0);
     try std.testing.expect(font.num_glyphs > 0);
 
-    var cache = cedar.Cache.init(cmem, .{}) catch return;
+    var cache = glyfz.Cache.init(cmem, .{}) catch return;
     const last: u16 = if (deep) 40 else 3;
     var gid: u16 = 0;
     while (gid <= last) : (gid += 1) {

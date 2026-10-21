@@ -1,6 +1,6 @@
 # GlyfZ
 
-A TrueType font parser, rasteriser and glyph cache for Zig. No allocator, no IO.
+A TrueType font parser and rasteriser for Zig 0.16. No allocator, glyph caching.
 
 GlyfZ reads `glyf`-based fonts, turns outlines into antialiased coverage masks,
 and keeps those masks between draws. It is not a shaper: no glyph substitution,
@@ -17,11 +17,38 @@ That sample is a unit test, so it cannot rot quietly.
 
 Two properties are the whole point:
 
-- **No allocator, no IO, no libc.** The font is bytes you own. Every working
-  buffer -- outlines, edges, coverage, and the glyph cache -- is yours too.
+- **No allocator, no IO, no libc.** There is no `std.mem.Allocator` parameter to
+  pass and no file to open. The font is bytes you own; every working buffer --
+  outlines, edges, coverage, and the glyph cache -- is yours too. The claim is
+  about who owns memory, not about using none.
 - **Glyph masks are cached.** `stbtt_GetCodepointBitmap` allocates, rasterises
   and frees on every draw, per glyph. A GlyfZ cache hit is a hash lookup and a
-  slice.
+  slice into caller memory. What stays warm is the rasterised coverage, keyed on
+  glyph, scale and subpixel phase -- not outlines, and not metrics.
+
+## Disclaimer
+
+What this is not, stated plainly so nothing below has to hedge:
+
+- **Not a shaper.** No glyph substitution, no GPOS, no bidi, no line breaking
+  (UAX #14), no Unicode normalisation. A CJK paragraph is one unbreakable line.
+- **Not a text layout engine.** No fallback chain, no font file discovery, no
+  matching a family name to a path. `hasCodepoint` answers the question a chain
+  would ask; walking the chain is yours.
+- **Not all of OpenType.** `glyf` outlines only: no CFF/CFF2, no variable axes,
+  no colour fonts, no hinting, no vertical layout, no `post` table yet.
+- **Not better kerning.** Format 0, the same table stb reads, at parity with it.
+  Formats 2 and 3, Apple's version 1, and GPOS are all absent.
+- **Not a faster rasteriser.** Parity at UI sizes, behind at display sizes. The
+  case for this library is the cache and the absence of an allocator, not the
+  sweep.
+- **"No allocator" is about ownership, not usage.** No `Allocator` parameter is
+  taken; memory is still used, and sizing it is the caller's job (`needed()`).
+- **No silent substitution.** A malformed face is a typed error. GlyfZ never
+  falls back to another face or draws a different glyph than you asked for --
+  that policy belongs to whoever knows which faces exist.
+- **Pre-1.0.** Names may still move before 1.0. `glyfz` is pinned as the package
+  name, and that one does not move, because it keys every consumer's dependency.
 
 ## Status
 
@@ -29,20 +56,47 @@ Two properties are the whole point:
 |---|---|
 | sfnt directory, including `ttcf` collections | done |
 | `head`, `maxp`, `hhea`, `hmtx` metrics | done |
+| `OS/2` weight, selection, typographic and Windows metrics, cap and x-height | done |
 | `cmap` formats 4 and 12 | done |
 | `glyf` / `loca` outlines, simple and composite | done |
 | coverage: exact-area sweep, caller-owned buffers | done |
 | load-time validation, scoped errors | done |
+| `name`, decoded to UTF-8, with an encoding preference | done |
 | `kern` format 0 | done |
-| glyph cache, keyed on glyph + ppem + phase | done |
-| `name`, `OS/2`, `post` | not started |
-| fuzzing | not started |
+| `hasCodepoint`, for asking a fallback chain's question | done |
+| glyph cache, keyed on glyph + scale + phase | done |
+| malformed input: truncation and bit-flip sweeps | done |
+| `post`: italic angle, underline | not started |
 | hinting, CFF/CFF2, variable axes, colour fonts, GPOS, kern 2/3 | out of scope |
 
 `kern` is format 0 only, which is what stb reads. Apple's version 1 layout is
 not read, and neither is GPOS -- where modern fonts actually keep their kerning.
 So a zero advance from `kern()` means the table has nothing to say, not that the
-designer wanted no adjustment.
+designer wanted no adjustment. Kerning here is parity with stb, not an
+improvement on it.
+
+## Names, and the numbers a box centres on
+
+A theme that says `.font = "DejaVu Sans"` needs something to match that string
+against, and `name` is the table that answers. `family` and `style` return the
+usual pair; `name` takes any id for the rest.
+
+Names are decoration, like kerning: a face without a `name` table still loads,
+and the accessor returns null instead of failing. The same id is normally stored
+once per encoding, so there is a preference order -- Windows Unicode, then the
+Unicode platform, then Mac Roman, and Mac Roman only while the bytes are pure
+ASCII, because decoding a codepage that is not implemented would produce a
+plausible wrong answer.
+
+`os2()` returns `cap_height` and `x_height`, both null below table version 2.
+Null rather than zero, because zero is a legal cap height and a guess would be
+indistinguishable from one. DejaVu Sans ships version 1, so this is the ordinary
+case rather than an edge.
+
+They matter because `hhea` gives one set of vertical metrics for every purpose
+while `OS/2` carries three, and on real faces they disagree: DejaVu Sans is
+1556/-492 typographic against 1901/-483 in `hhea`. Anything sizing a line by
+ascender-descender gets a different height depending on which pair it reads.
 
 ## Scope, and what it is measured against
 
@@ -72,6 +126,13 @@ The comparisons are shown to be capable of failing, not assumed to pass: a
 one-unit box shift flags 6190/6190, a half-pixel phase shift drives coverage
 delta to 169, dropping the sweep's accumulator tail drives it to 255.
 
+`zig build fuzz -Dfont=<ttf>` is the other direction: a truncated face at every
+4000th byte, plus 20,000 single-bit flips, deterministic. Every outcome has to
+be a scoped error or a face that still behaves -- a panic, an out-of-bounds read,
+a hang, or a face that loads with no glyphs is a failure. It is shown to be able
+to fail in both directions too: an impossible assertion turns it red, and
+running it with no font configured reports *skipped*, not passed.
+
 Agreement with stb proves GlyfZ is not *different*. It does not prove GlyfZ is
 *right* -- which is why the spec, not the oracle, settles arguments.
 
@@ -80,7 +141,7 @@ Agreement with stb proves GlyfZ is not *different*. It does not prove GlyfZ is
 Per glyph, ReleaseFast, 94 printable-ASCII glyphs, best of 40, three runs of the
 same binary (the spread is the honest precision):
 
-| size | stb | cedar raster | ratio | cache hit | vs stb |
+| size | stb | glyfz raster | ratio | cache hit | vs stb |
 |---|---|---|---|---|---|
 | 11 | 2100-2118 | 2048-2064 | 1.02-1.03x | 115-116 ns | 18x |
 | 16 | 1942-2134 | 1983-2212 | 0.96-1.03x | 86-94 ns | 22-25x |
@@ -102,20 +163,25 @@ zig build bench  -Doptimize=ReleaseFast -Dfont=/path/to/font.ttf
 zig build fuzz   -Dfont=/path/to/font.ttf     # malformed input: rejected, never faulted
 ```
 
-No font is vendored, so the oracle and the bench both need `-Dfont=` (or
-`CEDAR_TEST_FONT` / `CEDAR_BENCH_FONT`). Aim them at an awkward face on purpose.
+No font is vendored, so the oracle, the bench and the fuzz step all need
+`-Dfont=` (or `GLYFZ_TEST_FONT` / `GLYFZ_BENCH_FONT`). Aim them at an awkward face
+on purpose.
 
-## Not ready yet
+## Known gaps
 
-- **Nothing outside this repo has ever linked it.** The API has been exercised
-  by its own tests and bench, and by no consumer.
-- **No fuzzing.** A truncated or bit-flipped font is the classic input for this
-  kind of parser, and the validation has one test per field rather than a sweep.
-- **No font selection.** Without `name` and `OS/2` a caller cannot resolve a
-  font by name or ask for cap height.
-- **The cache flush policy is unmeasured under a real working set.** The arena is
-  a bump allocator, so filling it drops everything. One alphabet at one size is
-  not a UI.
+- **No font selection.** `name` gives you the family string; finding a *file*
+  with that family, and chaining to the next one when this face lacks a
+  codepoint, is the caller's job. `hasCodepoint` answers the question a chain
+  asks, and nothing here walks a list of files.
+- **The cache flush policy is unmeasured under a real working set.** The arena
+  is a bump allocator, so filling it drops everything and `stats.flushes` says
+  so. One alphabet at one size is not a UI.
+- **Composite flags are not audited.** `USE_MY_METRICS`, `ROUND_XY_TO_GRID` and
+  the scaled/unscaled component offset rules are shared with stb, so the
+  differential cannot see them. They need their own tests.
+- **One consumer, reached by absolute path.** A Zig GUI toolkit links this from
+  a machine-local path, which is not how anyone else would consume it. There is
+  no published package.
 
 ## Licence
 

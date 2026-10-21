@@ -1,12 +1,12 @@
 //! Differential against stb_truetype: same face, same answers.
 //!
-//! Point CEDAR_TEST_FONT at a TTF (or run `zig build oracle -Dfont=...`).
+//! Point GLYFZ_TEST_FONT at a TTF (or run `zig build oracle -Dfont=...`).
 //! No font is vendored, so the run is reproducible for anyone with a font
 //! rather than pinned to one file -- and it can be aimed at an awkward face on
 //! purpose.
 
 const std = @import("std");
-const cedar = @import("glyfz");
+const glyfz = @import("glyfz");
 
 const c = @cImport({
     @cInclude("stb_truetype.h");
@@ -20,20 +20,20 @@ fn readFont(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
 
 fn fontPath() ![]const u8 {
     // 0.16 dropped std.posix.getenv; the oracle links libc anyway.
-    const p = std.c.getenv("CEDAR_TEST_FONT") orelse return error.SkipZigTest;
+    const p = std.c.getenv("GLYFZ_TEST_FONT") orelse return error.SkipZigTest;
     return std.mem.span(p);
 }
 
 const Fixture = struct {
     gpa: std.mem.Allocator,
     data: []u8,
-    font: cedar.Font,
+    font: glyfz.Font,
     info: c.stbtt_fontinfo,
 
     fn open(gpa: std.mem.Allocator) !Fixture {
         const data = try readFont(gpa, try fontPath());
         errdefer gpa.free(data);
-        const font = try cedar.Font.init(data);
+        const font = try glyfz.Font.init(data);
         var info: c.stbtt_fontinfo = undefined;
         if (c.stbtt_InitFont(&info, data.ptr, 0) == 0) return error.BadFont;
         return .{ .gpa = gpa, .data = data, .font = font, .info = info };
@@ -69,7 +69,7 @@ test "vertical and horizontal metrics match stb_truetype" {
         c.stbtt_GetGlyphHMetrics(&fx.info, gid, &adv, &lsb);
         if (ours.advance != @as(u16, @intCast(adv)) or ours.lsb != @as(i16, @intCast(lsb))) {
             if (bad < 5) std.debug.print(
-                "hmtx gid {d}: cedar adv {d} lsb {d}, stb adv {d} lsb {d}\n",
+                "hmtx gid {d}: glyfz adv {d} lsb {d}, stb adv {d} lsb {d}\n",
                 .{ gid, ours.advance, ours.lsb, adv, lsb },
             );
             bad += 1;
@@ -91,7 +91,7 @@ test "character map matches stb_truetype over the whole code space" {
         const ours = try fx.font.glyphIndex(@intCast(cp));
         const theirs: c_int = c.stbtt_FindGlyphIndex(&fx.info, @intCast(cp));
         if (theirs < 0 or ours != @as(u16, @intCast(theirs))) {
-            if (bad < 10) std.debug.print("cmap U+{X}: cedar {d}, stb {d}\n", .{ cp, ours, theirs });
+            if (bad < 10) std.debug.print("cmap U+{X}: glyfz {d}, stb {d}\n", .{ cp, ours, theirs });
             bad += 1;
         }
     }
@@ -102,10 +102,10 @@ const Compared = struct { checked: usize, skipped: usize, mismatched: usize };
 
 /// Compare every glyph's decoded outline against stb's.
 ///
-/// `perturb` shifts Cedar's box so the comparison itself can be proven to
+/// `perturb` shifts GlyfZ's box so the comparison itself can be proven to
 /// notice a difference -- a differential that cannot go red is decoration.
 fn compareOutlines(fx: Fixture, perturb: i32) !Compared {
-    var pts: [8192]cedar.Point = undefined;
+    var pts: [8192]glyfz.Point = undefined;
     var ends: [512]u16 = undefined;
 
     var out = Compared{ .checked = 0, .skipped = 0, .mismatched = 0 };
@@ -125,7 +125,7 @@ fn compareOutlines(fx: Fixture, perturb: i32) !Compared {
 
         if (n <= 0) {
             if (o.points.len != 0) {
-                std.debug.print("gid {d}: cedar {d} points, stb none\n", .{ gid, o.points.len });
+                std.debug.print("gid {d}: glyfz {d} points, stb none\n", .{ gid, o.points.len });
                 out.mismatched += 1;
             }
             continue;
@@ -151,7 +151,7 @@ fn compareOutlines(fx: Fixture, perturb: i32) !Compared {
             }
         }
 
-        var b = cedar.outlineBounds(o);
+        var b = glyfz.outlineBounds(o);
         if (perturb != 0) {
             b.x0 += perturb;
             b.y0 += perturb;
@@ -159,7 +159,7 @@ fn compareOutlines(fx: Fixture, perturb: i32) !Compared {
         out.checked += 1;
         if (b.x0 != x0 or b.y0 != y0 or b.x1 != x1 or b.y1 != y1) {
             if (out.mismatched < 10) std.debug.print(
-                "gid {d}: cedar box [{d},{d}..{d},{d}] stb [{d},{d}..{d},{d}]\n",
+                "gid {d}: glyfz box [{d},{d}..{d},{d}] stb [{d},{d}..{d},{d}]\n",
                 .{ gid, b.x0, b.y0, b.x1, b.y1, x0, y0, x1, y1 },
             );
             out.mismatched += 1;
@@ -217,7 +217,7 @@ test "pixel boxes match stb_truetype at several sizes and phases" {
                 checked += 1;
                 if (ours.x0 != ix0 or ours.y0 != iy0 or ours.x1 != ix1 or ours.y1 != iy1) {
                     if (bad < 10) std.debug.print(
-                        "gid {d} size {d} phase {d}: cedar [{d},{d}..{d},{d}] stb [{d},{d}..{d},{d}]\n",
+                        "gid {d} size {d} phase {d}: glyfz [{d},{d}..{d},{d}] stb [{d},{d}..{d},{d}]\n",
                         .{ gid, size, phase, ours.x0, ours.y0, ours.x1, ours.y1, ix0, iy0, ix1, iy1 },
                     );
                     bad += 1;
@@ -237,9 +237,9 @@ test "coverage matches stb_truetype's rasteriser" {
 
     const span: f32 = @floatFromInt(fx.font.ascender - fx.font.descender);
 
-    var pts: [8192]cedar.Point = undefined;
+    var pts: [8192]glyfz.Point = undefined;
     var ends: [512]u16 = undefined;
-    var edges: [8192]cedar.Edge = undefined;
+    var edges: [8192]glyfz.Edge = undefined;
     var scratch: [1024]f32 = undefined;
     var ours_buf: [256 * 256]u8 = undefined;
 
@@ -326,9 +326,9 @@ test "the coverage comparison notices a half-pixel shift" {
     const span: f32 = @floatFromInt(fx.font.ascender - fx.font.descender);
     const scale = 16 / span;
 
-    var pts: [8192]cedar.Point = undefined;
+    var pts: [8192]glyfz.Point = undefined;
     var ends: [512]u16 = undefined;
-    var edges: [8192]cedar.Edge = undefined;
+    var edges: [8192]glyfz.Edge = undefined;
     var scratch: [1024]f32 = undefined;
     var ours_buf: [256 * 256]u8 = undefined;
 
@@ -391,7 +391,7 @@ test "kerning matches stb_truetype" {
             checked += 1;
             if (theirs != 0) nonzero += 1;
             if (ours != theirs) {
-                if (bad < 10) std.debug.print("kern ({d},{d}): cedar {d}, stb {d}\n", .{ a, b, ours, theirs });
+                if (bad < 10) std.debug.print("kern ({d},{d}): glyfz {d}, stb {d}\n", .{ a, b, ours, theirs });
                 bad += 1;
             }
         }

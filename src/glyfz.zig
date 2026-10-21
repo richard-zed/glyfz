@@ -1,4 +1,4 @@
-//! Cedar -- a TrueType rasteriser.
+//! GlyfZ -- a TrueType rasteriser.
 //!
 //! Reads `glyf`-based fonts, turns outlines into antialiased coverage masks,
 //! and keeps those masks between draws. It is not a shaper: no glyph
@@ -11,10 +11,10 @@
 //!    is the caller's too. Nothing here reaches outside them.
 //! 2. **The spec decides, not the reference.** `oracle/` carries stb_truetype as
 //!    a differential oracle. Where the two disagree the disagreement is a
-//!    finding to write down, not a bug in Cedar by default. Two are documented
+//!    finding to write down, not a bug in GlyfZ by default. Two are documented
 //!    at `cmapFormat4` and in the composite decoder.
 //! 3. **Failures are scoped.** `LoadError` means discard the face;
-//!    `GlyphError` means this one glyph failed and the face is still good. Cedar
+//!    `GlyphError` means this one glyph failed and the face is still good. GlyfZ
 //!    propagates both and never substitutes a glyph silently -- deciding to keep
 //!    a last-good face needs a fallback chain, which belongs to the caller.
 //!
@@ -30,7 +30,7 @@ const ReadError = error{Truncated};
 /// A table span that is absent or out of range: the only thing `slice` checks.
 const SpanError = error{ Truncated, MissingTable };
 
-/// Failures that mean the bytes will never work. Cedar has no second face to
+/// Failures that mean the bytes will never work. GlyfZ has no second face to
 /// fall back to, so choosing another font is the caller's policy, not ours.
 pub const LoadError = error{
     /// A read ran past the end of the font, or a table is shorter than the
@@ -191,7 +191,7 @@ pub const Raster = struct {
     coverage: []u8,
 };
 
-/// stb_truetype's curve flattening tolerance, in pixels. Cedar uses the same
+/// stb_truetype's curve flattening tolerance, in pixels. GlyfZ uses the same
 /// number so the two rasterisers are comparing the same polygons; an exact
 /// quadratic path would remove the tolerance altogether and is a later win.
 pub const flatten_tolerance: f32 = 0.35;
@@ -260,14 +260,14 @@ pub const Font = struct {
     os2_span: Span = .{},
 
     /// Parse the table directory and the metrics a caller needs up front.
-    /// Fails loudly: a font Cedar cannot read should not silently measure zero.
+    /// Fails loudly: a font GlyfZ cannot read should not silently measure zero.
     pub fn init(bytes: []const u8) LoadError!Font {
         return initIndex(bytes, 0);
     }
 
     /// Same, for the Nth face of a font collection (`.ttc`). The existing
     /// backend asks stb for index 0 of every file, so a collection is a file
-    /// users can already point at and Cedar refused.
+    /// users can already point at and GlyfZ refused.
     pub fn initIndex(bytes: []const u8, index: u32) LoadError!Font {
         var base: usize = 0;
         const v = try u32At(bytes, 0);
@@ -383,7 +383,7 @@ pub const Font = struct {
     /// because a well-formed font lists it later. The alternative -- scoring
     /// records -- would pick a different subtable on some fonts and move text
     /// on a swap, for no gain.
-    /// True when the font carries a `kern` table Cedar could read. An absent
+    /// True when the font carries a `kern` table GlyfZ could read. An absent
     /// or malformed one is not an error -- kerning is decoration, and refusing
     /// an otherwise good font over it would be worse -- but it is REPORTABLE,
     /// so a caller can say so instead of wondering why text looks loose.
@@ -725,10 +725,10 @@ pub const Font = struct {
 
 /// Format 4: segment mapping to delta values.
 ///
-/// KNOWN DIVERGENCE FROM stb_truetype, in Cedar's favour. The spec applies
+/// KNOWN DIVERGENCE FROM stb_truetype, in GlyfZ's favour. The spec applies
 /// `idDelta` to the value fetched through `idRangeOffset`; stb returns the
 /// fetched value unchanged. On a font that combines a non-zero delta with a
-/// non-zero range offset the two disagree, and Cedar is the one following the
+/// non-zero range offset the two disagree, and GlyfZ is the one following the
 /// spec. The oracle run reports that as a mismatch only if a font in test uses
 /// the combination; the synthetic test below pins our behaviour either way.
 fn cmapFormat4(cm: []const u8, base: usize, cp: u21) GlyphError!u16 {
@@ -951,7 +951,7 @@ fn decodeSimple(data: []const u8, n_contours: usize, cur: *Cursor) GlyphError!vo
 ///
 /// SECOND KNOWN DIVERGENCE FROM stb_truetype. The spec applies the 2x2 matrix
 /// as given; stb additionally multiplies by the sqrt of each column's norm
-/// (`m = sqrt(a*a + b*b)`), which squares a uniform scale. Cedar follows the
+/// (`m = sqrt(a*a + b*b)`), which squares a uniform scale. GlyfZ follows the
 /// spec. The two agree on the common case -- accents placed by translation
 /// with no matrix -- and disagree on scaled composites, which is exactly the
 /// kind of thing the differential is there to point at.
@@ -1314,7 +1314,7 @@ pub const Mask = struct {
 /// Glyph masks kept between draws, so a repeated glyph costs a lookup instead
 /// of a rasterisation.
 ///
-/// All of its memory is one caller-owned buffer. Cedar still does not allocate:
+/// All of its memory is one caller-owned buffer. GlyfZ still does not allocate:
 /// the caller decides the size once, from `needed()`, and this carves that into
 /// the slot table, the outline scratch and the pixel arena.
 ///
@@ -1592,6 +1592,18 @@ fn os2Table(t: []const u8) ?Os2 {
 /// single-byte codepage. A Mac record is used only while it is pure ASCII:
 /// reproducing it exactly needs a 128-entry table, and guessing would put the
 /// wrong character in a string whose whole job is to be exact.
+/// Pick one `name` record and decode it.
+///
+/// The same id is usually stored several times, once per encoding, so a
+/// preference order is unavoidable. Windows Unicode (platform 3, encoding 1 or
+/// 10) wins, then the Unicode platform, then Mac Roman -- which is accepted
+/// ONLY while the bytes are pure ASCII. Decoding Mac Roman properly means
+/// implementing Mac OS Roman, and half-doing it would turn a name into
+/// mojibake; refusing to guess is better than a plausible wrong answer.
+///
+/// The first record of the winning rank wins, so the pick does not depend on
+/// how many duplicates a face ships. A record pointing outside the table is
+/// skipped rather than trusted.
 fn nameRecord(tbl: []const u8, id: u16, out: []u8) ?[]const u8 {
     const count = at16(tbl, 2) orelse return null;
     const storage = at16(tbl, 4) orelse return null;

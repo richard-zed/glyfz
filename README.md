@@ -6,6 +6,8 @@ GlyfZ reads `glyf`-based fonts, turns outlines into antialiased coverage masks,
 and keeps those masks between draws. It is not a shaper: no glyph substitution,
 no fallback chain, no line breaking.
 
+<!-- Disclaimer goes here. Author-written. -->
+
 ```zig
 var font = try glyfz.Font.init(bytes);           // bytes are yours
 var cache = try glyfz.Cache.init(&storage, .{}); // so is the cache's memory
@@ -25,30 +27,6 @@ Two properties are the whole point:
   and frees on every draw, per glyph. A GlyfZ cache hit is a hash lookup and a
   slice into caller memory. What stays warm is the rasterised coverage, keyed on
   glyph, scale and subpixel phase -- not outlines, and not metrics.
-
-## Disclaimer
-
-What this is not, stated plainly so nothing below has to hedge:
-
-- **Not a shaper.** No glyph substitution, no GPOS, no bidi, no line breaking
-  (UAX #14), no Unicode normalisation. A CJK paragraph is one unbreakable line.
-- **Not a text layout engine.** No fallback chain, no font file discovery, no
-  matching a family name to a path. `hasCodepoint` answers the question a chain
-  would ask; walking the chain is yours.
-- **Not all of OpenType.** `glyf` outlines only: no CFF/CFF2, no variable axes,
-  no colour fonts, no hinting, no vertical layout, no `post` table yet.
-- **Not better kerning.** Format 0, the same table stb reads, at parity with it.
-  Formats 2 and 3, Apple's version 1, and GPOS are all absent.
-- **Not a faster rasteriser.** Measured at parity at UI sizes and behind at
-  display sizes. The case for this library is the cache and the absence of an
-  allocator, not the sweep.
-- **"No allocator" is about ownership, not usage.** No `Allocator` parameter is
-  taken; memory is still used, and sizing it is the caller's job (`needed()`).
-- **No silent substitution.** A malformed face is a typed error. GlyfZ never
-  falls back to another face or draws a different glyph than you asked for --
-  that policy belongs to whoever knows which faces exist.
-- **Pre-1.0.** Names may still move before 1.0. `glyfz` is pinned as the package
-  name, and that one does not move, because it keys every consumer's dependency.
 
 ## Status
 
@@ -100,7 +78,7 @@ ascender-descender gets a different height depending on which pair it reads.
 
 ## Scope
 
-`glyf`-based fonts, per the disclaimer above. The reference implementation
+`glyf`-based fonts only. The reference implementation
 during development was stb_truetype; **it is not vendored here**, so neither the
 differential nor the per-glyph comparison can be re-run from this repository.
 What they found is recorded below.

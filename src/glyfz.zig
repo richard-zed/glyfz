@@ -1230,8 +1230,10 @@ pub const Font = struct {
         const NAME = self.name_span.len;
         const OS2 = self.os2_span.len;
         const POST = self.post_span.len;
+        const KERN = if (self.kern_ok) self.kern_span.len else 0;
 
-        const n_tables: usize = 8;
+        const n_tables: usize = 8 + @as(usize, if (OS2 != 0) 1 else 0) +
+            @as(usize, if (POST != 0) 1 else 0) + @as(usize, if (KERN != 0) 1 else 0);
         var total: usize = 12 + 16 * n_tables;
         const off_head = total;
         total = pad4(total + HEAD);
@@ -1241,6 +1243,8 @@ pub const Font = struct {
         total = pad4(total + MAXP);
         const off_hmtx = total;
         total = pad4(total + HMTX);
+        const off_kern = total;
+        total = pad4(total + KERN);
         const off_loca = total;
         total = pad4(total + LOCA);
         const off_glyf = total;
@@ -1258,10 +1262,13 @@ pub const Font = struct {
         @memset(out[0..total], 0);
         var w = Out{ .b = out, .p = 0 };
         try w.u32v(0x0001_0000);
-        try w.u16v(n_tables);
-        try w.u16v(0);
-        try w.u16v(0);
-        try w.u16v(0);
+        try w.u16v(@intCast(n_tables));
+        var pow: usize = 1;
+        var log2: usize = 0;
+        while (pow * 2 <= n_tables) : (pow *= 2) log2 += 1;
+        try w.u16v(@intCast(pow * 16));
+        try w.u16v(@intCast(log2));
+        try w.u16v(@intCast(n_tables * 16 - pow * 16));
         const dir_at = w.p;
         w.p += 16 * n_tables;
 
@@ -1278,6 +1285,7 @@ pub const Font = struct {
         @memcpy(out[off_maxp..][0..MAXP], self.data[self.maxp.off..][0..MAXP]);
         @memcpy(out[off_hmtx..][0..HMTX], self.data[self.hmtx.off..][0..HMTX]);
         @memcpy(out[off_name..][0..NAME], self.data[self.name_span.off..][0..NAME]);
+        if (KERN != 0) @memcpy(out[off_kern..][0..KERN], self.data[self.kern_span.off..][0..KERN]);
         if (OS2 != 0) @memcpy(out[off_os2..][0..OS2], self.data[self.os2_span.off..][0..OS2]);
         if (POST != 0) @memcpy(out[off_post..][0..POST], self.data[self.post_span.off..][0..POST]);
 
@@ -1322,28 +1330,53 @@ pub const Font = struct {
         const delta_at = w.p;
         w.p += seg_count * 2;
         w.p += seg_count * 2; // idRangeOffset, all zero: idDelta does the work
-        try self.emitSegments(out, keep, end_at, start_at, delta_at);
+        try self.emitSegments(out, keep, end_at, start_at, delta_at, seg_count);
         out[pad_at] = 0;
         out[pad_at + 1] = 0;
 
-        // Directory, then each table's checksum over its padded bytes.
+        // Directory records must be in ascending tag order, and every table
+        // physically written must have one: FreeType binary searches this
+        // table, so an unsorted directory loses tables that are present.
+        const DirRec = struct { tag: u32, off: usize, len: usize };
+        var recs: [11]DirRec = undefined;
         var t: usize = 0;
-        for ([_]struct { tag: u32, off: usize, len: usize, checksum: bool }{
-            .{ .tag = tag("head"), .off = off_head, .len = HEAD, .checksum = true },
-            .{ .tag = tag("hhea"), .off = off_hhea, .len = HHEA, .checksum = true },
-            .{ .tag = tag("maxp"), .off = off_maxp, .len = MAXP, .checksum = true },
-            .{ .tag = tag("hmtx"), .off = off_hmtx, .len = HMTX, .checksum = true },
-            .{ .tag = tag("loca"), .off = off_loca, .len = LOCA, .checksum = true },
-            .{ .tag = tag("glyf"), .off = off_glyf, .len = glyf_len, .checksum = true },
-            .{ .tag = tag("cmap"), .off = off_cmap, .len = cmap_len, .checksum = true },
-            .{ .tag = tag("name"), .off = off_name, .len = NAME, .checksum = true },
-        }) |rec| {
-            const p = dir_at + t * 16;
-            writeU32(out, p, rec.tag);
-            writeU32(out, p + 4, checksum(out[rec.off..][0..pad4(rec.len)]));
-            writeU32(out, p + 8, @intCast(rec.off));
-            writeU32(out, p + 12, @intCast(rec.len));
+        if (OS2 != 0) {
+            recs[t] = .{ .tag = tag("OS/2"), .off = off_os2, .len = OS2 };
             t += 1;
+        }
+        recs[t] = .{ .tag = tag("cmap"), .off = off_cmap, .len = cmap_len };
+        t += 1;
+        recs[t] = .{ .tag = tag("glyf"), .off = off_glyf, .len = glyf_len };
+        t += 1;
+        recs[t] = .{ .tag = tag("head"), .off = off_head, .len = HEAD };
+        t += 1;
+        recs[t] = .{ .tag = tag("hhea"), .off = off_hhea, .len = HHEA };
+        t += 1;
+        recs[t] = .{ .tag = tag("hmtx"), .off = off_hmtx, .len = HMTX };
+        t += 1;
+        if (KERN != 0) {
+            recs[t] = .{ .tag = tag("kern"), .off = off_kern, .len = KERN };
+            t += 1;
+        }
+        recs[t] = .{ .tag = tag("loca"), .off = off_loca, .len = LOCA };
+        t += 1;
+        recs[t] = .{ .tag = tag("maxp"), .off = off_maxp, .len = MAXP };
+        t += 1;
+        recs[t] = .{ .tag = tag("name"), .off = off_name, .len = NAME };
+        t += 1;
+        if (POST != 0) {
+            recs[t] = .{ .tag = tag("post"), .off = off_post, .len = POST };
+            t += 1;
+        }
+        if (t != n_tables) return error.BadValue;
+        var d: usize = 0;
+        while (d < t) : (d += 1) {
+            const rec = recs[d];
+            const slot = dir_at + d * 16;
+            writeU32(out, slot, rec.tag);
+            writeU32(out, slot + 4, checksum(out[rec.off..][0..pad4(rec.len)]));
+            writeU32(out, slot + 8, @intCast(rec.off));
+            writeU32(out, slot + 12, @intCast(rec.len));
         }
 
         // head.checkSumAdjustment: 0xB1B0AFBA minus the whole-file sum.
@@ -1466,14 +1499,18 @@ pub const Font = struct {
                 run_open = false;
                 continue;
             }
-            if (!run_open or @as(u32, prev_gid) + 1 != @as(u32, g)) segs += 1;
+            if (!run_open or runBroken(prev_gid, g)) segs += 1;
             run_open = true;
             prev_gid = g;
         }
         return segs;
     }
 
-    fn emitSegments(self: Font, out: []u8, keep: []const u8, end_at: usize, start_at: usize, delta_at: usize) SubsetError!void {
+    fn runBroken(prev: u16, next: u16) bool {
+        return @as(u32, prev) + 1 != @as(u32, next);
+    }
+
+    fn emitSegments(self: Font, out: []u8, keep: []const u8, end_at: usize, start_at: usize, delta_at: usize, expect: usize) SubsetError!void {
         var seg: usize = 0;
         var cp: u32 = 0;
         var prev_gid: u16 = 0;
@@ -1496,7 +1533,7 @@ pub const Font = struct {
                 run_open = true;
                 run_start = cp;
                 run_gid = g;
-            } else if (@as(u32, prev_gid) + 1 != @as(u32, g)) {
+            } else if (runBroken(prev_gid, g)) {
                 writeU16(out, end_at + seg * 2, @intCast(cp - 1));
                 writeU16(out, start_at + seg * 2, @intCast(run_start));
                 writeU16(out, delta_at + seg * 2, @truncate(@as(u32, run_gid) -% run_start));
@@ -1516,6 +1553,11 @@ pub const Font = struct {
         writeU16(out, end_at + seg * 2, 0xFFFF);
         writeU16(out, start_at + seg * 2, 0xFFFF);
         writeU16(out, delta_at + seg * 2, 1);
+        seg += 1;
+        // The counting walk and the emitting walk are separate loops over the
+        // same predicate. One segment's disagreement writes a cmap whose
+        // segCountX2 is wrong -- corrupt and silent. Refuse instead.
+        if (seg != expect) return error.BadValue;
     }
 
     /// Convert base-relative mark offsets into pen-relative ones.
@@ -1582,7 +1624,9 @@ pub const Font = struct {
         const script = if (opts.script != 0) opts.script else self.pickScript();
         if (self.gsub_span.len != 0) {
             var l = opentype.Layout.init(self.data, self.gsub_span.off, self.gsub_span.len) catch return n;
-            l.lig = comps_of[0..];
+            // Fixed-size scratch: a longer run loses component tracking rather
+            // than indexing past the end. Substitution itself is unaffected.
+            if (n <= max_order) l.lig = comps_of[0..];
             if (self.gdef_span.len != 0) l.gdef = opentype.Gdef.init(self.data, self.gdef_span.off, self.gdef_span.len) catch null;
             // Order is hb's default feature order, and it matters: ccmp
             // rewrites the buffer (and can shorten it), so everything after it
@@ -1606,11 +1650,19 @@ pub const Font = struct {
                 } else |_| {}
             }
             if (opts.direction == .ltr) {
+                // Windowed for the same reason: the advance scratch is fixed
+                // size. A mark attaches to a base nearby, so a window gives the
+                // same answer as the whole run except at a seam.
                 var advs: [max_order]i32 = @splat(0);
-                for (out[0..len], 0..) |g, i| {
-                    advs[i] = if (self.hMetricsResolved(g)) |m| m.advance else |_| 0;
+                var off: usize = 0;
+                while (off < len) {
+                    const cnt = @min(max_order, len - off);
+                    for (out[off..][0..cnt], 0..) |g, i| {
+                        advs[i] = if (self.hMetricsResolved(g)) |m| m.advance else |_| 0;
+                    }
+                    penRelative(advs[0..cnt], p[off..][0..cnt]);
+                    off += cnt;
                 }
-                penRelative(advs[0..len], p[0..len]);
             }
         }
         return len;
@@ -1632,10 +1684,20 @@ pub const Font = struct {
     /// no parse of the table itself happens.
     pub fn hasTable(self: Font, wanted: u32) bool {
         if (self.data.len < 12) return false;
-        const n = (@as(usize, self.data[4]) << 8) | self.data[5];
+        // A collection has no directory at offset 0: those bytes are 'ttcf' and
+        // offset 4 is the face count, so numTables read from there answers about
+        // nothing. Follow the first face's directory offset instead.
+        var dir: usize = 0;
+        if (self.data[0] == 't' and self.data[1] == 't' and self.data[2] == 'c' and self.data[3] == 'f') {
+            if (self.data.len < 16) return false;
+            dir = (@as(usize, self.data[12]) << 24) | (@as(usize, self.data[13]) << 16) |
+                (@as(usize, self.data[14]) << 8) | self.data[15];
+        }
+        if (dir + 12 > self.data.len) return false;
+        const n = (@as(usize, self.data[dir + 4]) << 8) | self.data[dir + 5];
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            const rec = 12 + i * 16;
+            const rec = dir + 12 + i * 16;
             if (rec + 16 > self.data.len) return false;
             const t = (@as(u32, self.data[rec]) << 24) | (@as(u32, self.data[rec + 1]) << 16) |
                 (@as(u32, self.data[rec + 2]) << 8) | @as(u32, self.data[rec + 3]);
@@ -2842,6 +2904,10 @@ fn u8At(b: []const u8, off: usize) ReadError!u8 {
     return b[off];
 }
 
+fn at32(b: []const u8, off: usize) u32 {
+    return (@as(u32, b[off]) << 24) | (@as(u32, b[off + 1]) << 16) | (@as(u32, b[off + 2]) << 8) | b[off + 3];
+}
+
 fn u16At(b: []const u8, off: usize) ReadError!u16 {
     if (off + 2 > b.len) return error.Truncated;
     return std.mem.readInt(u16, b[off..][0..2], .big);
@@ -3824,6 +3890,54 @@ test "a subset pulls in components it was not asked for, and keeps ids" {
     try std.testing.expect(a.w > 0 and a.h > 0);
     try std.testing.expectEqual(a.w, b.w);
     try std.testing.expectEqualSlices(u8, a.coverage, b.coverage);
+}
+
+test "a subset writes a conformant container: sorted directory, correct header" {
+    var fbuf: [4096]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fbuf, false));
+    var out: [16384]u8 = undefined;
+    const n = try font.subset(&[_]u16{ 6, 7 }, &out);
+
+    const nt = (@as(usize, out[4]) << 8) | out[5];
+    try std.testing.expect(nt >= 8);
+    // header fields are required, not decorative: a reader that trusts
+    // searchRange searches the wrong span of the directory.
+    var pow: usize = 1;
+    var log2: usize = 0;
+    while (pow * 2 <= nt) : (pow *= 2) log2 += 1;
+    try std.testing.expectEqual(@as(u16, @intCast(pow * 16)), at16(&out, 6));
+    try std.testing.expectEqual(@as(u16, @intCast(log2)), at16(&out, 8));
+    try std.testing.expectEqual(@as(u16, @intCast(nt * 16 - pow * 16)), at16(&out, 10));
+
+    var prev: u32 = 0;
+    var i: usize = 0;
+    var saw_glyf = false;
+    while (i < nt) : (i += 1) {
+        const rec = 12 + i * 16;
+        const tg = at32(&out, rec);
+        // ascending tag order, which binary-searching readers depend on
+        if (i != 0) try std.testing.expect(tg > prev);
+        prev = tg;
+        const off = at32(&out, rec + 8);
+        const len = at32(&out, rec + 12);
+        try std.testing.expect(off + len <= n);
+        if (tg == tag("glyf")) saw_glyf = true;
+    }
+    try std.testing.expect(saw_glyf);
+}
+
+test "a run longer than the scratch arrays is shaped instead of overrunning them" {
+    var fbuf: [4096]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fbuf, false));
+    var cps: [600]u21 = @splat(0x41);
+    var out: [600]u16 = @splat(0);
+    var place: [600]opentype.Offset = @splat(.{});
+    // No layout tables in the test face, so this exercises the length guards
+    // rather than a lookup; the point is that it must not index past the fixed
+    // component/advance scratch arrays.
+    const n = try font.shape(&cps, &out, &place, .{});
+    try std.testing.expectEqual(@as(usize, 600), n);
+    try std.testing.expect(out[599] != 0);
 }
 
 test "a subset drops the outlines it was not given" {

@@ -802,26 +802,57 @@ pub const Layout = struct {
                 if (idx >= count) return .{};
                 const set = sub + try u16At(self.data, sub + 6 + @as(usize, idx) * 2);
                 const lig_count = try u16At(self.data, set);
+                const skip_marks = (flags & 0x0008 != 0) or (flags & 0x0010 != 0);
                 var l: usize = 0;
                 while (l < lig_count) : (l += 1) {
                     const lig = set + try u16At(self.data, set + 2 + l * 2);
                     const lig_glyph = try u16At(self.data, lig);
                     const comps = try u16At(self.data, lig + 2);
-                    if (comps == 0 or comps - 1 > len - pos - 1) continue;
-                    var ok = true;
-                    var k: usize = 0;
-                    while (k < comps - 1) : (k += 1) {
-                        if (buf[pos + 1 + k] != try u16At(self.data, lig + 4 + k * 2)) {
-                            ok = false;
-                            break;
+                    if (comps == 0 or comps > 16) continue;
+                    // Where each component actually sits. With IgnoreMarks a
+                    // mark between components is stepped over and LEFT IN
+                    // PLACE, so the ligature can form without eating it --
+                    // which is how الله keeps its shadda.
+                    var positions: [16]usize = undefined;
+                    positions[0] = pos;
+                    var got: usize = 1;
+                    var q = pos + 1;
+                    while (got < comps) {
+                        if (q >= len) break;
+                        const want = try u16At(self.data, lig + 4 + (got - 1) * 2);
+                        if (buf[q] == want) {
+                            positions[got] = q;
+                            got += 1;
+                            q += 1;
+                            continue;
                         }
+                        const is_mark = if (self.gdef) |g| try g.isMark(buf[q]) else false;
+                        if (skip_marks and is_mark) {
+                            q += 1;
+                            continue;
+                        }
+                        break;
                     }
-                    if (!ok) continue;
+                    if (got != comps) continue;
                     buf[pos] = lig_glyph;
-                    const drop = comps - 1;
-                    const tail = len - pos - 1 - drop;
-                    std.mem.copyForwards(u16, buf[pos + 1 .. pos + 1 + tail], buf[pos + 1 + drop .. pos + 1 + drop + tail]);
-                    return .{ .hit = true, .len = len - drop, .advance = 1 };
+                    // Keep everything that was not consumed as a component, so
+                    // the stepped-over marks survive in order after the ligature.
+                    var write = pos + 1;
+                    var r = pos + 1;
+                    while (r < len) : (r += 1) {
+                        var consumed = false;
+                        var c: usize = 1;
+                        while (c < comps) : (c += 1) {
+                            if (positions[c] == r) {
+                                consumed = true;
+                                break;
+                            }
+                        }
+                        if (consumed) continue;
+                        buf[write] = buf[r];
+                        write += 1;
+                    }
+                    return .{ .hit = true, .len = write, .advance = 1 };
                 }
                 return .{};
             },

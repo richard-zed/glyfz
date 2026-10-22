@@ -13,7 +13,7 @@
 
 const std = @import("std");
 
-pub const Error = error{ Truncated, MissingTable };
+pub const Error = error{ Truncated, MissingTable, BufferTooSmall };
 
 /// Big-endian four-character tag, the same encoding `glyfz.tag` produces.
 pub fn tag(comptime s: *const [4]u8) u32 {
@@ -343,6 +343,198 @@ pub const Layout = struct {
         }
     }
 
+    /// One GSUB pass for `feat` over `in`, writing to `out`.
+    ///
+    /// Types 1 (single), 2 (multiple), 3 (alternate) and 4 (ligature). The
+    /// pass is left to right, one lookup at a time, in lookup-list order --
+    /// which is the order the spec applies them in, because a later lookup is
+    /// written against the output of the earlier ones. Contextual lookups
+    /// (types 5 and 6) are not applied, so a font that only replaces through
+    /// context reads as unchanged rather than as wrong.
+    ///
+    /// `out` may alias `in`? No: it is written from the start, so pass distinct
+    /// buffers. It must have room for the longest expansion the feature can
+    /// produce, and too little room is `BufferTooSmall`, never a truncation.
+    pub fn substitute(self: Layout, feat: u32, in: []const u16, out: []u16) Error!usize {
+        if (out.len < in.len) return error.BufferTooSmall;
+        @memcpy(out[0..in.len], in);
+        var len = in.len;
+
+        var lookups_buf: [32]u16 = undefined;
+        const lookups = try self.featureLookupsDefault(feat, &lookups_buf);
+        for (lookups) |li| {
+            const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, li) * 2);
+            const kind = try u16At(self.data, lookup);
+            const sub_count = try u16At(self.data, lookup + 4);
+            var i: usize = 0;
+            while (i < sub_count) : (i += 1) {
+                const sub = lookup + try u16At(self.data, lookup + 6 + i * 2);
+                const step = try self.substPass(kind, sub, out, len);
+                len = step;
+            }
+        }
+        return len;
+    }
+
+    /// The lookups of `feat` under `script`, falling back to the default
+    /// script when that script does not carry it. Arabic lives under `arab`,
+    /// and a font may not repeat ccmp there.
+    fn lookupsFor(self: Layout, script: u32, feat: u32, out: []u16) []const u16 {
+        if (self.featureLookups(script, 0, feat, out)) |l| {
+            if (l.len > 0) return l;
+        } else |_| {}
+        return self.featureLookupsDefault(feat, out) catch return &.{};
+    }
+
+    /// Apply one feature at ONE buffer position, which is what a joining form
+    /// needs: `init` applies to the letters that take an initial form and to
+    /// nothing else. Returns the (possibly changed) buffer length.
+    pub fn applyFeatureAt(self: Layout, script: u32, feat: u32, buf: []u16, len: usize, pos: usize) Error!usize {
+        if (pos >= len) return len;
+        var lookups_buf: [32]u16 = undefined;
+        var cur = len;
+        for (self.lookupsFor(script, feat, &lookups_buf)) |li| {
+            const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, li) * 2);
+            const kind = try u16At(self.data, lookup);
+            const sub_count = try u16At(self.data, lookup + 4);
+            var i: usize = 0;
+            while (i < sub_count) : (i += 1) {
+                const sub = lookup + try u16At(self.data, lookup + 6 + i * 2);
+                var real_kind = kind;
+                var real = sub;
+                if (kind == 7) {
+                    real_kind = try u16At(self.data, sub + 2);
+                    real = sub + try u32At(self.data, sub + 4);
+                }
+                const step = try self.substAt(real_kind, real, buf, cur, pos);
+                cur = step.len;
+                if (step.hit) break;
+            }
+        }
+        return cur;
+    }
+
+    /// Apply one feature at every position, in order.
+    pub fn applyFeature(self: Layout, script: u32, feat: u32, buf: []u16, len: usize) Error!usize {
+        var lookups_buf: [32]u16 = undefined;
+        var cur = len;
+        for (self.lookupsFor(script, feat, &lookups_buf)) |li| {
+            const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, li) * 2);
+            const kind = try u16At(self.data, lookup);
+            const sub_count = try u16At(self.data, lookup + 4);
+            var i: usize = 0;
+            while (i < sub_count) : (i += 1) {
+                const sub = lookup + try u16At(self.data, lookup + 6 + i * 2);
+                cur = try self.substPass(kind, sub, buf, cur);
+            }
+        }
+        return cur;
+    }
+
+    /// Walk `buf[0..len]` applying one subtable at every position.
+    fn substPass(self: Layout, kind: u16, sub: usize, buf: []u16, len: usize) Error!usize {
+        var real_kind = kind;
+        var real = sub;
+        if (kind == 7) {
+            // GSUB Extension: the same unwrap GPOS uses, different type number.
+            real_kind = try u16At(self.data, sub + 2);
+            real = sub + try u32At(self.data, sub + 4);
+        }
+        var pos: usize = 0;
+        var n = len;
+        while (pos < n) {
+            const step = try self.substAt(real_kind, real, buf, n, pos);
+            if (step.hit) {
+                n = step.len;
+                pos += step.advance;
+            } else {
+                pos += 1;
+            }
+        }
+        return n;
+    }
+
+    const Step = struct { hit: bool = false, len: usize = 0, advance: usize = 1 };
+
+    fn substAt(self: Layout, kind: u16, sub: usize, buf: []u16, len: usize, pos: usize) Error!Step {
+        const gid = buf[pos];
+        const cov = sub + try u16At(self.data, sub + 2);
+        const idx = (try self.coverageIndex(cov, gid)) orelse return .{};
+        switch (kind) {
+            1 => {
+                // Format 1 maps by delta (a signed add, wrapping 16-bit);
+                // format 2 lists the substitutes.
+                const fmt = try u16At(self.data, sub);
+                const to: u16 = if (fmt == 1)
+                    gid +% @as(u16, @bitCast(try i16At(self.data, sub + 4)))
+                else blk: {
+                    const count = try u16At(self.data, sub + 4);
+                    if (idx >= count) return .{};
+                    break :blk try u16At(self.data, sub + 6 + @as(usize, idx) * 2);
+                };
+                if (to == gid) return .{};
+                buf[pos] = to;
+                return .{ .hit = true, .len = len, .advance = 1 };
+            },
+            2 => {
+                const count = try u16At(self.data, sub + 4);
+                if (idx >= count) return .{};
+                const seq = sub + try u16At(self.data, sub + 6 + @as(usize, idx) * 2);
+                const n = try u16At(self.data, seq);
+                if (n == 0) return .{};
+                if (len - 1 + n > buf.len) return error.BufferTooSmall;
+                if (n > 1) {
+                    const tail = len - pos - 1;
+                    std.mem.copyBackwards(u16, buf[pos + n .. pos + n + tail], buf[pos + 1 .. pos + 1 + tail]);
+                }
+                var k: usize = 0;
+                while (k < n) : (k += 1) buf[pos + k] = try u16At(self.data, seq + 2 + k * 2);
+                return .{ .hit = true, .len = len - 1 + n, .advance = n };
+            },
+            3 => {
+                const count = try u16At(self.data, sub + 4);
+                if (idx >= count) return .{};
+                const set = sub + try u16At(self.data, sub + 6 + @as(usize, idx) * 2);
+                const n = try u16At(self.data, set);
+                if (n == 0) return .{};
+                // Alternate 0 is the designer's first choice.
+                const to = try u16At(self.data, set + 2);
+                if (to == gid) return .{};
+                buf[pos] = to;
+                return .{ .hit = true, .len = len, .advance = 1 };
+            },
+            4 => {
+                const count = try u16At(self.data, sub + 4);
+                if (idx >= count) return .{};
+                const set = sub + try u16At(self.data, sub + 6 + @as(usize, idx) * 2);
+                const lig_count = try u16At(self.data, set);
+                var l: usize = 0;
+                while (l < lig_count) : (l += 1) {
+                    const lig = set + try u16At(self.data, set + 2 + l * 2);
+                    const lig_glyph = try u16At(self.data, lig);
+                    const comps = try u16At(self.data, lig + 2);
+                    if (comps == 0 or comps - 1 > len - pos - 1) continue;
+                    var ok = true;
+                    var k: usize = 0;
+                    while (k < comps - 1) : (k += 1) {
+                        if (buf[pos + 1 + k] != try u16At(self.data, lig + 4 + k * 2)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (!ok) continue;
+                    buf[pos] = lig_glyph;
+                    const drop = comps - 1;
+                    const tail = len - pos - 1 - drop;
+                    std.mem.copyForwards(u16, buf[pos + 1 .. pos + 1 + tail], buf[pos + 1 + drop .. pos + 1 + drop + tail]);
+                    return .{ .hit = true, .len = len - drop, .advance = 1 };
+                }
+                return .{};
+            },
+            else => return .{},
+        }
+    }
+
     /// Lookup type of a lookup index, with Extension wrappers resolved.
     pub fn lookupType(self: Layout, index: u16) Error!u16 {
         const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, index) * 2);
@@ -456,7 +648,7 @@ fn place(b: *Builder, sh: Shell, sub: usize) void {
 
 /// One DFLT script, one langsys with no lang record, one `kern` feature, one
 /// lookup. Everything the two tests that follow need, and nothing else.
-fn shell(b: *Builder, h: Header, lookup_type: u16) Shell {
+fn shell(b: *Builder, h: Header, lookup_type: u16, fea_tag: *const [4]u8) Shell {
     const scr = b.len;
     b.patch16(h.scr, scr);
     _ = b.put16(1);
@@ -476,7 +668,7 @@ fn shell(b: *Builder, h: Header, lookup_type: u16) Shell {
     const fea = b.len;
     b.patch16(h.fea, fea);
     _ = b.put16(1);
-    _ = b.putTag("kern");
+    _ = b.putTag(fea_tag);
     const frec = b.put16(0);
     const feature = b.len;
     b.patch16(frec, feature - fea);
@@ -563,13 +755,13 @@ fn pair2(b: *Builder) usize {
 
 fn gposPair1(b: *Builder) void {
     const h = header(b);
-    const sh = shell(b, h, 2);
+    const sh = shell(b, h, 2, "kern");
     place(b, sh, pair1(b));
 }
 
 fn gposPair2(b: *Builder) void {
     const h = header(b);
-    const sh = shell(b, h, 2);
+    const sh = shell(b, h, 2, "kern");
     place(b, sh, pair2(b));
 }
 
@@ -625,7 +817,7 @@ test "pair-2 reads class 0 as a row, not as a miss" {
 test "an extension lookup is unwrapped, not skipped" {
     var b = Builder.init();
     const h = header(&b);
-    const sh = shell(&b, h, 9);
+    const sh = shell(&b, h, 9, "kern");
     const ext = b.len;
     _ = b.put16(1); // extension posFormat
     _ = b.put16(2); // extensionLookupType: the real PairPos
@@ -645,7 +837,7 @@ test "an extension lookup is unwrapped, not skipped" {
 test "an offset past the end adjusts nothing instead of panicking" {
     var b = Builder.init();
     const h = header(&b);
-    const sh = shell(&b, h, 2);
+    const sh = shell(&b, h, 2, "kern");
     const sub = pair1(&b);
     place(&b, sh, sub);
     // Break the subtable's coverage offset, leaving the header intact.
@@ -757,4 +949,168 @@ test "the default script policy prefers latn, and DFLT still resolves" {
     // latn wins when both exist -- DejaVu Sans carries its two real kern
     // lookups under latn and a single class lookup under DFLT.
     try testing.expectEqualSlices(u16, &.{1}, try l.featureLookupsDefault(tag("kern"), &buf));
+}
+
+// -- substitution fixtures ---------------------------------------------
+
+/// Single substitution, format 1: glyph 5 becomes glyph 15.
+fn gsubSingleDelta(b: *Builder) void {
+    const h = header(b);
+    const sh = shell(b, h, 1, "liga");
+    const sub = b.len;
+    _ = b.put16(1);
+    const cov = b.put16(0);
+    _ = b.put16(@bitCast(@as(i16, 10)));
+    const covabs = b.len;
+    b.patch16(cov, covabs - sub);
+    _ = b.put16(1);
+    _ = b.put16(1);
+    _ = b.put16(5);
+    place(b, sh, sub);
+}
+
+/// Single substitution, format 2: the substitute is listed, not derived.
+fn gsubSingleList(b: *Builder) void {
+    const h = header(b);
+    const sh = shell(b, h, 1, "liga");
+    const sub = b.len;
+    _ = b.put16(2);
+    const cov = b.put16(0);
+    _ = b.put16(1); // glyphCount
+    _ = b.put16(30); // substitute for the first covered glyph
+    const covabs = b.len;
+    b.patch16(cov, covabs - sub);
+    _ = b.put16(1);
+    _ = b.put16(1);
+    _ = b.put16(5);
+    place(b, sh, sub);
+}
+
+/// Multiple substitution: glyph 5 expands to 7 then 8.
+fn gsubMultiple(b: *Builder) void {
+    const h = header(b);
+    const sh = shell(b, h, 2, "liga");
+    const sub = b.len;
+    _ = b.put16(1);
+    const cov = b.put16(0);
+    _ = b.put16(1);
+    const seqrec = b.put16(0);
+    const seq = b.len;
+    b.patch16(seqrec, seq - sub);
+    _ = b.put16(2);
+    _ = b.put16(7);
+    _ = b.put16(8);
+    const covabs = b.len;
+    b.patch16(cov, covabs - sub);
+    _ = b.put16(1);
+    _ = b.put16(1);
+    _ = b.put16(5);
+    place(b, sh, sub);
+}
+
+/// Ligatures: 5+6+7 -> 20, and 5+6 -> 21. The longer record comes first, so a
+/// three-glyph sequence must not match the two-glyph rule.
+fn gsubLigature(b: *Builder) void {
+    const h = header(b);
+    const sh = shell(b, h, 4, "liga");
+    const sub = b.len;
+    _ = b.put16(1);
+    const cov = b.put16(0);
+    _ = b.put16(1);
+    const setrec = b.put16(0);
+    const set = b.len;
+    b.patch16(setrec, set - sub);
+    _ = b.put16(2);
+    const l0 = b.put16(0);
+    const l1 = b.put16(0);
+
+    const lig0 = b.len;
+    b.patch16(l0, lig0 - set);
+    _ = b.put16(20); // ligature glyph
+    _ = b.put16(3); // componentCount, first included
+    _ = b.put16(6);
+    _ = b.put16(7);
+
+    const lig1 = b.len;
+    b.patch16(l1, lig1 - set);
+    _ = b.put16(21);
+    _ = b.put16(2);
+    _ = b.put16(6);
+
+    const covabs = b.len;
+    b.patch16(cov, covabs - sub);
+    _ = b.put16(1);
+    _ = b.put16(1);
+    _ = b.put16(5);
+    place(b, sh, sub);
+}
+
+test "single substitution maps by delta and by list" {
+    var b = Builder.init();
+    gsubSingleDelta(&b);
+    const d1 = b.bytes();
+    const l1 = try Layout.init(d1, 0, @intCast(d1.len));
+    var out: [8]u16 = undefined;
+    try testing.expectEqual(@as(usize, 1), try l1.substitute(tag("liga"), &.{5}, &out));
+    try testing.expectEqual(@as(u16, 15), out[0]);
+
+    var c = Builder.init();
+    gsubSingleList(&c);
+    const d2 = c.bytes();
+    const l2 = try Layout.init(d2, 0, @intCast(d2.len));
+    try testing.expectEqual(@as(usize, 1), try l2.substitute(tag("liga"), &.{5}, &out));
+    try testing.expectEqual(@as(u16, 30), out[0]);
+    // A glyph outside the coverage is left exactly as it was.
+    try testing.expectEqual(@as(usize, 1), try l2.substitute(tag("liga"), &.{9}, &out));
+    try testing.expectEqual(@as(u16, 9), out[0]);
+}
+
+test "multiple substitution grows the sequence in place" {
+    var b = Builder.init();
+    gsubMultiple(&b);
+    const data = b.bytes();
+    const l = try Layout.init(data, 0, @intCast(data.len));
+    var out: [8]u16 = undefined;
+    const n = try l.substitute(tag("liga"), &.{ 5, 9 }, &out);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqualSlices(u16, &.{ 7, 8, 9 }, out[0..n]);
+
+    // Too little room is an error, never a silent truncation.
+    var small: [1]u16 = undefined;
+    try testing.expectError(error.BufferTooSmall, l.substitute(tag("liga"), &.{5}, &small));
+}
+
+test "ligature substitution takes the longest matching rule first" {
+    var b = Builder.init();
+    gsubLigature(&b);
+    const data = b.bytes();
+    const l = try Layout.init(data, 0, @intCast(data.len));
+    var out: [8]u16 = undefined;
+
+    var n = try l.substitute(tag("liga"), &.{ 5, 6, 7, 9 }, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualSlices(u16, &.{ 20, 9 }, out[0..n]);
+
+    // Same first two glyphs, third differs: the two-component ligature applies.
+    n = try l.substitute(tag("liga"), &.{ 5, 6, 9 }, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualSlices(u16, &.{ 21, 9 }, out[0..n]);
+
+    // Nothing covered: unchanged, and no growth.
+    n = try l.substitute(tag("liga"), &.{ 9, 9 }, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualSlices(u16, &.{ 9, 9 }, out[0..n]);
+}
+
+test "a ligature replaces its components with one glyph" {
+    var b = Builder.init();
+    gsubLigature(&b);
+    const data = b.bytes();
+    const l = try Layout.init(data, 0, @intCast(data.len));
+    var out: [8]u16 = undefined;
+    const n = try l.substitute(tag("liga"), &.{ 5, 6 }, &out);
+    // Two components become one glyph: the length has to SHRINK, which is what
+    // distinguishes a substitution from a positioning adjustment.
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(u16, 21), out[0]);
 }

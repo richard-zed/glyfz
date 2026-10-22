@@ -34,6 +34,7 @@
 const std = @import("std");
 const cff = @import("cff.zig");
 const opentype = @import("opentype.zig");
+const arabic = @import("arabic.zig");
 
 /// The only failure a bounds-checked reader can produce.
 const ReadError = error{Truncated};
@@ -928,6 +929,50 @@ pub const Font = struct {
         const n = try self.edgesInto(gid, scale, phase_x, box, points, ends, edges);
         try sweep(edges[0..n], w, h, acc, coverage[0..need]);
         return .{ .w = w, .h = h, .x0 = box.x0, .y0 = box.y0, .coverage = coverage[0..need] };
+    }
+
+    /// Shape an Arabic run. Codepoints in, glyph ids out, in LOGICAL order --
+    /// the caller reverses for display, because reversing is a property of the
+    /// writing direction and not of the shaping.
+    ///
+    /// Each character takes one of four joining forms based on its two
+    /// neighbours; the form names a GSUB feature that applies to that position
+    /// and to nothing else. Then the ligature features run over the whole run.
+    ///
+    /// What this does NOT do: bidi (mixed-direction runs are the caller's),
+    /// and contextual lookups -- `rlig` is applied but a font that puts its
+    /// lam-alef behind a chaining lookup will keep the unligated pair until
+    /// GSUB type 6 exists.
+    pub fn shapeArabic(self: Font, cps: []const u21, out: []u16) GlyphError!usize {
+        const n = @min(cps.len, out.len);
+        for (cps[0..n], out[0..n]) |cp, *g| g.* = self.glyphIndex(cp) catch 0;
+        if (n == 0 or self.gsub_span.len == 0) return n;
+
+        const l = opentype.Layout.init(self.data, self.gsub_span.off, self.gsub_span.len) catch return n;
+        const arab = opentype.tag("arab");
+        var len = n;
+
+        len = l.applyFeature(arab, opentype.tag("ccmp"), out, len) catch len;
+        len = l.applyFeature(arab, opentype.tag("locl"), out, len) catch len;
+
+        // Joining forms are decided from the CODEPOINTS, not the glyphs, so a
+        // substitution earlier in the run cannot move a neighbour's form.
+        var i: usize = 0;
+        while (i < len and i < n) : (i += 1) {
+            const feat = switch (arabic.formAt(cps[0..n], i)) {
+                .isolated => opentype.tag("isol"),
+                .initial => opentype.tag("init"),
+                .medial => opentype.tag("medi"),
+                .final => opentype.tag("fina"),
+                .none => continue,
+            };
+            len = l.applyFeatureAt(arab, feat, out, len, i) catch len;
+        }
+
+        for ([_]u32{ opentype.tag("rlig"), opentype.tag("calt"), opentype.tag("liga") }) |feat| {
+            len = l.applyFeature(arab, feat, out, len) catch len;
+        }
+        return len;
     }
 
     /// Horizontal metrics for a glyph, straight out of `hmtx`. Ids past
@@ -2428,6 +2473,13 @@ fn buildTestFont(buf: []u8, with_fmt12: bool) []const u8 {
     for (tags, recs, 0..) |t, r, i| patchRec(buf, rec_base + i * 16, t, r.at, r.len);
 
     return buf[0..w.at];
+}
+
+test {
+    // Tests in an imported file only join this binary when the file is
+    // referenced from here. Without it arabic.zig's joining tests silently
+    // do not run, which is how a suite stays green while testing nothing.
+    std.testing.refAllDecls(arabic);
 }
 
 test "init reads the table directory and metrics" {

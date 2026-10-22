@@ -60,8 +60,8 @@ Two properties are the whole point:
 | colour: COLRv0 layers with CPAL palettes | done |
 | Arabic and Thai shaping, over GSUB features | done |
 | hinting, COLRv1, kern formats 2/3 | out of scope |
-| CFF2 outlines -- see [Roadmap](#roadmap) | roadmap |
-| GSUB beyond Arabic and Thai, and GSUB 1.1 FeatureVariations -- see [Roadmap](#roadmap) | roadmap |
+| CFF2 outlines | planned |
+| GSUB beyond Arabic and Thai, and GSUB 1.1 FeatureVariations | planned |
 | GPOS beyond pair adjustment: contextual positioning, GDEF mark filtering, Device tables | out of scope |
 
 Two kerning surfaces, and they answer different questions. `kern()` reads the
@@ -253,60 +253,6 @@ No font is vendored, so `bench` and `fuzz` both need `-Dfont=` (or
 - **The one consumer pins a commit.** A Zig GUI toolkit links this at a specific
   revision rather than by version range, so an API change here reaches it only
   when that pin is moved on purpose. Nothing else consumes GlyfZ.
-
-## Roadmap
-
-Two entries. Both are refused correctly today -- a face that needs either gets a
-scoped error, not a misread -- and both are things this library should eventually
-read rather than refuse.
-
-### CFF2
-
-CFF2 is the variable flavour of CFF, the outline format OpenType ships for
-variable PostScript faces. It is refused twice over, on purpose: `Font.init`
-matches only the `CFF ` tag, so a `CFF2` table is never even located (an OTTO
-face carrying only CFF2 ends in `error.MissingTable`), and `cff.Font.init`
-rejects any header byte but `1` -- CFF2 starts `0x02` -- returning
-`error.NotCff`. A test pins the second refusal on those exact bytes.
-
-What it needs, in the order it would be built:
-
-- A second reader beside CFF1. CFF2 has no NAME INDEX, so the header and the
-  Top DICT INDEX are at different offsets; sharing CFF1's parser is not an
-  option, which is exactly why it is refused rather than attempted.
-- An `ItemVariationStore` parser. `variations.zig` handles `gvar`, whose deltas
-  are per-glyph packed; a variation store is an indexed, shared region and
-  nothing in the tree reads one today.
-- The CFF2 charstring dialect: no `endchar`, and `vsindex`/`blend` operators for
-  interpolating between regions.
-
-Reusable as-is: the charstring interpreter, `charstringBox` and `flatten`.
-CFF1 is otherwise complete, so this is an addition, not a rewrite.
-
-### GSUB
-
-Shaping here means the `ccmp`, `init`/`medi`/`fina`, `rlig`, `calt` and `locl`
-features under two scripts, `arab` and `thai`. Single, multiple, ligature and
-chaining-contextual substitution all run; type 6 supports format 3 only, and
-GSUB 1.1's FeatureVariations are not read. There is no script-agnostic entry
-point -- `shapeArabic` and `shapeThai` are the two doors, each with its feature
-list baked in.
-
-What it needs:
-
-- A script-agnostic `shape` that takes a script tag and a feature list, so a
-  third writing system does not mean a third function.
-- GSUB type 6 formats 1 and 2 (glyph- and class-based rule sets). Real fonts use
-  them; nothing here reads them yet.
-- FeatureVariations, which is what a variable font switches on when an axis
-  crosses a threshold.
-- More scripts, which is a data problem before it is a code problem: joining and
-  combining classes per script, the way `arabic.zig` carries Arabic's.
-
-Test scaffolding now exists for this work. `buildGsubTestFont` emits a
-well-formed GSUB with empty lists, and `buildSubstTestFont` emits a `ccmp`
-lookup that turns one glyph into two -- the only lookup type that makes a run
-longer, which is what the placement guards have to follow.
 
 ## Licence
 

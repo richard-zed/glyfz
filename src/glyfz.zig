@@ -1856,7 +1856,7 @@ pub const Font = struct {
     /// different masks, so a cache that ignored this would serve the wrong
     /// glyph forever. It is a hash rather than an index because there is no
     /// registry to hand out indices.
-    pub fn variationId(self: Font) u32 {
+    pub fn variationId(self: *const Font) u32 {
         var h: u32 = 0;
         for (self.coords[0..self.n_coords]) |c| {
             h = (h *% 0x9E3779B1) ^ @as(u32, @bitCast(c));

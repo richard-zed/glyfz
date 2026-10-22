@@ -1088,6 +1088,98 @@ fn gsubMultiple(b: *Builder) void {
 
 /// Ligatures: 5+6+7 -> 20, and 5+6 -> 21. The longer record comes first, so a
 /// three-glyph sequence must not match the two-glyph rule.
+/// A GSUB with two lookups, which is the smallest shape a contextual rule
+/// needs: lookup 0 is a single substitution reachable ONLY through the record,
+/// lookup 1 is the chaining rule that decides when to call it. The feature
+/// lists lookup 1 alone, so nothing substitutes unless the context matches.
+fn gsubChain(b: *Builder) void {
+    const h = header(b);
+
+    // ScriptList: one DFLT script, one langsys naming feature 0.
+    const scr = b.len;
+    b.patch16(h.scr, scr);
+    _ = b.put16(1);
+    _ = b.putTag("DFLT");
+    const srec = b.put16(0);
+    const script = b.len;
+    b.patch16(srec, script - scr);
+    const dls = b.put16(0);
+    _ = b.put16(0); // LangSysCount
+    const langs = b.len;
+    b.patch16(dls, langs - script);
+    _ = b.put16(0); // LookupOrder
+    _ = b.put16(0xFFFF); // ReqFeatureIndex
+    _ = b.put16(1); // FeatureIndexCount
+    _ = b.put16(0);
+
+    // FeatureList: one 'liga' naming lookup 1 and NOT lookup 0.
+    const fea = b.len;
+    b.patch16(h.fea, fea);
+    _ = b.put16(1);
+    _ = b.putTag("liga");
+    const frec = b.put16(0);
+    const feature = b.len;
+    b.patch16(frec, feature - fea);
+    _ = b.put16(0); // FeatureParams
+    _ = b.put16(1); // LookupIndexCount
+    _ = b.put16(1); // lookup 1: the chaining rule
+
+    // LookupList.
+    const loo = b.len;
+    b.patch16(h.loo, loo);
+    _ = b.put16(2);
+    const l0rec = b.put16(0);
+    const l1rec = b.put16(0);
+
+    // Lookup 0: single substitution, format 1, glyph 10 -> 15.
+    const l0 = b.len;
+    b.patch16(l0rec, l0 - loo);
+    _ = b.put16(1); // lookupType
+    _ = b.put16(0); // lookupFlag
+    _ = b.put16(1); // subTableCount
+    const l0sub = b.put16(0);
+    const s0 = b.len;
+    b.patch16(l0sub, s0 - l0);
+    _ = b.put16(1); // substFormat
+    const cov0 = b.put16(0);
+    _ = b.put16(@bitCast(@as(i16, 5))); // delta +5
+    const covabs0 = b.len;
+    b.patch16(cov0, covabs0 - s0);
+    _ = b.put16(1); // coverage format 1
+    _ = b.put16(1); // glyphCount
+    _ = b.put16(10);
+
+    // Lookup 1: chaining contextual, format 3. Input [10], lookahead [20],
+    // one record that runs lookup 0 at sequence index 0.
+    const l1 = b.len;
+    b.patch16(l1rec, l1 - loo);
+    _ = b.put16(6);
+    _ = b.put16(0);
+    _ = b.put16(1);
+    const l1sub = b.put16(0);
+    const s1 = b.len;
+    b.patch16(l1sub, s1 - l1);
+    _ = b.put16(3); // substFormat
+    _ = b.put16(0); // backtrackGlyphCount
+    _ = b.put16(1); // inputGlyphCount
+    const icov = b.put16(0);
+    _ = b.put16(1); // lookaheadGlyphCount
+    const acov = b.put16(0);
+    _ = b.put16(1); // substCount
+    _ = b.put16(0); // sequenceIndex
+    _ = b.put16(0); // lookupListIndex -> lookup 0
+    const icovabs = b.len;
+    b.patch16(icov, icovabs - s1);
+    _ = b.put16(1);
+    _ = b.put16(1);
+    _ = b.put16(10);
+    const acovabs = b.len;
+    b.patch16(acov, acovabs - s1);
+    _ = b.put16(1);
+    _ = b.put16(1);
+    _ = b.put16(20);
+}
+
 fn gsubLigature(b: *Builder) void {
     const h = header(b);
     const sh = shell(b, h, 4, "liga");
@@ -1191,4 +1283,30 @@ test "a ligature replaces its components with one glyph" {
     // distinguishes a substitution from a positioning adjustment.
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqual(@as(u16, 21), out[0]);
+}
+
+test "a chaining lookup substitutes through the lookup it names" {
+    var b = Builder.init();
+    gsubChain(&b);
+    const l = try Layout.init(b.bytes(), 0, @intCast(b.len));
+
+    var buf = [_]u16{ 10, 20 };
+    const n = try l.applyFeature(tag("DFLT"), tag("liga"), &buf, 2);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(u16, 15), buf[0]); // 10 -> 15 via lookup 0
+    try testing.expectEqual(@as(u16, 20), buf[1]); // untouched
+}
+
+test "a chaining lookup whose lookahead fails changes nothing" {
+    var b = Builder.init();
+    gsubChain(&b);
+    const l = try Layout.init(b.bytes(), 0, @intCast(b.len));
+
+    // Lookup 0 is not in the feature, so with the context broken there is
+    // nothing left that could substitute the 10.
+    var buf = [_]u16{ 10, 30 };
+    const n = try l.applyFeature(tag("DFLT"), tag("liga"), &buf, 2);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(u16, 10), buf[0]);
+    try testing.expectEqual(@as(u16, 30), buf[1]);
 }

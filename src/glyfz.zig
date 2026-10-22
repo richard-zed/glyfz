@@ -943,7 +943,7 @@ pub const Font = struct {
     /// and contextual lookups -- `rlig` is applied but a font that puts its
     /// lam-alef behind a chaining lookup will keep the unligated pair until
     /// GSUB type 6 exists.
-    pub fn shapeArabic(self: Font, cps: []const u21, out: []u16) GlyphError!usize {
+    pub fn shapeArabic(self: Font, cps: []const u21, out: []u16, place: ?[]opentype.Offset) GlyphError!usize {
         const n = @min(cps.len, out.len);
         for (cps[0..n], out[0..n]) |cp, *g| g.* = self.glyphIndex(cp) catch 0;
         if (n == 0 or self.gsub_span.len == 0) return n;
@@ -971,6 +971,17 @@ pub const Font = struct {
 
         for ([_]u32{ opentype.tag("rlig"), opentype.tag("calt"), opentype.tag("liga") }) |feat| {
             len = l.applyFeature(arab, feat, out, len) catch len;
+        }
+
+        // Marks are positioned after substitution, because the substitutions
+        // are what turn a letter into the form the anchors are drawn for.
+        if (place) |p| {
+            @memset(p[0..len], .{});
+            if (self.gpos_span.len != 0) {
+                if (opentype.Layout.init(self.data, self.gpos_span.off, self.gpos_span.len)) |gp| {
+                    _ = gp.markAttach(arab, opentype.tag("mark"), out[0..len], len, p) catch 0;
+                } else |_| {}
+            }
         }
         return len;
     }

@@ -21,6 +21,9 @@ pub fn tag(comptime s: *const [4]u8) u32 {
 }
 
 /// What a ValueRecord can say. Device offsets are read past, not applied.
+/// Where a mark sits relative to the glyph it attaches to, in font units.
+pub const Offset = struct { x: i16 = 0, y: i16 = 0 };
+
 pub const Adjust = struct {
     x_placement: i16 = 0,
     y_placement: i16 = 0,
@@ -474,6 +477,77 @@ pub const Layout = struct {
             shift += @as(isize, @intCast(cur)) - @as(isize, @intCast(before));
         }
         return .{ .hit = true, .len = cur, .advance = in_n };
+    }
+
+    /// GPOS type 4, mark-to-base. Each mark glyph offsets itself by
+    /// (base anchor - mark anchor) for its class, so a fatha lands where the
+    /// font drew that letter's room for one rather than on the baseline.
+    ///
+    /// The base is the nearest preceding glyph that is not itself a mark, and
+    /// the class is the one the mark's MarkRecord names. Anchors are integer
+    /// font units: no device tables, no variation deltas.
+    pub fn markAttach(self: Layout, script: u32, feat: u32, buf: []const u16, len: usize, out: []Offset) Error!usize {
+        var lookups_buf: [32]u16 = undefined;
+        var placed: usize = 0;
+        for (self.lookupsFor(script, feat, &lookups_buf)) |li| {
+            const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, li) * 2);
+            var kind = try u16At(self.data, lookup);
+            const sub_count = try u16At(self.data, lookup + 4);
+            var si: usize = 0;
+            while (si < sub_count) : (si += 1) {
+                var sub = lookup + try u16At(self.data, lookup + 6 + si * 2);
+                kind = try u16At(self.data, lookup);
+                if (kind == 9) {
+                    kind = try u16At(self.data, sub + 2);
+                    sub = sub + try u32At(self.data, sub + 4);
+                }
+                if (kind != 4) continue;
+                placed += try self.markBaseSub(sub, buf, len, out);
+            }
+        }
+        return placed;
+    }
+
+    fn markBaseSub(self: Layout, sub: usize, buf: []const u16, len: usize, out: []Offset) Error!usize {
+        if (try u16At(self.data, sub) != 1) return 0;
+        const mark_cov = sub + try u16At(self.data, sub + 2);
+        const base_cov = sub + try u16At(self.data, sub + 4);
+        const class_count = try u16At(self.data, sub + 6);
+        const mark_array = sub + try u16At(self.data, sub + 8);
+        const base_array = sub + try u16At(self.data, sub + 10);
+
+        var placed: usize = 0;
+        var i: usize = 0;
+        while (i < len) : (i += 1) {
+            const mi = (try self.coverageIndex(mark_cov, buf[i])) orelse continue;
+            // Walk back to the base: any number of marks may stack on it.
+            var j = i;
+            var base_index: ?u16 = null;
+            while (j > 0) {
+                j -= 1;
+                if ((try self.coverageIndex(mark_cov, buf[j])) != null) continue;
+                base_index = try self.coverageIndex(base_cov, buf[j]);
+                break;
+            }
+            const bi = base_index orelse continue;
+
+            // MarkRecord: class, then the anchor offset within MarkArray.
+            const cls = try u16At(self.data, mark_array + 2 + @as(usize, mi) * 4);
+            if (cls >= class_count) continue;
+            const mark_anchor = mark_array + try u16At(self.data, mark_array + 2 + @as(usize, mi) * 4 + 2);
+
+            // BaseRecord: one anchor offset per class, within BaseArray.
+            const base_anchor = base_array + try u16At(self.data, base_array + 2 + (@as(usize, bi) * class_count + cls) * 2);
+            if (try u16At(self.data, base_anchor) == 0) continue;
+
+            const bx = try i16At(self.data, base_anchor + 2);
+            const by = try i16At(self.data, base_anchor + 4);
+            const mx = try i16At(self.data, mark_anchor + 2);
+            const my = try i16At(self.data, mark_anchor + 4);
+            out[i] = .{ .x = bx - mx, .y = by - my };
+            placed += 1;
+        }
+        return placed;
     }
 
     /// Apply one feature at ONE buffer position, which is what a joining form

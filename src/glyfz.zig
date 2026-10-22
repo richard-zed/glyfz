@@ -1088,6 +1088,12 @@ pub const Font = struct {
         // Marks are positioned after substitution, because the substitutions
         // are what turn a letter into the form the anchors are drawn for.
         if (place) |p| {
+            // Substitution can SHORTEN the run, so `len` is known only here --
+            // but it can also LENGTHEN it (GSUB type 2, a glyph expanding to a
+            // sequence), bounded by `out.len` rather than by the codepoint
+            // count. Checking against `len` at this point is therefore exact,
+            // and checking earlier against `n` would not be.
+            if (p.len < len) return error.BufferTooSmall;
             @memset(p[0..len], .{});
             if (self.gpos_span.len != 0) {
                 if (opentype.Layout.init(self.data, self.gpos_span.off, self.gpos_span.len)) |gp_init| {
@@ -1138,6 +1144,12 @@ pub const Font = struct {
         }
 
         if (place) |p| {
+            // Substitution can SHORTEN the run, so `len` is known only here --
+            // but it can also LENGTHEN it (GSUB type 2, a glyph expanding to a
+            // sequence), bounded by `out.len` rather than by the codepoint
+            // count. Checking against `len` at this point is therefore exact,
+            // and checking earlier against `n` would not be.
+            if (p.len < len) return error.BufferTooSmall;
             @memset(p[0..len], .{});
             if (self.gpos_span.len != 0) {
                 if (opentype.Layout.init(self.data, self.gpos_span.off, self.gpos_span.len)) |gp_init| {
@@ -1707,6 +1719,12 @@ pub const Font = struct {
         }
 
         if (place) |p| {
+            // Substitution can SHORTEN the run, so `len` is known only here --
+            // but it can also LENGTHEN it (GSUB type 2, a glyph expanding to a
+            // sequence), bounded by `out.len` rather than by the codepoint
+            // count. Checking against `len` at this point is therefore exact,
+            // and checking earlier against `n` would not be.
+            if (p.len < len) return error.BufferTooSmall;
             @memset(p[0..len], .{});
             if (self.gpos_span.len != 0) {
                 if (opentype.Layout.init(self.data, self.gpos_span.off, self.gpos_span.len)) |gp_init| {
@@ -1733,6 +1751,9 @@ pub const Font = struct {
         }
         var advs: [max_order]i32 = @splat(0);
         var off: usize = 0;
+        if (opts.advances) |a| {
+            if (a.len < len) return error.BufferTooSmall;
+        }
         while (off < len) {
             const cnt = @min(max_order, len - off);
             self.runAdvances(out[off..][0..cnt], advs[0..cnt], kp);
@@ -2903,7 +2924,10 @@ pub const Cache = struct {
     }
 
     pub fn init(mem: []align(8) u8, opts: Options) error{BufferTooSmall}!Cache {
-        if (mem.len < needed(opts)) return error.BufferTooSmall;
+        // A zero-slot table has no probe chain to walk and `probeStart` would
+        // take it modulo zero. `Lookup` refuses the same input for the same
+        // reason; a configuration error is not a crash.
+        if (opts.slots == 0 or mem.len < needed(opts)) return error.BufferTooSmall;
         var off: usize = 0;
         const slots = takeSlice(Slot, mem, &off, opts.slots);
         const points = takeSlice(Point, mem, &off, opts.max_points);
@@ -3019,6 +3043,7 @@ pub const Cache = struct {
         s.* = .{
             .gid = gid,
             .scale_key = scale_key,
+            .var_key = vk,
             .phase = phase,
             .phase_y = phase_y,
             .cls = @intCast(cls),
@@ -4203,6 +4228,40 @@ test "the cache key covers size and phase, not just the glyph" {
     try std.testing.expectEqual(@as(u64, 2), cache.stats.hits);
 }
 
+test "the instance is part of the cache key, so a varied face still hits" {
+    var fb: [2048]u8 = undefined;
+    const font = try Font.init(buildVarTestFont(&fb));
+    const user = [_]f32{700};
+    const varied = font.withCoords(&user);
+    try std.testing.expect(varied.variationId() != font.variationId());
+
+    var cbuf: [64 * 1024]u8 align(8) = undefined;
+    var cache = try Cache.init(&cbuf, .{ .slots = 16, .max_points = 256, .max_edges = 256, .max_width = 64, .arena = 48 * 1024 });
+
+    // The instance id already chose the probe position; storing it is what
+    // makes the entry findable again. Without it every ask on a varied face was
+    // a miss, and 512 duplicates of one key then flushed the whole table.
+    _ = try cache.mask(&varied, 6, 16, .zero);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.misses);
+    _ = try cache.mask(&varied, 6, 16, .zero);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.hits);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.misses);
+
+    // The default instance is a DIFFERENT key, not a shared hit. A stored id
+    // that was always zero would pass the two checks above and fail here.
+    _ = try cache.mask(&font, 6, 16, .zero);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats.misses);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.hits);
+}
+
+test "a zero-slot cache is refused rather than dividing by zero" {
+    // `probeStart` takes the hash modulo the slot count, so an empty table is
+    // not an empty cache, it is a crash on the first ask. A configuration error
+    // is not a crash: `Lookup` refuses the same input for the same reason.
+    var cbuf: [Cache.needed(.{ .slots = 0 })]u8 align(8) = undefined;
+    try std.testing.expectError(error.BufferTooSmall, Cache.init(&cbuf, .{ .slots = 0 }));
+}
+
 test "a full arena flushes instead of handing back stale pixels" {
     var fb: [2048]u8 = undefined;
     const font = try Font.init(buildTestFont(&fb, false));
@@ -4438,6 +4497,30 @@ test "a run longer than the scratch arrays is shaped instead of overrunning them
     const n = try font.shape(&cps, &out, &place, .{});
     try std.testing.expectEqual(@as(usize, 600), n);
     try std.testing.expect(out[599] != 0);
+}
+
+test "a placement or advance buffer shorter than the run is refused, not written past" {
+    var fbuf: [4096]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fbuf, false));
+    const cps = [_]u21{ 0x41, 0x42, 0x43, 0x44 };
+    var out: [4]u16 = @splat(0);
+
+    // Both slices are indexed by the SHAPED length, which is not known until
+    // substitution has run. A buffer sized to the codepoint count is safe only
+    // while nothing grows the run, and GSUB type 2 does grow it -- bounded by
+    // `out.len`, not by the codepoint count -- so the check belongs after.
+    var short_place: [1]opentype.Offset = undefined;
+    try std.testing.expectError(error.BufferTooSmall, font.shape(&cps, &out, &short_place, .{}));
+
+    var short_adv: [1]i32 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, font.shape(&cps, &out, null, .{ .advances = &short_adv }));
+
+    // A buffer the size of the run is accepted: the guard rejects what would
+    // overflow, not what happens to be smaller than the input.
+    var place: [4]opentype.Offset = undefined;
+    var adv: [4]i32 = undefined;
+    const n = try font.shape(&cps, &out, &place, .{ .advances = &adv });
+    try std.testing.expect(n > 0 and n <= 4);
 }
 
 test "a subset drops the outlines it was not given" {

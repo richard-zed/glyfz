@@ -1182,6 +1182,26 @@ pub const Font = struct {
         /// liga lookups under `latn` and only a stub under DFLT.
         script: u32 = 0,
         lang: u32 = 0,
+        /// Where the run's advances go, in FONT UNITS, with pair kerning
+        /// already folded into the glyph it belongs to. Length `out.len`;
+        /// only the first `len` entries are written.
+        advances: ?[]i32 = null,
+        /// Run the substitution features (`ccmp`, `locl`, `rlig`, `liga`,
+        /// `clig`, `calt`). Off means glyph ids come straight from the cmap.
+        ///
+        /// Separate from `kern` because the two are separate promises: a
+        /// caller that wants correct advances does not necessarily want `liga`
+        /// rewriting "fi" into one glyph and changing the width of a button.
+        /// Kerning is geometry; substitution is spelling.
+        substitute: bool = true,
+        /// Apply pair kerning: the `kern` feature in GPOS, falling back to the
+        /// legacy `kern` table when the face has no such feature.
+        ///
+        /// ON by default, and that default is the point. A shaper that hands
+        /// back glyph ids and leaves kerning to be re-derived by every caller
+        /// is how two owners end up applying it twice, once when placing and
+        /// once in the advance. Kerning is part of what shaping means.
+        kern: bool = true,
     };
 
     pub const SubsetError = error{ BufferTooSmall, CffNotSupported, Truncated, BadValue };
@@ -1631,10 +1651,11 @@ pub const Font = struct {
     /// Arabic and Thai keep their own functions, because joining forms and
     /// positional features are not expressible as a list of features.
     ///
-    /// Kerning is NOT applied here, deliberately: it changes the pen, and this
-    /// function returns glyphs and mark offsets, not advances. Walk the pairs
-    /// with `kern()` -- or with GPOS once that is wired in -- as the run is
-    /// laid out.
+    /// Kerning IS applied, because it belongs to shaping: `ShapeOptions.kern`
+    /// is on by default and the result lands in the advance of the glyph the
+    /// pair starts with. Pass `ShapeOptions.advances` to receive them; the pen
+    /// for glyph i is the running sum, so a caller that also adds its own
+    /// kerning would be applying it twice.
     pub fn shape(
         self: Font,
         cps: []const u21,
@@ -1656,7 +1677,7 @@ pub const Font = struct {
         var len = n;
         var comps_of: [max_order]u8 = @splat(0xFF);
         const script = if (opts.script != 0) opts.script else self.pickScript();
-        if (self.gsub_span.len != 0) {
+        if (self.gsub_span.len != 0 and opts.substitute) {
             var l = opentype.Layout.init(self.data, self.gsub_span.off, self.gsub_span.len) catch return n;
             // Fixed-size scratch: a longer run loses component tracking rather
             // than indexing past the end. Substitution itself is unaffected.
@@ -1683,23 +1704,55 @@ pub const Font = struct {
                     _ = gp.markAttach(script, opentype.tag("mkmk"), out[0..len], len, p) catch 0;
                 } else |_| {}
             }
-            if (opts.direction == .ltr) {
-                // Windowed for the same reason: the advance scratch is fixed
-                // size. A mark attaches to a base nearby, so a window gives the
-                // same answer as the whole run except at a seam.
-                var advs: [max_order]i32 = @splat(0);
-                var off: usize = 0;
-                while (off < len) {
-                    const cnt = @min(max_order, len - off);
-                    for (out[off..][0..cnt], 0..) |g, i| {
-                        advs[i] = if (self.hMetricsResolved(g)) |m| m.advance else |_| 0;
-                    }
-                    penRelative(advs[0..cnt], p[off..][0..cnt]);
-                    off += cnt;
-                }
+        }
+
+        // One advance pass, kerning included. Windowed because both scratches
+        // are fixed size: a mark attaches to a base nearby, so a window gives
+        // the same answer as the whole run except at a seam.
+        var kern_buf: [kern_lookups]u16 = undefined;
+        const kp = if (opts.kern) Kern.initSlice(self, kern_buf[0..]) else Kern{ .font = self };
+        var advs: [max_order]i32 = @splat(0);
+        var off: usize = 0;
+        while (off < len) {
+            const cnt = @min(max_order, len - off);
+            self.runAdvances(out[off..][0..cnt], advs[0..cnt], &kp);
+            if (opts.advances) |a| @memcpy(a[off..][0..cnt], advs[0..cnt]);
+            if (place) |p| {
+                if (opts.direction == .ltr) penRelative(advs[0..cnt], p[off..][0..cnt]);
             }
+            off += cnt;
         }
         return len;
+    }
+
+    /// How many lookup indices `shape` will track for the `kern` feature.
+    const kern_lookups = 32;
+
+    /// Advances for one window of glyphs, with pair kerning folded in.
+    ///
+    /// Pairs are ADJACENT, marks included, because lookup flags are not
+    /// modelled here and `pairAdjust` does not model them either -- a `kern`
+    /// lookup may carry IgnoreMarks or USE_MARK_FILTERING_SET and Inter's
+    /// feature carries both kinds at once, so skipping marks at this level
+    /// would answer for a flag we never read and put `shape` out of step with
+    /// the pair adjustment it is built on. What this does match is the font's
+    /// pair tables, which is what a differential against fontTools can grade.
+    fn runAdvances(self: Font, gids: []const u16, advs: []i32, kp: *const Kern) void {
+        // `hMetricsResolved` walks `glyf` to honour USE_MY_METRICS, so a CFF
+        // face has no answer there. The raw `hmtx` read still does, and a
+        // plain advance is what a run needs; only composites care about the
+        // flag, and they are not in a CFF face.
+        for (gids, advs) |g, *a| {
+            a.* = blk: {
+                if (self.hMetricsResolved(g)) |m| break :blk @as(i32, m.advance) else |_| {}
+                if (self.hMetrics(g)) |m| break :blk @as(i32, m.advance) else |_| {}
+                break :blk 0;
+            };
+        }
+        if (kp.status == .none) return;
+        for (gids[0..gids.len -| 1], 0..) |g, i| {
+            advs[i] += kp.adjust(g, gids[i + 1]).x_advance;
+        }
     }
 
     /// The script to use when the caller did not name one: whichever of `latn`
@@ -3033,6 +3086,83 @@ pub const Cache = struct {
 ///
 /// Same contract as `Cache`: the caller owns the memory, there is no
 /// allocator, and `init` carves one buffer.
+/// Pair kerning with the feature's lookups resolved once, instead of rebuilt
+/// per query the way `Font.pairAdjust` has to.
+///
+/// Storage is the caller's, like `Lookup`: no allocator, and a `Kern` that
+/// outlives its buffer is a dangling slice the type system will not catch, so
+/// the buffer must live at least as long as the value.
+///
+/// PRECEDENCE, and it matters: GPOS wins, and the legacy `kern` table is
+/// consulted only when the face has no `kern` feature in GPOS. A face that
+/// carries both is expressing the same kerning twice, so summing them would
+/// double every pair; DejaVu is such a face.
+pub const Kern = struct {
+    pub const Options = struct {
+        /// Lookup indices tracked for the `kern` feature, in 2-byte entries.
+        lookups: u16 = 32,
+    };
+
+    pub const Status = enum {
+        /// Pair adjustment from GPOS, where modern faces keep kerning.
+        gpos,
+        /// No `kern` feature in GPOS, so the older table is the answer.
+        legacy,
+        /// Neither: this face does not kern.
+        none,
+    };
+
+    font: Font,
+    layout: ?opentype.Layout = null,
+    lookups: []u16 = &.{},
+    status: Status = .none,
+
+    /// How much memory `init` wants for this configuration.
+    pub fn needed(opts: Options) usize {
+        return @as(usize, opts.lookups) * @sizeOf(u16);
+    }
+
+    pub fn init(mem: []align(8) u8, font: Font, opts: Options) Kern {
+        const n = @min(@as(usize, opts.lookups), mem.len / @sizeOf(u16));
+        const buf: []u16 = @alignCast(std.mem.bytesAsSlice(u16, mem[0 .. n * @sizeOf(u16)]));
+        return initSlice(font, buf);
+    }
+
+    /// The same thing over storage the caller already has as `u16`, which is
+    /// what `shape` needs for its stack scratch.
+    pub fn initSlice(font: Font, buf: []u16) Kern {
+        var k = Kern{ .font = font };
+        if (font.gpos_span.len >= 10) {
+            if (opentype.Layout.init(font.data, font.gpos_span.off, font.gpos_span.len)) |l| {
+                if (l.featureLookupsDefault(opentype.tag("kern"), buf)) |got| {
+                    if (got.len != 0) {
+                        k.layout = l;
+                        k.lookups = got;
+                        k.status = .gpos;
+                        return k;
+                    }
+                } else |_| {}
+            } else |_| {}
+        }
+        k.status = if (font.kern_ok) .legacy else .none;
+        return k;
+    }
+
+    /// The adjustment for a pair, in FONT UNITS.
+    pub fn adjust(self: Kern, left: u16, right: u16) opentype.Adjust {
+        return switch (self.status) {
+            .gpos => if (self.layout) |l| l.pairAdjust(self.lookups, left, right) else .{},
+            .legacy => .{ .x_advance = self.font.kern(left, right) },
+            .none => .{},
+        };
+    }
+
+    /// The x advance of `adjust`, for a caller that only wants a number.
+    pub fn xAdvance(self: Kern, left: u16, right: u16) i16 {
+        return self.adjust(left, right).x_advance;
+    }
+};
+
 pub const Lookup = struct {
     pub const Options = struct {
         /// A power of two divides evenly; anything else costs a modulo per

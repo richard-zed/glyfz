@@ -77,3 +77,72 @@ test "pair adjustments agree with fontTools on real faces" {
     try std.testing.expect(nonzero > 500);
     try std.testing.expectEqual(@as(usize, 0), mismatched);
 }
+
+test "shape folds that same kerning into the advances, once" {
+    const gpa = std.testing.allocator;
+    const manifest_z = std.c.getenv("GLYFZ_GPOS") orelse return error.SkipZigTest;
+    const manifest = std.mem.span(manifest_z);
+
+    var faces: usize = 0;
+    var checked: usize = 0;
+    var mismatched: usize = 0;
+    var unkerned_ok: usize = 0;
+
+    var entries = std.mem.splitScalar(u8, manifest, ';');
+    while (entries.next()) |entry| {
+        if (entry.len == 0) continue;
+        const bar = std.mem.indexOfScalar(u8, entry, '|') orelse return error.BadManifest;
+        const font_path = entry[0..bar];
+        const pairs_path = entry[bar + 1 ..];
+
+        const bytes = try readFile(gpa, font_path);
+        defer gpa.free(bytes);
+        const pairs = try readFile(gpa, pairs_path);
+        defer gpa.free(pairs);
+        const font = try glyfz.Font.init(bytes);
+        faces += 1;
+
+        var lines = std.mem.tokenizeScalar(u8, pairs, '\n');
+        while (lines.next()) |line| {
+            var f = std.mem.tokenizeScalar(u8, line, ' ');
+            const left = try std.fmt.parseInt(u16, f.next().?, 10);
+            const right = try std.fmt.parseInt(u16, f.next().?, 10);
+            const want = try std.fmt.parseInt(i16, f.next().?, 10);
+            const cp_l = std.fmt.parseInt(u21, f.next() orelse continue, 10) catch continue;
+            const cp_r = std.fmt.parseInt(u21, f.next() orelse continue, 10) catch continue;
+
+            const cps = [2]u21{ cp_l, cp_r };
+            var out = [2]u16{ 0, 0 };
+            var adv = [2]i32{ 0, 0 };
+            // No `place`: advances must not depend on the caller wanting marks.
+            const n = try font.shape(&cps, &out, null, .{ .advances = &adv });
+            // A ligature collapsed the pair, so there is no pair left to kern.
+            if (n != 2 or out[0] != left or out[1] != right) continue;
+
+            const base: i32 = blk: {
+                if (font.hMetricsResolved(left)) |m| break :blk m.advance else |_| {}
+                if (font.hMetrics(left)) |m| break :blk m.advance else |_| {}
+                continue;
+            };
+            checked += 1;
+            if (adv[0] != base + want) {
+                mismatched += 1;
+                if (mismatched <= 5) {
+                    std.debug.print("advance {s} ({d},{d}) want {d} got {d}\n", .{ font_path, left, right, base + want, adv[0] });
+                }
+            }
+
+            // Kerning off must give back the bare advance, or "applied once"
+            // could just as easily mean "applied always, even when asked not".
+            var adv_off = [2]i32{ 0, 0 };
+            _ = try font.shape(&cps, &out, null, .{ .advances = &adv_off, .kern = false });
+            if (adv_off[0] == base) unkerned_ok += 1;
+        }
+    }
+
+    std.debug.print("shape kern: faces {d} pairs {d} unkerned {d} mismatched {d}\n", .{ faces, checked, unkerned_ok, mismatched });
+    try std.testing.expect(faces >= 3);
+    try std.testing.expect(checked > 2000);
+    try std.testing.expectEqual(checked, unkerned_ok);
+    try std.testing.expectEqual(@as(usize, 0), mismatched);
+}

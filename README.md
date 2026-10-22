@@ -47,6 +47,7 @@ Two properties are the whole point:
 | `name`, decoded to UTF-8, with an encoding preference | done |
 | `kern` format 0 | done |
 | GPOS pair kerning: PairPos formats 1 and 2, `kern` feature | done |
+| `Kern`: pair kerning with the feature's lookups resolved once, GPOS preferred over the legacy table | done |
 | `hasCodepoint`, for asking a fallback chain's question | done |
 | glyph cache, keyed on glyph + scale + phase | done |
 | codepoint lookup cache, carrying the resolved advance | done |
@@ -56,7 +57,7 @@ Two properties are the whole point:
 | colour: COLRv0 layers with CPAL palettes | done |
 | Arabic and Thai shaping, over GSUB features | done |
 | hinting, CFF2, COLRv1, kern formats 2/3 | out of scope |
-| GPOS beyond pair adjustment: contextual positioning, mark attachment, GDEF filtering, Device tables | out of scope |
+| GPOS beyond pair adjustment: contextual positioning, GDEF mark filtering, Device tables | out of scope |
 
 Two kerning surfaces, and they answer different questions. `kern()` reads the
 legacy `kern` table, format 0 only, which is what stb reads; a zero from it means
@@ -69,10 +70,21 @@ format 2 are both implemented, because faces split their pairs across the two:
 Liberation ships only format 1, DejaVu only format 2, Lato splits one face's
 pairs across both. Extension wrappers are unwrapped.
 
-`kern()` does not yet prefer GPOS; that would move every existing render, so it
-is a separate decision. What GPOS does not yet get: contextual positioning, mark
-attachment, GDEF mark filtering, and Device tables (hint-time, and there is no
-hinting here). Script selection has no text to work from, so it tries `latn`,
+`kern()` is the RAW legacy read and stays that way; it answers what that table
+says, nothing more. `Kern` is the entry point that decides: GPOS first, the
+legacy table only when the face has no `kern` feature in GPOS. A face carrying
+both is saying the same thing twice, so summing them would double every pair --
+DejaVu is such a face.
+
+`shape()` kerns. Its advances come back with pair adjustment already folded in,
+because a shaper that returns glyph ids and leaves every caller to re-derive
+kerning is how two owners end up applying it twice. Pairing is adjacent, marks
+included: lookup flags (IgnoreMarks, USE_MARK_FILTERING_SET) are not modelled,
+and Inter's `kern` feature carries both kinds at once, so skipping marks here
+would be answering for a flag never read.
+
+What GPOS does not yet get: contextual positioning, GDEF mark filtering, and
+Device tables (hint-time, and there is no hinting here). Script selection has no text to work from, so it tries `latn`,
 then DFLT, then file order -- which matters, because DejaVu keeps one class-based
 lookup under DFLT and its two real ones under `latn`.
 

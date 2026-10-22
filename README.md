@@ -203,7 +203,6 @@ No font is vendored, so `bench` and `fuzz` both need `-Dfont=` (or
   `outline` hands back CFF curves **already flattened to line points**. The
   tolerance is one font unit, far below one device pixel at any normal size,
   but the curve data itself is not preserved.
-- A CFF face does not get the legacy `kern` table applied yet.
 - CFF2 (the variable-font flavour) is still refused.
 
 - **The external check is not reproducible here.** The differential and the

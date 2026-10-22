@@ -22,10 +22,14 @@
 //!    propagates both and never substitutes a glyph silently -- deciding to keep
 //!    a last-good face needs a fallback chain, which belongs to the caller.
 //!
+//! Outlines come from either `glyf` or `CFF`: a CFF charstring is cubic and
+//! this library's outline is quadratic, so CFF curves reach the caller already
+//! flattened to line points. See `cff.zig`.
+//!
 //! Out of scope, deliberately: hinting (stb skips it, so unhinted is the bar),
-//! CFF/CFF2 outlines, variable axes, colour fonts, shaping, GPOS beyond pair
-//! adjustment, kern formats 2/3 and Apple's version 1 layout, vertical layout,
-//! and Unicode normalisation or line breaking.
+//! CFF2, variable axes, colour fonts, shaping, GPOS beyond pair adjustment,
+//! kern formats 2/3 and Apple's version 1 layout, vertical layout, and Unicode
+//! normalisation or line breaking.
 
 const std = @import("std");
 const cff = @import("cff.zig");
@@ -452,8 +456,9 @@ pub const Font = struct {
             (@as(usize, self.num_glyphs) - self.num_hmetrics) * 2;
         if (hmtx.len < hmtx_need) return error.Truncated;
 
-        // A CFF face has no glyf/loca at all, so the checks below do not
-        // apply. Its outlines are validated when the CFF table is parsed.
+        // A CFF face has no glyf/loca at all, so those checks are skipped --
+        // but the cmap selection below is NOT, because it is what maps a
+        // codepoint to a glyph and it applies to both outline formats.
         if (self.is_cff) {
             self.cff = cff.Font.init(try self.slice(self.cff_span)) catch |e| return switch (e) {
                 error.NotCff => error.CffNotSupported,
@@ -462,27 +467,28 @@ pub const Font = struct {
                 else => error.BadValue,
             };
             if (self.cff.?.glyphCount() == 0) return error.MissingTable;
-            return self;
         }
 
-        // `loca` is indexed up to num_glyphs inclusive. A table that is short
-        // would let glyph lookups read into the next table, so check once here.
-        const loca = try self.slice(self.loca);
-        const entry: usize = if (self.index_to_loc == 0) 2 else 4;
-        if (loca.len < (@as(usize, self.num_glyphs) + 1) * entry) return error.Truncated;
+        if (!self.is_cff) {
+            // `loca` is indexed up to num_glyphs inclusive. A table that is short
+            // would let glyph lookups read into the next table, so check once here.
+            const loca = try self.slice(self.loca);
+            const entry: usize = if (self.index_to_loc == 0) 2 else 4;
+            if (loca.len < (@as(usize, self.num_glyphs) + 1) * entry) return error.Truncated;
 
-        // Offsets must not go backwards: one that does makes a glyph's byte
-        // range invert, and every lookup after it is a guess.
-        var prev: u32 = 0;
-        var gi: usize = 0;
-        while (gi <= self.num_glyphs) : (gi += 1) {
-            const at: u32 = if (self.index_to_loc == 0)
-                @as(u32, try u16At(loca, gi * 2)) * 2
-            else
-                try u32At(loca, gi * 4);
-            if (at < prev) return error.Truncated;
-            if (@as(usize, at) > (try self.slice(self.glyf)).len) return error.Truncated;
-            prev = at;
+            // Offsets must not go backwards: one that does makes a glyph's byte
+            // range invert, and every lookup after it is a guess.
+            var prev: u32 = 0;
+            var gi: usize = 0;
+            while (gi <= self.num_glyphs) : (gi += 1) {
+                const at: u32 = if (self.index_to_loc == 0)
+                    @as(u32, try u16At(loca, gi * 2)) * 2
+                else
+                    try u32At(loca, gi * 4);
+                if (at < prev) return error.Truncated;
+                if (@as(usize, at) > (try self.slice(self.glyf)).len) return error.Truncated;
+                prev = at;
+            }
         }
 
         // Choose the character map once, so a font we cannot map fails at load
@@ -790,7 +796,11 @@ pub const Font = struct {
             // so the curves arrive already flattened to line points. The
             // tolerance is in font units and is far below one device pixel at
             // any realistic size (1 unit at 1000 upem is 0.048px at 48px).
-            var segs: [256]cff.Segment = undefined;
+            //
+            // The buffer is 1024 because it has to be: flattened, the worst
+            // glyph measured is 626 segments in Source Han Serif and 459 in
+            // Noto Sans CJK JP. A 256 buffered clipped 27 real CJK glyphs.
+            var segs: [1024]cff.Segment = undefined;
             const got = cff.charstring(cf, gid, &segs) catch |e| return cffGlyphError(e);
             const flat = cff.flatten(got, points, ends, 1.0) catch |e| return cffGlyphError(e);
             return .{ .points = flat.points, .ends = flat.ends };

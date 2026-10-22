@@ -33,6 +33,10 @@
 
 const std = @import("std");
 const cff = @import("cff.zig");
+const colr = @import("colr.zig");
+
+pub const Layer = colr.Layer;
+pub const Rgba = colr.Rgba;
 const opentype = @import("opentype.zig");
 const arabic = @import("arabic.zig");
 
@@ -325,6 +329,8 @@ const tag_gpos = tag("GPOS");
 const tag_gsub = tag("GSUB");
 const tag_gdef = tag("GDEF");
 const tag_cff = tag("CFF ");
+const tag_colr = tag("COLR");
+const tag_cpal = tag("CPAL");
 
 /// Map a CFF failure onto this library's glyph error set. A CFF construct that
 /// is not implemented is reported as `UnsupportedComposite`, which already
@@ -368,6 +374,8 @@ pub const Font = struct {
     gsub_span: Span = .{},
     gdef_span: Span = .{},
     cff_span: Span = .{},
+    colr_span: Span = .{},
+    cpal_span: Span = .{},
 
     /// Set when the outlines come from a CFF table instead of `glyf`. The
     /// container is parsed at load; charstrings are interpreted per glyph.
@@ -424,6 +432,8 @@ pub const Font = struct {
             if (t == tag_gsub) self.gsub_span = span;
             if (t == tag_gdef) self.gdef_span = span;
             if (t == tag_cff) self.cff_span = span;
+            if (t == tag_colr) self.colr_span = span;
+            if (t == tag_cpal) self.cpal_span = span;
         }
 
         const head = try self.slice(self.head);
@@ -1066,6 +1076,36 @@ pub const Font = struct {
             }
         }
         return len;
+    }
+
+    /// The colour layers of a glyph, written into `out`.
+    ///
+    /// Null means "draw this as a normal glyph": the face has no colour table,
+    /// or this glyph is not coloured. A caller must treat null as the ordinary
+    /// path rather than as an error, because in every real emoji font most of
+    /// the face is still monochrome.
+    pub fn colorLayers(self: Font, gid: u16, out: []colr.Layer) ?[]colr.Layer {
+        const tbl = self.slice(self.colr_span) catch return null;
+        const c = colr.Colr.init(tbl) orelse return null;
+        return c.layers(gid, out);
+    }
+
+    /// Whether the face carries colour glyphs at all, which is what a caller
+    /// needs to know before deciding to ask per glyph.
+    pub fn hasColor(self: Font) bool {
+        const tbl = self.slice(self.colr_span) catch return false;
+        const c = colr.Colr.init(tbl) orelse return false;
+        return c.any();
+    }
+
+    /// One palette entry. Null when the face has no CPAL table, or when that
+    /// palette or entry does not exist -- a layer naming an entry the palette
+    /// does not have is a font bug, and the caller decides what to draw instead
+    /// rather than this inventing a colour.
+    pub fn paletteColor(self: Font, palette: u16, index: u16) ?colr.Rgba {
+        const tbl = self.slice(self.cpal_span) catch return null;
+        const p = colr.Cpal.init(tbl) orelse return null;
+        return p.color(palette, index);
     }
 
     /// Horizontal metrics for a glyph, straight out of `hmtx`. Ids past
@@ -2573,6 +2613,7 @@ test {
     // referenced from here. Without it arabic.zig's joining tests silently
     // do not run, which is how a suite stays green while testing nothing.
     std.testing.refAllDecls(arabic);
+    std.testing.refAllDecls(colr);
 }
 
 test "init reads the table directory and metrics" {

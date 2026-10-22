@@ -48,7 +48,7 @@ fn use(b: []const u8, cmem: []align(8) u8, deep: bool) !void {
         _ = font.hMetrics(gid) catch {};
         _ = font.bitmapBox(gid, 0.0117, 0) catch {};
         _ = font.bitmapBox(gid, 0.0117, 0.5) catch {};
-        _ = cache.mask(font, gid, 14, .zero) catch {};
+        _ = cache.mask(&font, gid, 14, .zero) catch {};
     }
     _ = font.kern(2, 3);
     _ = font.kern(6, 7);

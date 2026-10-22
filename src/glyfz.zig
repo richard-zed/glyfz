@@ -28,6 +28,7 @@
 //! and Unicode normalisation or line breaking.
 
 const std = @import("std");
+const cff = @import("cff.zig");
 const opentype = @import("opentype.zig");
 
 /// The only failure a bounds-checked reader can produce.
@@ -314,6 +315,20 @@ const tag_post = tag("post");
 const tag_gpos = tag("GPOS");
 const tag_gsub = tag("GSUB");
 const tag_gdef = tag("GDEF");
+const tag_cff = tag("CFF ");
+
+/// Map a CFF failure onto this library's glyph error set. A CFF construct that
+/// is not implemented is reported as `UnsupportedComposite`, which already
+/// means "this glyph needs something the reader does not do".
+fn cffGlyphError(e: cff.Error) GlyphError {
+    return switch (e) {
+        error.Truncated => error.Truncated,
+        error.MissingTable => error.MissingTable,
+        error.BufferTooSmall => error.BufferTooSmall,
+        error.SubrTooDeep => error.CompositeTooDeep,
+        error.NotCff, error.Unsupported => error.UnsupportedComposite,
+    };
+}
 
 /// One loaded face. Borrows the bytes; they must outlive it.
 pub const Font = struct {
@@ -343,6 +358,12 @@ pub const Font = struct {
     gpos_span: Span = .{},
     gsub_span: Span = .{},
     gdef_span: Span = .{},
+    cff_span: Span = .{},
+
+    /// Set when the outlines come from a CFF table instead of `glyf`. The
+    /// container is parsed at load; charstrings are interpreted per glyph.
+    cff: ?cff.Font = null,
+    is_cff: bool = false,
 
     /// Parse the table directory and the metrics a caller needs up front.
     /// Fails loudly: a font GlyfZ cannot read should not silently measure zero.
@@ -355,6 +376,7 @@ pub const Font = struct {
     /// users can already point at and GlyfZ refused.
     pub fn initIndex(bytes: []const u8, index: u32) LoadError!Font {
         var base: usize = 0;
+        var is_cff = false;
         const v = try u32At(bytes, 0);
         switch (v) {
             0x0001_0000, tag("true") => {},
@@ -363,11 +385,14 @@ pub const Font = struct {
                 if (index >= count) return error.UnknownFontIndex;
                 base = try u32At(bytes, 12 + @as(usize, index) * 4);
             },
-            tag("OTTO") => return error.CffNotSupported,
+            // OTTO means CFF outlines. Loadable now; `CFF2` (a different,
+            // variable-font format) is still refused below, by tag.
+            tag("OTTO") => is_cff = true,
             else => return error.NotSfnt,
         }
 
         var self: Font = .{ .data = bytes };
+        self.is_cff = is_cff;
         const n = try u16At(bytes, base + 4);
 
         var i: usize = 0;
@@ -389,13 +414,14 @@ pub const Font = struct {
             if (t == tag_gpos) self.gpos_span = span;
             if (t == tag_gsub) self.gsub_span = span;
             if (t == tag_gdef) self.gdef_span = span;
+            if (t == tag_cff) self.cff_span = span;
         }
 
         const head = try self.slice(self.head);
         const hhea = try self.slice(self.hhea);
         const maxp = try self.slice(self.maxp);
         const hmtx = try self.slice(self.hmtx);
-        _ = try self.slice(self.glyf);
+        if (!self.is_cff) _ = try self.slice(self.glyf);
 
         // Every field below is read at a fixed offset, so a table that is
         // merely short would read into whatever follows it instead of failing.
@@ -425,6 +451,19 @@ pub const Font = struct {
         const hmtx_need = @as(usize, self.num_hmetrics) * 4 +
             (@as(usize, self.num_glyphs) - self.num_hmetrics) * 2;
         if (hmtx.len < hmtx_need) return error.Truncated;
+
+        // A CFF face has no glyf/loca at all, so the checks below do not
+        // apply. Its outlines are validated when the CFF table is parsed.
+        if (self.is_cff) {
+            self.cff = cff.Font.init(try self.slice(self.cff_span)) catch |e| return switch (e) {
+                error.NotCff => error.CffNotSupported,
+                error.Truncated => error.Truncated,
+                error.MissingTable => error.MissingTable,
+                else => error.BadValue,
+            };
+            if (self.cff.?.glyphCount() == 0) return error.MissingTable;
+            return self;
+        }
 
         // `loca` is indexed up to num_glyphs inclusive. A table that is short
         // would let glyph lookups read into the next table, so check once here.
@@ -746,6 +785,16 @@ pub const Font = struct {
     /// empty outline rather than an error, because that is a legal glyph.
     pub fn outline(self: Font, gid: u16, points: []Point, ends: []u16) GlyphError!Outline {
         if (gid >= self.num_glyphs) return error.UnknownGlyph;
+        if (self.cff) |cf| {
+            // CFF charstrings are cubic; this library's outline is quadratic,
+            // so the curves arrive already flattened to line points. The
+            // tolerance is in font units and is far below one device pixel at
+            // any realistic size (1 unit at 1000 upem is 0.048px at 48px).
+            var segs: [256]cff.Segment = undefined;
+            const got = cff.charstring(cf, gid, &segs) catch |e| return cffGlyphError(e);
+            const flat = cff.flatten(got, points, ends, 1.0) catch |e| return cffGlyphError(e);
+            return .{ .points = flat.points, .ends = flat.ends };
+        }
         var cur = Cursor{ .points = points, .ends = ends };
         try decodeInto(self, gid, &cur, 0);
         return .{ .points = points[0..cur.n], .ends = ends[0..cur.nc] };
@@ -765,6 +814,18 @@ pub const Font = struct {
     /// same size across the swap. `outlineBounds` is the computed alternative.
     pub fn headerBox(self: Font, gid: u16) GlyphError!?Box {
         if (gid >= self.num_glyphs) return error.UnknownGlyph;
+        if (self.cff) |cf| {
+            // No per-glyph header exists in CFF, so the box is computed from
+            // the control points. Still a declared-style integer box in font
+            // units, so the bitmap sizing below is unchanged in shape.
+            const b = (cff.charstringBox(cf, gid) catch |e| return cffGlyphError(e)) orelse return null;
+            return Box{
+                .x0 = @intFromFloat(@floor(b.x0)),
+                .y0 = @intFromFloat(@floor(b.y0)),
+                .x1 = @intFromFloat(@ceil(b.x1)),
+                .y1 = @intFromFloat(@ceil(b.y1)),
+            };
+        }
         const data = try glyphRange(self, gid);
         if (data.len == 0) return null;
         return Box{
@@ -2455,7 +2516,10 @@ test "outline says so when the caller's buffer is too small" {
 test "rejects what it cannot read" {
     try std.testing.expectError(error.Truncated, Font.init(""));
     try std.testing.expectError(error.Truncated, Font.init("\x00\x01\x00"));
-    try std.testing.expectError(error.CffNotSupported, Font.init("OTTO\x00\x00\x00\x00"));
+    // OTTO is CFF outlines, which load now; without a CFF table the face has no
+    // outlines at all, which is what this pins. A CFF2 table is still refused,
+    // and `cff.zig` covers that directly.
+    try std.testing.expectError(error.MissingTable, Font.init("OTTO\x00\x00\x00\x00"));
     try std.testing.expectError(error.NotSfnt, Font.init("junkjunkjunk"));
 
     var buf: [1024]u8 = undefined;

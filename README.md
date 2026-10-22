@@ -52,7 +52,7 @@ Two properties are the whole point:
 | codepoint lookup cache, carrying the resolved advance | done |
 | malformed input: truncation and bit-flip sweeps | done |
 | `post`: italic angle, underline, fixed pitch | done |
-| hinting, CFF/CFF2, variable axes, colour fonts, kern 2/3 | out of scope |
+| hinting, CFF2, variable axes, colour fonts, kern 2/3 | out of scope |
 | GPOS beyond pair adjustment: contextual positioning, mark attachment, GDEF filtering, Device tables | out of scope |
 
 Two kerning surfaces, and they answer different questions. `kern()` reads the
@@ -198,6 +198,13 @@ No font is vendored, so `bench` and `fuzz` both need `-Dfont=` (or
 `GLYFZ_BENCH_FONT` / `GLYFZ_TEST_FONT`). Aim them at an awkward face on purpose.
 
 ## Known gaps
+
+- CFF charstrings are cubic, and this library's outline type is quadratic, so
+  `outline` hands back CFF curves **already flattened to line points**. The
+  tolerance is one font unit, far below one device pixel at any normal size,
+  but the curve data itself is not preserved.
+- A CFF face does not get the legacy `kern` table applied yet.
+- CFF2 (the variable-font flavour) is still refused.
 
 - **The external check is not reproducible here.** The differential and the
   comparison numbers came from a harness against stb_truetype that no longer

@@ -234,6 +234,9 @@ pub const Underline = struct {
 
 pub const Point = struct { x: i32, y: i32, on: bool };
 
+/// Components one composite may carry with variation deltas applied.
+const comp_cap = 64;
+
 /// A glyph outline: all points, and the index of the LAST point of each
 /// contour. Contours wrap, so the point after `ends[i]` starts contour i+1.
 pub const Outline = struct {
@@ -839,14 +842,6 @@ pub const Font = struct {
         }
         var cur = Cursor{ .points = points, .ends = ends };
         try decodeInto(self, gid, &cur, 0);
-        if (self.n_coords != 0 and self.gvar_span.len != 0 and cur.n != 0) {
-            // A composite's point array is component records, not outline
-            // points, so its own deltas are a different operation and are not
-            // applied here.
-            const gd = glyphRange(self, gid) catch &[_]u8{};
-            const n_contours: i16 = if (gd.len >= 2) @bitCast((@as(u16, gd[0]) << 8) | gd[1]) else 0;
-            if (n_contours > 0) self.varyOutline(gid, points[0..cur.n], ends[0..cur.nc]);
-        }
         return .{ .points = points[0..cur.n], .ends = ends[0..cur.nc] };
     }
 
@@ -1764,10 +1759,9 @@ pub const Font = struct {
 
     /// Apply this instance's gvar deltas to a decoded outline, in place.
     ///
-    /// Only simple glyphs: a composite's point numbers are component records
-    /// and their offsets are a different kind of delta, so they are left at
-    /// their default positions. The components themselves still vary, because
-    /// each one is decoded through this same path.
+    /// Simple glyphs only. A composite's point numbers are its component
+    /// records and its deltas move those offsets, which
+    /// applies before the component's transform.
     fn varyOutline(self: Font, gid: u16, pts: []Point, contour_ends: []const u16) void {
         if (self.n_coords == 0 or self.gvar_span.len == 0 or pts.len == 0) return;
         if (pts.len > variations.max_points) return;
@@ -2162,9 +2156,26 @@ fn decodeInto(self: Font, gid: u16, cur: *Cursor, depth: u32) GlyphError!void {
     const n_contours = try i16At(data, 0);
     if (n_contours == 0) return;
     if (n_contours > 0) {
+        const first_n = cur.n;
+        const first_nc = cur.nc;
         try decodeSimple(data, @intCast(n_contours), cur);
+        // Vary here rather than at the top of `outline`, because a composite's
+        // components are themselves glyphs with their own deltas and they are
+        // decoded through this same function.
+        self.varyOutline(gid, cur.points[first_n..cur.n], cur.ends[first_nc..cur.nc]);
     } else {
-        try decodeComposite(self, data, cur, depth);
+        const ncomp = componentCount(data) catch 0;
+        var dxb: [comp_cap]f32 = @splat(0);
+        var dyb: [comp_cap]f32 = @splat(0);
+        var vdx: ?[]const f32 = null;
+        var vdy: ?[]const f32 = null;
+        if (ncomp > 0 and ncomp <= comp_cap) {
+            if (varyComposite(self, gid, ncomp, dxb[0..ncomp], dyb[0..ncomp])) {
+                vdx = dxb[0..ncomp];
+                vdy = dyb[0..ncomp];
+            }
+        }
+        try decodeComposite(self, data, cur, depth, vdx, vdy);
     }
 }
 
@@ -2247,12 +2258,66 @@ fn decodeSimple(data: []const u8, n_contours: usize, cur: *Cursor) GlyphError!vo
 /// spec. The two agree on the common case -- accents placed by translation
 /// with no matrix -- and disagree on scaled composites, which is exactly the
 /// kind of thing the differential is there to point at.
-fn decodeComposite(self: Font, data: []const u8, cur: *Cursor, depth: u32) GlyphError!void {
+/// How many component records a composite carries. Sizing only: the offsets
+/// themselves are read by `decodeComposite`.
+fn componentCount(data: []const u8) GlyphError!usize {
+    var p: usize = 10;
+    var flags: u16 = 1 << 5;
+    var n: usize = 0;
+    while (flags & (1 << 5) != 0) : (n += 1) {
+        flags = try u16At(data, p);
+        p += 4; // flags + glyph index
+        if (flags & 0x0002 != 0) {
+            p += if (flags & 0x0001 != 0) 4 else 2;
+        } else {
+            p += 4; // point-matching arguments
+        }
+        if (flags & 0x0008 != 0) {
+            p += 2;
+        } else if (flags & 0x0040 != 0) {
+            p += 4;
+        } else if (flags & 0x0080 != 0) {
+            p += 8;
+        }
+        if (p > data.len) return error.Truncated;
+        if (n > 1024) return error.Truncated;
+    }
+    return n;
+}
+
+/// Deltas for a composite's component offsets, at the current instance.
+fn varyComposite(self: Font, gid: u16, n: usize, dx: []f32, dy: []f32) bool {
+    if (self.n_coords == 0 or self.gvar_span.len == 0 or n == 0) return false;
+    var xs: [1024]f32 = @splat(0);
+    var ys: [1024]f32 = @splat(0);
+    var tx: [1024]f32 = @splat(0);
+    var ty: [1024]f32 = @splat(0);
+    var touched: [1024]bool = @splat(false);
+    var idx: [1024]u16 = undefined;
+    return variations.applyGlyph(
+        self.data[self.gvar_span.off..][0..self.gvar_span.len],
+        self.coords[0..self.n_coords],
+        gid,
+        n,
+        &.{}, // no contours, so no interpolation: an unlisted component is unmoved
+        xs[0..n],
+        ys[0..n],
+        dx,
+        dy,
+        touched[0..n],
+        idx[0..n],
+        tx[0..n],
+        ty[0..n],
+    ) catch false;
+}
+
+fn decodeComposite(self: Font, data: []const u8, cur: *Cursor, depth: u32, vdx: ?[]const f32, vdy: ?[]const f32) GlyphError!void {
     if (depth >= max_composite_depth) return error.CompositeTooDeep;
 
     var p: usize = 10;
     var flags: u16 = 1 << 5; // enter the loop
-    while (flags & (1 << 5) != 0) {
+    var comp_i: usize = 0;
+    while (flags & (1 << 5) != 0) : (comp_i += 1) {
         flags = try u16At(data, p);
         p += 2;
         const gid = try u16At(data, p);
@@ -2301,6 +2366,15 @@ fn decodeComposite(self: Font, data: []const u8, cur: *Cursor, depth: u32) Glyph
             p += 2;
             d = f2dot14(try i16At(data, p));
             p += 2;
+        }
+
+        // A composite's deltas move its component offsets, one delta per
+        // record, before the component's own transform is applied.
+        if (vdx) |vx| {
+            if (comp_i < vx.len) dx += vx[comp_i];
+        }
+        if (vdy) |vy| {
+            if (comp_i < vy.len) dy += vy[comp_i];
         }
 
         // SCALED_COMPONENT_OFFSET: the offset is expressed in the component's

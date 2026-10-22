@@ -5,6 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     // Read once: b.option panics if the same name is declared twice.
     const font_opt = b.option([]const u8, "font", "path to a TTF/OTF for the bench and fuzz runs");
+    const pairs_opt = b.option([]const u8, "pairs", "fontpath|pairsfile[;...] manifest for the GPOS differential");
 
     // The library: pure Zig, no libc, no C, no allocator.
     const glyfz_mod = b.addModule("glyfz", .{
@@ -50,6 +51,24 @@ pub fn build(b: *std.Build) void {
     }
     const bench_step = b.step("bench", "time glyph rasterisation and cache hits (-Dfont=path)");
     bench_step.dependOn(&run_bench.step);
+
+    // GPOS pair adjustment, differentially against fontTools' decode. Same
+    // shape as fuzz: skipped rather than silently passing without inputs.
+    const gpos_mod = b.createModule(.{
+        .root_source_file = b.path("test/gpos_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "glyfz", .module = glyfz_mod }},
+        .link_libc = true,
+    });
+    const gpos_tests = b.addTest(.{ .root_module = gpos_mod });
+    const run_gpos = b.addRunArtifact(gpos_tests);
+    run_gpos.has_side_effects = true;
+    if (pairs_opt) |p| {
+        run_gpos.setEnvironmentVariable("GLYFZ_GPOS", p);
+    }
+    const gpos_step = b.step("gpos", "compare GPOS pair adjustments against fontTools (-Dpairs=manifest)");
+    gpos_step.dependOn(&run_gpos.step);
 
     const fuzz_step = b.step("fuzz", "mangle the face under -Dfont (or GLYFZ_TEST_FONT): truncations and bit flips");
     fuzz_step.dependOn(&run_fuzz.step);

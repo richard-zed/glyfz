@@ -46,18 +46,35 @@ Two properties are the whole point:
 | load-time validation, scoped errors | done |
 | `name`, decoded to UTF-8, with an encoding preference | done |
 | `kern` format 0 | done |
+| GPOS pair kerning: PairPos formats 1 and 2, `kern` feature | done |
 | `hasCodepoint`, for asking a fallback chain's question | done |
 | glyph cache, keyed on glyph + scale + phase | done |
 | codepoint lookup cache, carrying the resolved advance | done |
 | malformed input: truncation and bit-flip sweeps | done |
 | `post`: italic angle, underline, fixed pitch | done |
-| hinting, CFF/CFF2, variable axes, colour fonts, GPOS, kern 2/3 | out of scope |
+| hinting, CFF/CFF2, variable axes, colour fonts, kern 2/3 | out of scope |
+| GPOS beyond pair adjustment: contextual positioning, mark attachment, GDEF filtering, Device tables | out of scope |
 
-`kern` is format 0 only, which is what stb reads. Apple's version 1 layout is
-not read, and neither is GPOS -- where modern fonts actually keep their kerning.
-So a zero advance from `kern()` means the table has nothing to say, not that the
-designer wanted no adjustment. Kerning here is parity with stb, not an
-improvement on it.
+Two kerning surfaces, and they answer different questions. `kern()` reads the
+legacy `kern` table, format 0 only, which is what stb reads; a zero from it means
+that table has nothing to say, not that the designer wanted no adjustment. Apple's
+version 1 layout is still not read.
+
+`pairAdjust()` reads GPOS -- where modern fonts actually keep their kerning --
+and returns the pair's adjustment, or null if there is none. PairPos format 1 and
+format 2 are both implemented, because faces split their pairs across the two:
+Liberation ships only format 1, DejaVu only format 2, Lato splits one face's
+pairs across both. Extension wrappers are unwrapped.
+
+`kern()` does not yet prefer GPOS; that would move every existing render, so it
+is a separate decision. What GPOS does not yet get: contextual positioning, mark
+attachment, GDEF mark filtering, and Device tables (hint-time, and there is no
+hinting here). Script selection has no text to work from, so it tries `latn`,
+then DFLT, then file order -- which matters, because DejaVu keeps one class-based
+lookup under DFLT and its two real ones under `latn`.
+
+Verified differentially against fontTools' decode of the same tables: 95,236
+glyph pairs over five faces, 18,918 of them non-zero, no disagreements.
 
 ## Names, and the numbers a box centres on
 

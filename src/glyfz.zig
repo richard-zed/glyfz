@@ -23,11 +23,12 @@
 //!    a last-good face needs a fallback chain, which belongs to the caller.
 //!
 //! Out of scope, deliberately: hinting (stb skips it, so unhinted is the bar),
-//! CFF/CFF2 outlines, variable axes, colour fonts, shaping and GPOS, kern
-//! formats 2/3 and Apple's version 1 layout, vertical layout, and Unicode
-//! normalisation or line breaking.
+//! CFF/CFF2 outlines, variable axes, colour fonts, shaping, GPOS beyond pair
+//! adjustment, kern formats 2/3 and Apple's version 1 layout, vertical layout,
+//! and Unicode normalisation or line breaking.
 
 const std = @import("std");
+const opentype = @import("opentype.zig");
 
 /// The only failure a bounds-checked reader can produce.
 const ReadError = error{Truncated};
@@ -310,6 +311,9 @@ const tag_loca = tag("loca");
 const tag_name = tag("name");
 const tag_os2 = tag("OS/2");
 const tag_post = tag("post");
+const tag_gpos = tag("GPOS");
+const tag_gsub = tag("GSUB");
+const tag_gdef = tag("GDEF");
 
 /// One loaded face. Borrows the bytes; they must outlive it.
 pub const Font = struct {
@@ -336,6 +340,9 @@ pub const Font = struct {
     name_span: Span = .{},
     os2_span: Span = .{},
     post_span: Span = .{},
+    gpos_span: Span = .{},
+    gsub_span: Span = .{},
+    gdef_span: Span = .{},
 
     /// Parse the table directory and the metrics a caller needs up front.
     /// Fails loudly: a font GlyfZ cannot read should not silently measure zero.
@@ -379,6 +386,9 @@ pub const Font = struct {
             if (t == tag_name) self.name_span = span;
             if (t == tag_os2) self.os2_span = span;
             if (t == tag_post) self.post_span = span;
+            if (t == tag_gpos) self.gpos_span = span;
+            if (t == tag_gsub) self.gsub_span = span;
+            if (t == tag_gdef) self.gdef_span = span;
         }
 
         const head = try self.slice(self.head);
@@ -504,6 +514,47 @@ pub const Font = struct {
             }
         }
         return 0;
+    }
+
+    /// True when the font carries a GPOS table with a header this version can
+    /// read. Kerning lives there in most modern fonts, so `kern` can honestly
+    /// report nothing while `pairAdjust` has an answer.
+    pub fn hasGpos(self: Font) bool {
+        _ = opentype.Layout.init(self.data, self.gpos_span.off, self.gpos_span.len) catch return false;
+        return true;
+    }
+
+    /// GPOS pair adjustment for the `kern` feature, in FONT UNITS.
+    ///
+    /// Null when there is no GPOS, no `kern` feature, or nothing to say about
+    /// this pair. That is NOT the same as an adjustment of zero, which is why
+    /// this does not return a bare i16 -- a caller comparing against `kern`'s
+    /// zero needs to know whether GPOS was consulted at all.
+    ///
+    /// Script selection has no text context to work from: `latn`, then DFLT,
+    /// then each script in file order (see `featureLookupsDefault`). A caller that knows the script should use
+    /// `opentype.Layout` directly. What is not applied: contextual lookups,
+    /// GDEF mark filtering, and Device tables. See `opentype.zig`.
+    ///
+    /// The feature's lookup list is rebuilt per call rather than cached: a
+    /// cache needs storage the caller owns, and a stale one would move text
+    /// without saying so. Measured at ~30 bounds-checked reads.
+    pub fn pairAdjust(self: Font, left: u16, right: u16) ?opentype.Adjust {
+        if (self.gpos_span.len < 10) return null;
+        const l = opentype.Layout.init(self.data, self.gpos_span.off, self.gpos_span.len) catch return null;
+        var buf: [32]u16 = undefined;
+        const lookups = l.featureLookupsDefault(opentype.tag("kern"), &buf) catch return null;
+        if (lookups.len == 0) return null;
+        const a = l.pairAdjust(lookups, left, right);
+        if (a.isZero()) return null;
+        return a;
+    }
+
+    /// The x advance of `pairAdjust`, for a caller that only wants a number
+    /// shaped like `kern`'s.
+    pub fn kernGpos(self: Font, left: u16, right: u16) i16 {
+        const a = self.pairAdjust(left, right) orelse return 0;
+        return a.x_advance;
     }
 
     /// Offset of the nth `kern` subtable body, skipping any we do not read.
@@ -3349,4 +3400,10 @@ test "Lookup stores the RESOLVED advance, so a hit cannot report a stale one" {
     const again = try l.resolve(f, 0x42);
     try std.testing.expectEqual(@as(u16, 600), again.advance);
     try std.testing.expectEqual(@as(u32, 1), l.stats.hits);
+}
+
+test {
+    // A sibling file's tests only join the module's test binary if something
+    // references its declarations -- the same reason elmz keeps this line.
+    std.testing.refAllDecls(@import("opentype.zig"));
 }

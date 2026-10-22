@@ -1150,6 +1150,374 @@ pub const Font = struct {
         lang: u32 = 0,
     };
 
+    pub const SubsetError = error{ BufferTooSmall, CffNotSupported, Truncated, BadValue };
+
+    /// Write a valid single-table-directory font into `out` that carries only
+    /// the outlines reachable from `gids`, and return how many bytes it took.
+    ///
+    /// GLYPH IDS ARE PRESERVED. A dropped glyph becomes a zero-length entry
+    /// rather than being renumbered, which costs nothing in `glyf` (an empty
+    /// glyph is no bytes) and means two things for free: any gid the caller
+    /// already holds stays valid in the output, and composite glyphs need no
+    /// rewriting, because their component indices still point at the same
+    /// glyphs. Components are pulled in transitively, so a composite never
+    /// references a glyph the subset dropped.
+    ///
+    /// Not supported: CFF faces (the charstring INDEX would have to be rebuilt)
+    /// and any table other than the ones a rasteriser reads -- `cmap` is
+    /// rebuilt from the kept codepoints, `glyf`/`loca` are rebuilt, and `name`,
+    /// `OS/2` and `post` ride along verbatim. GPOS/GSUB and colour tables are
+    /// DROPPED, so a subset is for rendering, not for shaping.
+    pub fn subset(self: Font, gids: []const u16, out: []u8) SubsetError!usize {
+        if (self.is_cff) return error.CffNotSupported;
+        if (self.glyf.len == 0 or self.loca.len == 0 or self.num_glyphs == 0) return error.BadValue;
+        const n: usize = self.num_glyphs;
+
+        var keep_bits: [8192]u8 = @splat(0);
+        const keep = keep_bits[0 .. (n + 7) / 8];
+        const mark = struct {
+            fn set(bits: []u8, i: usize) bool {
+                const m = @as(u8, 1) << @intCast(i & 7);
+                const was = bits[i >> 3] & m != 0;
+                bits[i >> 3] |= m;
+                return !was;
+            }
+            fn has(bits: []const u8, i: usize) bool {
+                return bits[i >> 3] & (@as(u8, 1) << @intCast(i & 7)) != 0;
+            }
+        };
+        _ = mark.set(keep, 0); // .notdef always travels
+        for (gids) |g| {
+            if (g >= self.num_glyphs) return error.BadValue;
+            _ = mark.set(keep, g);
+        }
+
+        // Pull in composite components until nothing new is reachable. A
+        // composite cannot name a glyph the subset lacks, or the outline is
+        // silently wrong rather than visibly broken.
+        var changed = true;
+        while (changed) {
+            changed = false;
+            var gid: usize = 0;
+            while (gid < n) : (gid += 1) {
+                if (!mark.has(keep, gid)) continue;
+                var it = try self.componentIter(gid);
+                while (try it.next()) |comp| {
+                    if (comp < self.num_glyphs and mark.set(keep, comp)) changed = true;
+                }
+            }
+        }
+
+        // New glyf: kept outlines in place, everything else zero length.
+        var glyf_len: usize = 0;
+        {
+            var gid: usize = 0;
+            while (gid < n) : (gid += 1) {
+                if (mark.has(keep, gid)) glyf_len += (try self.glyphBytes(gid)).len;
+            }
+        }
+
+        // Two passes over the codepoint space: count the cmap segments, then
+        // emit them. Nothing is buffered, because there is no allocator here.
+        const seg_count = try self.countSegments(keep);
+        const cmap_len = 12 + 14 + 8 * seg_count + 2;
+
+        const HEAD = self.head.len;
+        const HHEA = self.hhea.len;
+        const MAXP = self.maxp.len;
+        const HMTX = self.hmtx.len;
+        const LOCA = (n + 1) * 4;
+        const NAME = self.name_span.len;
+        const OS2 = self.os2_span.len;
+        const POST = self.post_span.len;
+
+        const n_tables: usize = 8;
+        var total: usize = 12 + 16 * n_tables;
+        const off_head = total;
+        total = pad4(total + HEAD);
+        const off_hhea = total;
+        total = pad4(total + HHEA);
+        const off_maxp = total;
+        total = pad4(total + MAXP);
+        const off_hmtx = total;
+        total = pad4(total + HMTX);
+        const off_loca = total;
+        total = pad4(total + LOCA);
+        const off_glyf = total;
+        total = pad4(total + glyf_len);
+        const off_cmap = total;
+        total = pad4(total + cmap_len);
+        const off_name = total;
+        total = pad4(total + NAME);
+        const off_os2 = total;
+        total = pad4(total + OS2);
+        const off_post = total;
+        total = pad4(total + POST);
+        if (total > out.len) return error.BufferTooSmall;
+
+        @memset(out[0..total], 0);
+        var w = Out{ .b = out, .p = 0 };
+        try w.u32v(0x0001_0000);
+        try w.u16v(n_tables);
+        try w.u16v(0);
+        try w.u16v(0);
+        try w.u16v(0);
+        const dir_at = w.p;
+        w.p += 16 * n_tables;
+
+        // head, with the loca format forced to long and the adjustment zeroed.
+        @memcpy(out[off_head..][0..HEAD], self.data[self.head.off..][0..HEAD]);
+        if (HEAD < 54) return error.BadValue;
+        out[off_head + 8] = 0;
+        out[off_head + 9] = 0;
+        out[off_head + 10] = 0;
+        out[off_head + 11] = 0;
+        out[off_head + 50] = 0;
+        out[off_head + 51] = 1; // indexToLocFormat = long
+        @memcpy(out[off_hhea..][0..HHEA], self.data[self.hhea.off..][0..HHEA]);
+        @memcpy(out[off_maxp..][0..MAXP], self.data[self.maxp.off..][0..MAXP]);
+        @memcpy(out[off_hmtx..][0..HMTX], self.data[self.hmtx.off..][0..HMTX]);
+        @memcpy(out[off_name..][0..NAME], self.data[self.name_span.off..][0..NAME]);
+        if (OS2 != 0) @memcpy(out[off_os2..][0..OS2], self.data[self.os2_span.off..][0..OS2]);
+        if (POST != 0) @memcpy(out[off_post..][0..POST], self.data[self.post_span.off..][0..POST]);
+
+        // glyf + loca
+        var at: u32 = 0;
+        var gid: usize = 0;
+        while (gid < n) : (gid += 1) {
+            w.p = off_loca + gid * 4;
+            try w.u32v(at);
+            if (mark.has(keep, gid)) {
+                const g = try self.glyphBytes(gid);
+                @memcpy(out[off_glyf + at ..][0..g.len], g);
+                at += @intCast(g.len);
+            }
+        }
+        w.p = off_loca + n * 4;
+        try w.u32v(at);
+
+        // cmap: format 4, one segment per run of consecutive code -> glyph.
+        w.p = off_cmap;
+        try w.u16v(0);
+        try w.u16v(1);
+        try w.u16v(3);
+        try w.u16v(1);
+        try w.u32v(12);
+        try w.u16v(4);
+        try w.u16v(@intCast(cmap_len - 12));
+        try w.u16v(0);
+        try w.u16v(@intCast(seg_count * 2));
+        var sr: usize = 1;
+        var es: usize = 0;
+        while (sr * 2 <= seg_count) : (sr *= 2) es += 1;
+        try w.u16v(@intCast(sr * 2));
+        try w.u16v(@intCast(es));
+        try w.u16v(@intCast(seg_count * 2 - sr * 2));
+        const end_at = w.p;
+        w.p += seg_count * 2;
+        const pad_at = w.p;
+        w.p += 2;
+        const start_at = w.p;
+        w.p += seg_count * 2;
+        const delta_at = w.p;
+        w.p += seg_count * 2;
+        w.p += seg_count * 2; // idRangeOffset, all zero: idDelta does the work
+        try self.emitSegments(out, keep, end_at, start_at, delta_at);
+        out[pad_at] = 0;
+        out[pad_at + 1] = 0;
+
+        // Directory, then each table's checksum over its padded bytes.
+        var t: usize = 0;
+        for ([_]struct { tag: u32, off: usize, len: usize, checksum: bool }{
+            .{ .tag = tag("head"), .off = off_head, .len = HEAD, .checksum = true },
+            .{ .tag = tag("hhea"), .off = off_hhea, .len = HHEA, .checksum = true },
+            .{ .tag = tag("maxp"), .off = off_maxp, .len = MAXP, .checksum = true },
+            .{ .tag = tag("hmtx"), .off = off_hmtx, .len = HMTX, .checksum = true },
+            .{ .tag = tag("loca"), .off = off_loca, .len = LOCA, .checksum = true },
+            .{ .tag = tag("glyf"), .off = off_glyf, .len = glyf_len, .checksum = true },
+            .{ .tag = tag("cmap"), .off = off_cmap, .len = cmap_len, .checksum = true },
+            .{ .tag = tag("name"), .off = off_name, .len = NAME, .checksum = true },
+        }) |rec| {
+            const p = dir_at + t * 16;
+            writeU32(out, p, rec.tag);
+            writeU32(out, p + 4, checksum(out[rec.off..][0..pad4(rec.len)]));
+            writeU32(out, p + 8, @intCast(rec.off));
+            writeU32(out, p + 12, @intCast(rec.len));
+            t += 1;
+        }
+
+        // head.checkSumAdjustment: 0xB1B0AFBA minus the whole-file sum.
+        const sum = checksum(out[0..total]);
+        const adj = 0xB1B0_AFBA -% sum;
+        writeU32(out, off_head + 8, adj);
+
+        return total;
+    }
+
+    const Out = struct {
+        b: []u8,
+        p: usize = 0,
+        fn u16v(self: *Out, v: u32) SubsetError!void {
+            if (self.p + 2 > self.b.len) return error.BufferTooSmall;
+            writeU16(self.b, self.p, @intCast(v));
+            self.p += 2;
+        }
+        fn u32v(self: *Out, v: u32) SubsetError!void {
+            if (self.p + 4 > self.b.len) return error.BufferTooSmall;
+            writeU32(self.b, self.p, v);
+            self.p += 4;
+        }
+    };
+
+    fn pad4(v: usize) usize {
+        return (v + 3) & ~@as(usize, 3);
+    }
+
+    fn writeU16(b: []u8, at: usize, v: u16) void {
+        b[at] = @intCast(v >> 8);
+        b[at + 1] = @truncate(v);
+    }
+
+    fn writeU32(b: []u8, at: usize, v: u32) void {
+        b[at] = @intCast(v >> 24);
+        b[at + 1] = @truncate(v >> 16);
+        b[at + 2] = @truncate(v >> 8);
+        b[at + 3] = @truncate(v);
+    }
+
+    fn checksum(b: []const u8) u32 {
+        var sum: u32 = 0;
+        var i: usize = 0;
+        while (i + 4 <= b.len) : (i += 4) {
+            sum +%= (@as(u32, b[i]) << 24) | (@as(u32, b[i + 1]) << 16) |
+                (@as(u32, b[i + 2]) << 8) | @as(u32, b[i + 3]);
+        }
+        if (i < b.len) {
+            var last: u32 = 0;
+            var k: usize = 0;
+            while (i + k < b.len) : (k += 1) last |= @as(u32, b[i + k]) << @intCast(24 - 8 * k);
+            sum +%= last;
+        }
+        return sum;
+    }
+
+    fn locaOff(self: Font, gid: usize) SubsetError!u32 {
+        if (gid > self.num_glyphs) return error.BadValue;
+        if (self.index_to_loc == 0) {
+            return @as(u32, try u16At(self.data, self.loca.off + gid * 2)) * 2;
+        }
+        return try u32At(self.data, self.loca.off + gid * 4);
+    }
+
+    fn glyphBytes(self: Font, gid: usize) SubsetError![]const u8 {
+        const a = try self.locaOff(gid);
+        const b = try self.locaOff(gid + 1);
+        if (b < a) return error.BadValue;
+        const end = self.glyf.off + b;
+        if (end > self.data.len) return error.Truncated;
+        return self.data[self.glyf.off + a .. end];
+    }
+
+    /// Walk a composite's component glyph ids. A simple glyph yields nothing.
+    fn componentIter(self: Font, gid: usize) SubsetError!CompIter {
+        const g = try self.glyphBytes(gid);
+        if (g.len < 10) return .{ .g = g, .p = g.len };
+        const contours = try i16At(g, 0);
+        if (contours >= 0) return .{ .g = g, .p = g.len };
+        return .{ .g = g, .p = 10 };
+    }
+
+    const CompIter = struct {
+        g: []const u8,
+        p: usize,
+        more: bool = true,
+        fn next(self: *CompIter) SubsetError!?u16 {
+            if (!self.more or self.p + 4 > self.g.len) return null;
+            const flags = try u16At(self.g, self.p);
+            const comp = try u16At(self.g, self.p + 2);
+            var adv: usize = 4;
+            adv += if (flags & 0x0001 != 0) 4 else 2; // ARG_1_AND_2_ARE_WORDS
+            if (flags & 0x0008 != 0) adv += 2 // WE_HAVE_A_SCALE
+            else if (flags & 0x0040 != 0) adv += 4 // X_AND_Y_SCALE
+            else if (flags & 0x0080 != 0) adv += 8; // TWO_BY_TWO
+            self.p += adv;
+            self.more = flags & 0x0020 != 0; // MORE_COMPONENTS
+            return comp;
+        }
+    };
+
+    fn keptGid(self: Font, keep: []const u8, cp: u32) u16 {
+        if (cp > 0xFFFF) return 0;
+        const g = self.glyphIndex(@intCast(cp)) catch return 0;
+        if (g == 0 or g >= self.num_glyphs) return 0;
+        const i: usize = g;
+        if (keep[i >> 3] & (@as(u8, 1) << @intCast(i & 7)) == 0) return 0;
+        return g;
+    }
+
+    fn countSegments(self: Font, keep: []const u8) SubsetError!usize {
+        var segs: usize = 1; // the terminator
+        var cp: u32 = 0;
+        var prev_gid: u16 = 0;
+        var run_open = false;
+        while (cp <= 0xFFFF) : (cp += 1) {
+            const g = self.keptGid(keep, cp);
+            if (g == 0) {
+                run_open = false;
+                continue;
+            }
+            if (!run_open or @as(u32, prev_gid) + 1 != @as(u32, g)) segs += 1;
+            run_open = true;
+            prev_gid = g;
+        }
+        return segs;
+    }
+
+    fn emitSegments(self: Font, out: []u8, keep: []const u8, end_at: usize, start_at: usize, delta_at: usize) SubsetError!void {
+        var seg: usize = 0;
+        var cp: u32 = 0;
+        var prev_gid: u16 = 0;
+        var run_open = false;
+        var run_start: u32 = 0;
+        var run_gid: u16 = 0;
+        while (cp <= 0xFFFF) : (cp += 1) {
+            const g = self.keptGid(keep, cp);
+            if (g == 0) {
+                if (run_open) {
+                    writeU16(out, end_at + seg * 2, @intCast(cp - 1));
+                    writeU16(out, start_at + seg * 2, @intCast(run_start));
+                    writeU16(out, delta_at + seg * 2, @truncate(@as(u32, run_gid) -% run_start));
+                    seg += 1;
+                    run_open = false;
+                }
+                continue;
+            }
+            if (!run_open) {
+                run_open = true;
+                run_start = cp;
+                run_gid = g;
+            } else if (@as(u32, prev_gid) + 1 != @as(u32, g)) {
+                writeU16(out, end_at + seg * 2, @intCast(cp - 1));
+                writeU16(out, start_at + seg * 2, @intCast(run_start));
+                writeU16(out, delta_at + seg * 2, @truncate(@as(u32, run_gid) -% run_start));
+                seg += 1;
+                run_start = cp;
+                run_gid = g;
+            }
+            prev_gid = g;
+        }
+        if (run_open) {
+            writeU16(out, end_at + seg * 2, 0xFFFF);
+            writeU16(out, start_at + seg * 2, @intCast(run_start));
+            writeU16(out, delta_at + seg * 2, @truncate(@as(u32, run_gid) -% run_start));
+            seg += 1;
+        }
+        // Terminator segment: 0xFFFF maps to gid 0.
+        writeU16(out, end_at + seg * 2, 0xFFFF);
+        writeU16(out, start_at + seg * 2, 0xFFFF);
+        writeU16(out, delta_at + seg * 2, 1);
+    }
+
     /// Convert base-relative mark offsets into pen-relative ones.
     ///
     /// A mark's anchor offset is measured from the origin of the base it attaches
@@ -3432,6 +3800,59 @@ test "two vertical phases never share a cache slot" {
     try std.testing.expect(cache.find(6, sk, .zero, .half) == null);
     try std.testing.expect(cache.find(6, sk, .half, .zero) == null);
     try std.testing.expect(cache.find(6, sk, .zero, .three_quarters) == null);
+}
+
+test "a subset pulls in components it was not asked for, and keeps ids" {
+    var fbuf: [4096]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fbuf, false));
+    var out: [16384]u8 = undefined;
+
+    // gid 7 is a composite whose component is gid 6. Ask for 7 alone.
+    const n = try font.subset(&[_]u16{7}, &out);
+    const small = try Font.init(out[0..n]);
+    try std.testing.expectEqual(font.num_glyphs, small.num_glyphs);
+    try std.testing.expectEqual(try font.glyphIndex('A'), try small.glyphIndex('A'));
+
+    var pts: [256]Point = undefined;
+    var ends: [32]u16 = undefined;
+    var edges: [256]Edge = undefined;
+    var acc: [256]f32 = undefined;
+    var c1: [4096]u8 = undefined;
+    var c2: [4096]u8 = undefined;
+    const a = try font.raster(7, 0.02, 0, &pts, &ends, &edges, &acc, &c1);
+    const b = try small.raster(7, 0.02, 0, &pts, &ends, &edges, &acc, &c2);
+    try std.testing.expect(a.w > 0 and a.h > 0);
+    try std.testing.expectEqual(a.w, b.w);
+    try std.testing.expectEqualSlices(u8, a.coverage, b.coverage);
+}
+
+test "a subset drops the outlines it was not given" {
+    var fbuf: [4096]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fbuf, false));
+    var out: [16384]u8 = undefined;
+
+    // Keep the triangle only; the composite that used it goes away, because
+    // nothing asked for it and dropping a glyph must not be silently undone.
+    const n = try font.subset(&[_]u16{6}, &out);
+    const small = try Font.init(out[0..n]);
+
+    var pts: [256]Point = undefined;
+    var ends: [32]u16 = undefined;
+    var edges: [256]Edge = undefined;
+    var acc: [256]f32 = undefined;
+    var c1: [4096]u8 = undefined;
+    var c2: [4096]u8 = undefined;
+    const kept = try small.raster(6, 0.02, 0, &pts, &ends, &edges, &acc, &c1);
+    const gone = try small.raster(7, 0.02, 0, &pts, &ends, &edges, &acc, &c2);
+    try std.testing.expect(kept.w > 0);
+    try std.testing.expectEqual(@as(u32, 0), gone.w);
+}
+
+test "a subset that does not fit says so instead of writing a broken font" {
+    var fbuf: [4096]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fbuf, false));
+    var tiny: [64]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, font.subset(&[_]u16{6}, &tiny));
 }
 
 test "capability queries answer from the directory, not from a guess" {

@@ -34,6 +34,7 @@
 const std = @import("std");
 const cff = @import("cff.zig");
 const colr = @import("colr.zig");
+const variations = @import("variations.zig");
 
 pub const Layer = colr.Layer;
 pub const Rgba = colr.Rgba;
@@ -330,6 +331,10 @@ const tag_gsub = tag("GSUB");
 const tag_gdef = tag("GDEF");
 const tag_cff = tag("CFF ");
 const tag_colr = tag("COLR");
+const tag_fvar = tag("fvar");
+const tag_avar = tag("avar");
+const tag_gvar = tag("gvar");
+const tag_hvar = tag("HVAR");
 const tag_cpal = tag("CPAL");
 
 /// Map a CFF failure onto this library's glyph error set. A CFF construct that
@@ -375,6 +380,14 @@ pub const Font = struct {
     gdef_span: Span = .{},
     cff_span: Span = .{},
     colr_span: Span = .{},
+    fvar_span: Span = .{},
+    avar_span: Span = .{},
+    gvar_span: Span = .{},
+    hvar_span: Span = .{},
+    /// Normalised axis coordinates, in axis order. Zero is the default
+    /// instance, so a Font that was never varied costs nothing extra to decode.
+    coords: [variations.max_axes]f32 = @splat(0),
+    n_coords: u8 = 0,
     cpal_span: Span = .{},
 
     /// Set when the outlines come from a CFF table instead of `glyf`. The
@@ -433,6 +446,10 @@ pub const Font = struct {
             if (t == tag_gdef) self.gdef_span = span;
             if (t == tag_cff) self.cff_span = span;
             if (t == tag_colr) self.colr_span = span;
+            if (t == tag_fvar) self.fvar_span = span;
+            if (t == tag_avar) self.avar_span = span;
+            if (t == tag_gvar) self.gvar_span = span;
+            if (t == tag_hvar) self.hvar_span = span;
             if (t == tag_cpal) self.cpal_span = span;
         }
 
@@ -822,6 +839,14 @@ pub const Font = struct {
         }
         var cur = Cursor{ .points = points, .ends = ends };
         try decodeInto(self, gid, &cur, 0);
+        if (self.n_coords != 0 and self.gvar_span.len != 0 and cur.n != 0) {
+            // A composite's point array is component records, not outline
+            // points, so its own deltas are a different operation and are not
+            // applied here.
+            const gd = glyphRange(self, gid) catch &[_]u8{};
+            const n_contours: i16 = if (gd.len >= 2) @bitCast((@as(u16, gd[0]) << 8) | gd[1]) else 0;
+            if (n_contours > 0) self.varyOutline(gid, points[0..cur.n], ends[0..cur.nc]);
+        }
         return .{ .points = points[0..cur.n], .ends = ends[0..cur.nc] };
     }
 
@@ -1682,6 +1707,106 @@ pub const Font = struct {
 
     /// Does the file carry this table at all? Answers about the DIRECTORY, so
     /// no parse of the table itself happens.
+    /// How many variation axes the face declares. A static face has none.
+    pub fn axisCount(self: Font) u16 {
+        if (self.fvar_span.len == 0) return 0;
+        return variations.axisCount(self.fvar_slice()) catch 0;
+    }
+
+    pub fn axisInfo(self: Font, i: usize) ?variations.Axis {
+        if (self.fvar_span.len == 0) return null;
+        return variations.axis(self.fvar_slice(), i) catch null;
+    }
+
+    /// Return a copy of this face pinned to a point in its design space.
+    ///
+    /// `user` is in axis order and in USER units (a `wght` of 700, not a
+    /// normalised coordinate); it is normalised here, through `avar` when the
+    /// face has one. Extra values are ignored and missing ones stay at the
+    /// default, so varying one axis of a two-axis face is legal.
+    pub fn withCoords(self: Font, user: []const f32) Font {
+        var f = self;
+        f.n_coords = 0;
+        if (self.fvar_span.len == 0) return f;
+        const count = variations.axisCount(self.fvar_slice()) catch return f;
+        const avar: []const u8 = if (self.avar_span.len != 0)
+            self.data[self.avar_span.off..][0..self.avar_span.len]
+        else
+            &.{};
+        const n = @min(@min(user.len, variations.max_axes), @as(usize, count));
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const a = variations.axis(self.fvar_slice(), i) catch break;
+            f.coords[i] = variations.normalizeAxis(a, user[i], avar, i);
+        }
+        f.n_coords = @intCast(i);
+        while (i < variations.max_axes) : (i += 1) f.coords[i] = 0;
+        return f;
+    }
+
+    /// A small id for the current instance, for use in a cache key.
+    ///
+    /// Two Fonts over the same bytes at different coordinates produce
+    /// different masks, so a cache that ignored this would serve the wrong
+    /// glyph forever. It is a hash rather than an index because there is no
+    /// registry to hand out indices.
+    pub fn variationId(self: Font) u32 {
+        var h: u32 = 0;
+        for (self.coords[0..self.n_coords]) |c| {
+            h = (h *% 0x9E3779B1) ^ @as(u32, @bitCast(c));
+        }
+        return h;
+    }
+
+    fn fvar_slice(self: Font) []const u8 {
+        return self.data[self.fvar_span.off..][0..self.fvar_span.len];
+    }
+
+    /// Apply this instance's gvar deltas to a decoded outline, in place.
+    ///
+    /// Only simple glyphs: a composite's point numbers are component records
+    /// and their offsets are a different kind of delta, so they are left at
+    /// their default positions. The components themselves still vary, because
+    /// each one is decoded through this same path.
+    fn varyOutline(self: Font, gid: u16, pts: []Point, contour_ends: []const u16) void {
+        if (self.n_coords == 0 or self.gvar_span.len == 0 or pts.len == 0) return;
+        if (pts.len > variations.max_points) return;
+
+        var xs: [variations.max_points]f32 = undefined;
+        var ys: [variations.max_points]f32 = undefined;
+        var dx: [variations.max_points]f32 = @splat(0);
+        var dy: [variations.max_points]f32 = @splat(0);
+        var tx: [variations.max_points]f32 = @splat(0);
+        var ty: [variations.max_points]f32 = @splat(0);
+        var touched: [variations.max_points]bool = @splat(false);
+        var idx: [variations.max_points]u16 = undefined;
+        for (pts, 0..) |p, i| {
+            xs[i] = @floatFromInt(p.x);
+            ys[i] = @floatFromInt(p.y);
+        }
+        const n = pts.len;
+        const any = variations.applyGlyph(
+            self.data[self.gvar_span.off..][0..self.gvar_span.len],
+            self.coords[0..self.n_coords],
+            gid,
+            n,
+            contour_ends,
+            xs[0..n],
+            ys[0..n],
+            dx[0..n],
+            dy[0..n],
+            touched[0..n],
+            idx[0..n],
+            tx[0..n],
+            ty[0..n],
+        ) catch return;
+        if (!any) return;
+        for (pts, 0..) |*p, i| {
+            p.x += @intFromFloat(@round(dx[i]));
+            p.y += @intFromFloat(@round(dy[i]));
+        }
+    }
+
     pub fn hasTable(self: Font, wanted: u32) bool {
         if (self.data.len < 12) return false;
         // A collection has no directory at offset 0: those bytes are 'ttcf' and
@@ -2532,6 +2657,7 @@ pub const Cache = struct {
     const Slot = struct {
         gid: u16 = 0,
         scale_key: u32 = 0,
+        var_key: u32 = 0,
         phase: Phase = .zero,
         phase_y: Phase = .zero,
         /// The size class the pixels came from, so an eviction knows whose
@@ -2669,7 +2795,8 @@ pub const Cache = struct {
     /// between them would serve the wrong one forever.
     pub fn maskAtXY(self: *Cache, font: *const Font, gid: u16, scale: f32, phase: Phase, phase_y: Phase) GlyphError!Mask {
         const scale_key: u32 = @bitCast(scale);
-        if (self.find(gid, scale_key, phase, phase_y)) |s| {
+        const vk = font.variationId();
+        if (self.find(gid, scale_key, phase, phase_y, vk)) |s| {
             self.stats.hits += 1;
             const at = self.arena_at + self.class_at[s.cls] + s.off;
             return .{ .w = s.w, .h = s.h, .x0 = s.x0, .y0 = s.y0, .pixels = self.mem[at..][0 .. @as(usize, s.w) * s.h] };
@@ -2694,12 +2821,12 @@ pub const Cache = struct {
         // Only this class gives way. Masks of other sizes keep their pixels.
         if (self.class_used[cls] + len > self.class_cap[cls]) self.evictClass(cls);
 
-        var slot = self.freeSlot(gid, scale_key, phase, phase_y);
+        var slot = self.freeSlot(gid, scale_key, phase, phase_y, vk);
         if (slot == null) {
             // Every slot is spoken for; the table, not the pixels, is the
             // limit. Rare enough to take the blunt path.
             self.flush();
-            slot = self.freeSlot(gid, scale_key, phase, phase_y);
+            slot = self.freeSlot(gid, scale_key, phase, phase_y, vk);
         }
         const s = slot orelse return error.BufferTooSmall;
 
@@ -2723,30 +2850,32 @@ pub const Cache = struct {
         return .{ .w = r.w, .h = r.h, .x0 = r.x0, .y0 = r.y0, .pixels = r.coverage };
     }
 
-    fn probeStart(self: *Cache, gid: u16, scale_key: u32, phase: Phase, phase_y: Phase) usize {
+    fn probeStart(self: *Cache, gid: u16, scale_key: u32, phase: Phase, phase_y: Phase, var_key: u32) usize {
+        // The instance id is part of the key: the same glyph at the same size
+        // in two weights is two different masks.
         // The scale enters the key by its raw bits. Quantising it onto a size
         // lattice would let two neighbouring sizes share a mask, which is the
         // wrong glyph by design; a caller that animates size loses hit rate
         // instead, and that is the honest failure.
-        var key: u64 = (@as(u64, gid) << 40) ^ (@as(u64, scale_key) << 4) ^ (@as(u64, @intFromEnum(phase)) << 2) ^ @as(u64, @intFromEnum(phase_y));
+        var key: u64 = (@as(u64, gid) << 40) ^ (@as(u64, scale_key) << 4) ^ (@as(u64, @intFromEnum(phase)) << 2) ^ @as(u64, @intFromEnum(phase_y)) ^ (@as(u64, var_key) << 48);
         key *%= 0x9E3779B97F4A7C15;
         key ^= key >> 29;
         return @as(usize, key >> 16) % self.slots.len;
     }
 
-    fn find(self: *Cache, gid: u16, scale_key: u32, phase: Phase, phase_y: Phase) ?*Slot {
-        const start = self.probeStart(gid, scale_key, phase, phase_y);
+    fn find(self: *Cache, gid: u16, scale_key: u32, phase: Phase, phase_y: Phase, var_key: u32) ?*Slot {
+        const start = self.probeStart(gid, scale_key, phase, phase_y, var_key);
         var i: usize = 0;
         while (i < self.slots.len) : (i += 1) {
             const s = &self.slots[(start + i) % self.slots.len];
             if (s.state == .empty) return null; // an empty slot ends the probe run
-            if (s.state == .live and s.gid == gid and s.scale_key == scale_key and s.phase == phase and s.phase_y == phase_y) return s;
+            if (s.state == .live and s.gid == gid and s.scale_key == scale_key and s.phase == phase and s.phase_y == phase_y and s.var_key == var_key) return s;
         }
         return null;
     }
 
-    fn freeSlot(self: *Cache, gid: u16, scale_key: u32, phase: Phase, phase_y: Phase) ?*Slot {
-        const start = self.probeStart(gid, scale_key, phase, phase_y);
+    fn freeSlot(self: *Cache, gid: u16, scale_key: u32, phase: Phase, phase_y: Phase, var_key: u32) ?*Slot {
+        const start = self.probeStart(gid, scale_key, phase, phase_y, var_key);
         var i: usize = 0;
         while (i < self.slots.len) : (i += 1) {
             const s = &self.slots[(start + i) % self.slots.len];
@@ -3811,7 +3940,7 @@ test "a dead slot keeps its probe chain walkable, an empty one ends it" {
     const gid: u16 = 42;
     const sk: u32 = @bitCast(@as(f32, 0.25));
     const n = cache.slots.len;
-    const start = cache.probeStart(gid, sk, .zero, .zero);
+    const start = cache.probeStart(gid, sk, .zero, .zero, 0);
     const near = start % n;
     const under_test = (start + 1) % n;
     const far = (start + 2) % n;
@@ -3823,12 +3952,12 @@ test "a dead slot keeps its probe chain walkable, an empty one ends it" {
 
     // Evicted pixels: the chain has to walk over it.
     cache.slots[under_test] = .{ .state = .dead };
-    try std.testing.expect(cache.find(gid, sk, .zero, .zero) != null);
+    try std.testing.expect(cache.find(gid, sk, .zero, .zero, 0) != null);
 
     // A slot that was never used ends the run: nothing is ever stored past one,
     // so a lookup must stop rather than scan the rest of the table.
     cache.slots[under_test] = .{ .state = .empty };
-    try std.testing.expect(cache.find(gid, sk, .zero, .zero) == null);
+    try std.testing.expect(cache.find(gid, sk, .zero, .zero, 0) == null);
 }
 
 test "a vertical phase moves the mask, and is part of the cache key" {
@@ -3862,10 +3991,10 @@ test "two vertical phases never share a cache slot" {
     const sk: u32 = @bitCast(@as(f32, 0.25));
     cache.slots[0] = .{ .gid = 6, .scale_key = sk, .phase = .zero, .phase_y = .zero, .state = .live };
 
-    try std.testing.expect(cache.find(6, sk, .zero, .zero) != null);
-    try std.testing.expect(cache.find(6, sk, .zero, .half) == null);
-    try std.testing.expect(cache.find(6, sk, .half, .zero) == null);
-    try std.testing.expect(cache.find(6, sk, .zero, .three_quarters) == null);
+    try std.testing.expect(cache.find(6, sk, .zero, .zero, 0) != null);
+    try std.testing.expect(cache.find(6, sk, .zero, .half, 0) == null);
+    try std.testing.expect(cache.find(6, sk, .half, .zero, 0) == null);
+    try std.testing.expect(cache.find(6, sk, .zero, .three_quarters, 0) == null);
 }
 
 test "a subset pulls in components it was not asked for, and keeps ids" {

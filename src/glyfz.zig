@@ -1534,6 +1534,11 @@ pub const Cache = struct {
     pub const Stats = struct {
         hits: u64 = 0,
         misses: u64 = 0,
+        /// Every time pixels gave way: one size class giving up its share, or
+        /// the whole table when the slots run out. A high count means the arena
+        /// is sized below the working set -- visible rather than inferred from
+        /// timings. It is not a miss count: what a class eviction costs depends
+        /// on whether those masks are asked for again.
         flushes: u64 = 0,
     };
 
@@ -1541,13 +1546,38 @@ pub const Cache = struct {
         gid: u16 = 0,
         scale_key: u32 = 0,
         phase: Phase = .zero,
+        /// The size class the pixels came from, so an eviction knows whose
+        /// slot to drop without consulting any other bookkeeping.
+        cls: u8 = 0,
         off: u32 = 0,
         w: u32 = 0,
         h: u32 = 0,
         x0: i32 = 0,
         y0: i32 = 0,
-        valid: bool = false,
+        state: State = .empty,
     };
+
+    /// An open-addressed table cannot simply drop an entry: a hole in the
+    /// middle of a probe chain hides every key behind it, because a lookup
+    /// stops at the first empty slot it meets. `dead` keeps the chain walkable
+    /// while marking those pixels as gone.
+    const State = enum(u2) { empty = 0, live = 1, dead = 2 };
+
+    /// Byte-size classes, largest `len` each will hold. A mask goes in the
+    /// first class that fits, and every class owns its own slice of the arena.
+    ///
+    /// The point is that filling up is not a single event: without this, one
+    /// page of display-size glyphs exhausts the arena and evicts the small text
+    /// masks that get asked for on every row of every frame, so the cheap,
+    /// hot, numerous masks are thrown away to make room for the rare, cold,
+    /// expensive ones. Separate budgets mean each population only competes with
+    /// itself.
+    const class_count = 4;
+    const class_max = [class_count]usize{ 256, 1024, 4096, std.math.maxInt(usize) };
+    /// Below this there is no room to divide usefully, and the cache behaves as
+    /// one pool exactly as it used to -- which keeps a deliberately tiny arena
+    /// in a test meaning what it says.
+    const partition_min: usize = 8 * 1024;
 
     mem: []align(8) u8,
     slots: []Slot,
@@ -1557,7 +1587,10 @@ pub const Cache = struct {
     scratch: []f32,
     arena_at: usize,
     arena_len: usize,
-    used: usize,
+    class_at: [class_count]usize = @splat(0),
+    class_cap: [class_count]usize = @splat(0),
+    class_used: [class_count]usize = @splat(0),
+    partitioned: bool,
     stats: Stats = .{},
 
     /// How much memory `init` wants for this configuration.
@@ -1591,10 +1624,33 @@ pub const Cache = struct {
             .scratch = scratch,
             .arena_at = arena_at,
             .arena_len = mem.len - arena_at,
-            .used = 0,
+            .partitioned = mem.len - arena_at >= partition_min,
         };
+        if (c.partitioned) {
+            const each = c.arena_len / class_count;
+            var k: usize = 0;
+            while (k < class_count) : (k += 1) {
+                c.class_at[k] = k * each;
+                c.class_cap[k] = each;
+            }
+            // The division is not exact; the last class takes the remainder
+            // rather than leaving bytes unreachable.
+            c.class_cap[class_count - 1] = c.arena_len - (class_count - 1) * each;
+        } else {
+            c.class_cap[class_count - 1] = c.arena_len;
+        }
         c.reset();
         return c;
+    }
+
+    /// Which budget a mask of `len` bytes is drawn from.
+    fn classOf(self: Cache, len: usize) usize {
+        if (!self.partitioned) return class_count - 1;
+        var k: usize = 0;
+        while (k < class_count - 1) : (k += 1) {
+            if (len <= class_max[k]) return k;
+        }
+        return class_count - 1;
     }
 
     /// The mask for this glyph at this pixel size and phase, rasterising it if
@@ -1618,7 +1674,7 @@ pub const Cache = struct {
         const scale_key: u32 = @bitCast(scale);
         if (self.find(gid, scale_key, phase)) |s| {
             self.stats.hits += 1;
-            const at = self.arena_at + s.off;
+            const at = self.arena_at + self.class_at[s.cls] + s.off;
             return .{ .w = s.w, .h = s.h, .x0 = s.x0, .y0 = s.y0, .pixels = self.mem[at..][0 .. @as(usize, s.w) * s.h] };
         }
 
@@ -1631,28 +1687,36 @@ pub const Cache = struct {
         if (w == 0 or h == 0) return .{ .x0 = box.x0, .y0 = box.y0 };
         const len = @as(usize, w) * h;
 
+        const cls = self.classOf(len);
+        if (len > self.class_cap[cls]) return error.BufferTooSmall;
+        // Only this class gives way. Masks of other sizes keep their pixels.
+        if (self.class_used[cls] + len > self.class_cap[cls]) self.evictClass(cls);
+
         var slot = self.freeSlot(gid, scale_key, phase);
-        if (slot == null or self.used + len > self.arena_len) {
+        if (slot == null) {
+            // Every slot is spoken for; the table, not the pixels, is the
+            // limit. Rare enough to take the blunt path.
             self.flush();
-            if (len > self.arena_len) return error.BufferTooSmall;
             slot = self.freeSlot(gid, scale_key, phase);
         }
         const s = slot orelse return error.BufferTooSmall;
-        const at = self.arena_at + self.used;
+
+        const at = self.arena_at + self.class_at[cls] + self.class_used[cls];
         const r = try font.raster(gid, scale, ph, self.points, self.ends, self.edges, self.scratch, self.mem[at..][0..len]);
 
         s.* = .{
             .gid = gid,
             .scale_key = scale_key,
             .phase = phase,
-            .off = @intCast(self.used),
+            .cls = @intCast(cls),
+            .off = @intCast(self.class_used[cls]),
             .w = r.w,
             .h = r.h,
             .x0 = r.x0,
             .y0 = r.y0,
-            .valid = true,
+            .state = .live,
         };
-        self.used += len;
+        self.class_used[cls] += len;
         return .{ .w = r.w, .h = r.h, .x0 = r.x0, .y0 = r.y0, .pixels = r.coverage };
     }
 
@@ -1661,7 +1725,7 @@ pub const Cache = struct {
         // lattice would let two neighbouring sizes share a mask, which is the
         // wrong glyph by design; a caller that animates size loses hit rate
         // instead, and that is the honest failure.
-        var key: u64 = (@as(u64, gid) << 40) ^ (@as(u64, scale_key) << 2) ^ @intFromEnum(phase);
+        var key: u64 = (@as(u64, gid) << 40) ^ (@as(u64, scale_key) << 2) ^ @as(u64, @intFromEnum(phase));
         key *%= 0x9E3779B97F4A7C15;
         key ^= key >> 29;
         return @as(usize, key >> 16) % self.slots.len;
@@ -1672,8 +1736,8 @@ pub const Cache = struct {
         var i: usize = 0;
         while (i < self.slots.len) : (i += 1) {
             const s = &self.slots[(start + i) % self.slots.len];
-            if (!s.valid) return null; // an empty slot ends the probe run
-            if (s.gid == gid and s.scale_key == scale_key and s.phase == phase) return s;
+            if (s.state == .empty) return null; // an empty slot ends the probe run
+            if (s.state == .live and s.gid == gid and s.scale_key == scale_key and s.phase == phase) return s;
         }
         return null;
     }
@@ -1683,14 +1747,23 @@ pub const Cache = struct {
         var i: usize = 0;
         while (i < self.slots.len) : (i += 1) {
             const s = &self.slots[(start + i) % self.slots.len];
-            if (!s.valid) return s;
+            if (s.state != .live) return s; // a dead slot is free, and keeps its chain
         }
         return null;
     }
 
     fn reset(self: *Cache) void {
-        for (self.slots) |*s| s.valid = false;
-        self.used = 0;
+        for (self.slots) |*s| s.state = .empty;
+        self.class_used = @splat(0);
+    }
+
+    /// One size class gives way; the other three keep their pixels.
+    fn evictClass(self: *Cache, cls: usize) void {
+        for (self.slots) |*s| {
+            if (s.state == .live and s.cls == cls) s.state = .dead;
+        }
+        self.class_used[cls] = 0;
+        self.stats.flushes += 1;
     }
 
     /// Everything goes. Counted, because a high flush count means the caller
@@ -2638,6 +2711,106 @@ test "a full arena flushes instead of handing back stale pixels" {
     const scale = @as(f32, @floatFromInt(@as(u16, 39))) / @as(f32, @floatFromInt(font.units_per_em));
     const direct = try font.raster(6, scale, 0, &pts, &ends, &edges, &scratch, &cov);
     try std.testing.expectEqualSlices(u8, direct.coverage, last.pixels);
+}
+
+test "filling one size class does not evict the small masks" {
+    var fb: [2048]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fb, false));
+
+    var storage: [64 * 1024]u8 align(8) = undefined;
+    var cache = try Cache.init(&storage, .{
+        .slots = 64,
+        .max_points = 256,
+        .max_edges = 256,
+        .max_width = 64,
+        .arena = 16 * 1024,
+    });
+
+    // One small mask: the kind a row of text asks for on every frame.
+    const small = try cache.mask(font, 6, 8, .zero);
+    try std.testing.expect(small.pixels.len > 0);
+    var snapshot: [4096]u8 = undefined;
+    @memcpy(snapshot[0..small.pixels.len], small.pixels);
+
+    // Now drag a stream of display-size masks through the arena. These are the
+    // cold, rare, expensive ones; they must not be able to throw out the cheap
+    // hot ones to make room for themselves.
+    var ppem: u16 = 300;
+    while (ppem < 600) : (ppem += 1) {
+        _ = try cache.mask(font, 6, ppem, .zero);
+        _ = try cache.mask(font, 7, ppem, .zero);
+    }
+    try std.testing.expect(cache.stats.flushes > 0); // it really did give way
+
+    const mid = cache.stats;
+    const again = try cache.mask(font, 6, 8, .zero);
+    try std.testing.expectEqual(mid.misses, cache.stats.misses);
+    try std.testing.expectEqual(mid.hits + 1, cache.stats.hits);
+    try std.testing.expectEqualSlices(u8, snapshot[0..again.pixels.len], again.pixels);
+}
+
+test "evicting a class leaves the keys behind its holes findable" {
+    var fb: [2048]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fb, false));
+
+    var storage: [64 * 1024]u8 align(8) = undefined;
+    var cache = try Cache.init(&storage, .{
+        .slots = 64,
+        .max_points = 256,
+        .max_edges = 256,
+        .max_width = 64,
+        .arena = 16 * 1024,
+    });
+
+    // Small keys and big ones requested in turn, so their slots interleave and
+    // share probe chains -- which is exactly where a hole costs more than a
+    // miss: a lookup that stops at the hole reports a glyph it does not have,
+    // and the caller gets the WRONG mask rather than a slow one.
+    var ppem: u16 = 8;
+    while (ppem < 14) : (ppem += 1) {
+        _ = try cache.mask(font, 6, ppem, .zero);
+        _ = try cache.mask(font, 7, ppem * 40, .zero);
+    }
+    const smalls = [_]u16{ 8, 9, 10, 11, 12, 13 };
+    const before = cache.stats;
+
+    var storm: u16 = 300;
+    while (storm < 500) : (storm += 1) _ = try cache.mask(font, 6, storm, .zero);
+    try std.testing.expect(cache.stats.flushes > 0);
+
+    const mid = cache.stats;
+    for (smalls) |p| _ = try cache.mask(font, 6, p, .zero);
+    // Every small key is still there: no new rasterisations, all hits.
+    try std.testing.expectEqual(mid.misses, cache.stats.misses);
+    try std.testing.expectEqual(mid.hits + smalls.len, cache.stats.hits);
+    _ = before;
+}
+
+test "a dead slot keeps its probe chain walkable, an empty one ends it" {
+    var storage: [64 * 1024]u8 align(8) = undefined;
+    var cache = try Cache.init(&storage, .{ .slots = 16, .max_points = 256, .max_edges = 256, .max_width = 64, .arena = 16 * 1024 });
+
+    const gid: u16 = 42;
+    const sk: u32 = @bitCast(@as(f32, 0.25));
+    const n = cache.slots.len;
+    const start = cache.probeStart(gid, sk, .zero);
+    const near = start % n;
+    const under_test = (start + 1) % n;
+    const far = (start + 2) % n;
+
+    // A live neighbour first, so the only thing standing between the lookup
+    // and the key is the slot under test.
+    cache.slots[near] = .{ .gid = 1, .state = .live };
+    cache.slots[far] = .{ .gid = gid, .scale_key = sk, .phase = .zero, .state = .live };
+
+    // Evicted pixels: the chain has to walk over it.
+    cache.slots[under_test] = .{ .state = .dead };
+    try std.testing.expect(cache.find(gid, sk, .zero) != null);
+
+    // A slot that was never used ends the run: nothing is ever stored past one,
+    // so a lookup must stop rather than scan the rest of the table.
+    cache.slots[under_test] = .{ .state = .empty };
+    try std.testing.expect(cache.find(gid, sk, .zero) == null);
 }
 
 test "phase classes quantise to the nearest quarter pixel" {

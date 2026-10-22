@@ -1194,6 +1194,18 @@ pub const Font = struct {
         /// rewriting "fi" into one glyph and changing the width of a button.
         /// Kerning is geometry; substitution is spelling.
         substitute: bool = true,
+        /// A `Kern` resolved once and reused instead of rebuilt per call.
+        ///
+        /// Resolving means walking the feature list for `kern` and copying its
+        /// lookup indices -- a handful of milliseconds' worth of small scans
+        /// across a UI, but it happens once per string per FRAME, so it is
+        /// pure repetition. `Kern.init(mem, font, .{})` builds one; storage is
+        /// the caller's, as everywhere else here.
+        ///
+        /// A cache built from a DIFFERENT face is ignored, not trusted: its
+        /// lookup indices would be applied to this face's tables, and wrong
+        /// kerning is worse than slow kerning.
+        kern_cache: ?*const Kern = null,
         /// Apply pair kerning: the `kern` feature in GPOS, falling back to the
         /// legacy `kern` table when the face has no such feature.
         ///
@@ -1710,12 +1722,20 @@ pub const Font = struct {
         // are fixed size: a mark attaches to a base nearby, so a window gives
         // the same answer as the whole run except at a seam.
         var kern_buf: [kern_lookups]u16 = undefined;
-        const kp = if (opts.kern) Kern.initSlice(self, kern_buf[0..]) else Kern{ .font = self };
+        var own_kern: Kern = .{ .font = self };
+        var kp: *const Kern = &own_kern;
+        if (opts.kern) {
+            if (opts.kern_cache) |kc| {
+                if (kc.font.data.ptr == self.data.ptr) kp = kc else own_kern = Kern.initSlice(self, kern_buf[0..]);
+            } else {
+                own_kern = Kern.initSlice(self, kern_buf[0..]);
+            }
+        }
         var advs: [max_order]i32 = @splat(0);
         var off: usize = 0;
         while (off < len) {
             const cnt = @min(max_order, len - off);
-            self.runAdvances(out[off..][0..cnt], advs[0..cnt], &kp);
+            self.runAdvances(out[off..][0..cnt], advs[0..cnt], kp);
             if (opts.advances) |a| @memcpy(a[off..][0..cnt], advs[0..cnt]);
             if (place) |p| {
                 if (opts.direction == .ltr) penRelative(advs[0..cnt], p[off..][0..cnt]);
@@ -3047,7 +3067,15 @@ pub const Cache = struct {
         return null;
     }
 
-    fn reset(self: *Cache) void {
+    /// Back to cold: no entries, an empty arena, zeroed counters. Storage is
+    /// untouched, so this is cheap and repeatable.
+    ///
+    /// It exists because a cache's STARTING STATE is otherwise not something a
+    /// caller can name. A test that wants to observe misses has to know it
+    /// began cold -- and Elm's process-global test face is shared across a
+    /// whole test binary, so that assumption held only while no earlier test
+    /// happened to raster the same glyphs.
+    pub fn reset(self: *Cache) void {
         for (self.slots) |*s| s.state = .empty;
         self.class_used = @splat(0);
     }
@@ -5079,4 +5107,37 @@ test "a halfway instance rounds a delta half up, not away from zero" {
     try std.testing.expectEqual(@as(i32, 18), o.points[1].y);
     try std.testing.expectEqual(@as(i32, 56), o.points[2].x);
     try std.testing.expectEqual(@as(i32, 94), o.points[2].y);
+}
+
+test "a cached kern gives the same advances and refuses a foreign face" {
+    var buf: [65536]u8 = undefined;
+    const f = try Font.init(buildTestFont(&buf, false));
+
+    const text = "AVTo";
+    var cps: [8]u21 = undefined;
+    for (text, 0..) |ch, i| cps[i] = ch;
+
+    var a: [8]u16 = undefined;
+    var adv_a: [8]i32 = undefined;
+    _ = try f.shape(cps[0..text.len], a[0..], null, .{ .advances = adv_a[0..] });
+
+    var mem: [Kern.needed(.{})]u8 align(8) = undefined;
+    const cached = Kern.init(&mem, f, .{});
+    var b: [8]u16 = undefined;
+    var adv_b: [8]i32 = undefined;
+    _ = try f.shape(cps[0..text.len], b[0..], null, .{ .advances = adv_b[0..], .kern_cache = &cached });
+
+    try std.testing.expectEqualSlices(u16, a[0..text.len], b[0..text.len]);
+    try std.testing.expectEqualSlices(i32, adv_a[0..text.len], adv_b[0..text.len]);
+
+    // A cache built from a DIFFERENT face must be ignored rather than applied:
+    // its lookup indices address another font's tables.
+    var buf2: [65536]u8 = undefined;
+    const f2 = try Font.init(buildTestFont(&buf2, true));
+    var mem2: [Kern.needed(.{})]u8 align(8) = undefined;
+    const foreign = Kern.init(&mem2, f2, .{});
+    var c2: [8]u16 = undefined;
+    var adv_c: [8]i32 = undefined;
+    _ = try f.shape(cps[0..text.len], c2[0..], null, .{ .advances = adv_c[0..], .kern_cache = &foreign });
+    try std.testing.expectEqualSlices(i32, adv_a[0..text.len], adv_c[0..text.len]);
 }

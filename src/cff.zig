@@ -1062,33 +1062,39 @@ fn Elem(comptime T: type) type {
 pub fn flatten(segs: []const Segment, points: anytype, ends: anytype, tolerance: f32) Error!struct { points: []Elem(@TypeOf(points)), ends: []Elem(@TypeOf(ends)) } {
     var np: usize = 0;
     var ne: usize = 0;
-    var start: [2]f32 = .{ 0, 0 };
+    // First point index of the contour being built.
+    var start: usize = 0;
     var cur: [2]f32 = .{ 0, 0 };
     var open = false;
 
+    // `ends` holds the INDEX OF THE LAST POINT of each contour, inclusive --
+    // the convention the glyf decoder uses, because that is what the emitter
+    // downstream walks. Writing the count instead shifts every contour by one
+    // and the last one reads past the end of the buffer.
     for (segs) |s| {
         switch (s) {
             .move => |p| {
-                if (open) {
+                if (open and np > start) {
                     if (ne >= ends.len) return error.BufferTooSmall;
-                    ends[ne] = @intCast(np);
+                    ends[ne] = @intCast(np - 1);
                     ne += 1;
-                    open = false;
                 }
                 if (np >= points.len) return error.BufferTooSmall;
+                start = np;
                 points[np] = .{ .x = @intFromFloat(@round(p[0])), .y = @intFromFloat(@round(p[1])), .on = true };
                 np += 1;
-                start = p;
                 cur = p;
                 open = true;
             },
             .line => |p| {
+                if (!open) return error.Truncated;
                 if (np >= points.len) return error.BufferTooSmall;
                 points[np] = .{ .x = @intFromFloat(@round(p[0])), .y = @intFromFloat(@round(p[1])), .on = true };
                 np += 1;
                 cur = p;
             },
             .cubic => |c| {
+                if (!open) return error.Truncated;
                 var buf: [64]Segment = undefined;
                 var wn: usize = 0;
                 try flattenCubic(&buf, &wn, cur, .{ c[0], c[1] }, .{ c[2], c[3] }, .{ c[4], c[5] }, tolerance, 0);
@@ -1100,18 +1106,18 @@ pub fn flatten(segs: []const Segment, points: anytype, ends: anytype, tolerance:
                 cur = .{ c[4], c[5] };
             },
             .close => {
-                if (open) {
+                if (open and np > start) {
                     if (ne >= ends.len) return error.BufferTooSmall;
-                    ends[ne] = @intCast(np);
+                    ends[ne] = @intCast(np - 1);
                     ne += 1;
-                    open = false;
                 }
+                open = false;
             },
         }
     }
-    if (open) {
+    if (open and np > start) {
         if (ne >= ends.len) return error.BufferTooSmall;
-        ends[ne] = @intCast(np);
+        ends[ne] = @intCast(np - 1);
         ne += 1;
     }
     return .{ .points = points[0..np], .ends = ends[0..ne] };
@@ -1235,9 +1241,29 @@ test "flattening turns a contour into points and one end index" {
     const got = try flatten(&segs, pts[0..], ends[0..], 0.5);
     try expectEqual(@as(usize, 3), got.points.len);
     try expectEqual(@as(usize, 1), got.ends.len);
-    try expectEqual(@as(u16, 3), got.ends[0]);
+    // Inclusive last index, not a count: ends[0] == points.len - 1.
+    try expectEqual(@as(u16, 2), got.ends[0]);
     try expectEqual(@as(i32, 100), got.points[2].x);
     try expect(got.points[0].on);
+}
+
+test "two contours report two inclusive end indices" {
+    var segs = [_]Segment{
+        .{ .move = .{ 0, 0 } },
+        .{ .line = .{ 10, 0 } },
+        .close,
+        .{ .move = .{ 50, 50 } },
+        .{ .line = .{ 60, 50 } },
+        .{ .line = .{ 60, 60 } },
+        .close,
+    };
+    var pts: [16]Point = undefined;
+    var ends: [4]u16 = undefined;
+    const got = try flatten(&segs, pts[0..], ends[0..], 0.5);
+    try expectEqual(@as(usize, 5), got.points.len);
+    try expectEqual(@as(usize, 2), got.ends.len);
+    try expectEqual(@as(u16, 1), got.ends[0]);
+    try expectEqual(@as(u16, 4), got.ends[1]);
 }
 
 test "a curve flattens to more than one line and stays inside its hull" {

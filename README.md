@@ -1,6 +1,6 @@
 # GlyfZ
 
-A TrueType font parser and rasteriser for Zig 0.16. No allocator, glyph caching.
+A TrueType font parser and rasteriser for Zig 0.17. No allocator, glyph caching.
 
 ## Disclaimer
 

@@ -32,10 +32,13 @@
 //! a composite's components move with it. See `variations.zig`.
 //!
 //! Out of scope, deliberately: hinting (stb skips it, so unhinted is the bar),
-//! CFF2 -- the variable flavour of CFF; `glyf` variations are read, CFF2 is
-//! not --, any shaping beyond Arabic and Thai, COLRv1 (COLRv0 and CPAL are
-//! read), GPOS beyond pair adjustment, kern formats 2/3 and Apple's version 1
-//! layout, vertical layout, and Unicode normalisation or line breaking.
+//! COLRv1 (COLRv0 and CPAL are read), GPOS beyond pair adjustment, kern formats
+//! 2/3 and Apple's version 1 layout, vertical layout, and Unicode normalisation
+//! or line breaking.
+//!
+//! Two of those are ROADMAP rather than refused, and the README says what each
+//! needs: CFF2 (the variable flavour of CFF -- `glyf` variations are read, CFF2
+//! is not) and GSUB beyond Arabic and Thai.
 
 const std = @import("std");
 const cff = @import("cff.zig");
@@ -550,14 +553,6 @@ pub const Font = struct {
         return self.data[off..end];
     }
 
-    /// Pick a `cmap` subtable and return its format.
-    ///
-    /// The policy is deliberately the same one the previous backend used: walk
-    /// the encoding records in file order and let the last one we understand
-    /// win. Microsoft full-repertoire (3,10) beats Microsoft BMP (3,1) only
-    /// because a well-formed font lists it later. The alternative -- scoring
-    /// records -- would pick a different subtable on some fonts and move text
-    /// on a swap, for no gain.
     /// True when the font carries a `kern` table GlyfZ could read. An absent
     /// or malformed one is not an error -- kerning is decoration, and refusing
     /// an otherwise good font over it would be worse -- but it is REPORTABLE,
@@ -711,6 +706,14 @@ pub const Font = struct {
         }
     }
 
+    /// Pick a `cmap` subtable and return its format.
+    ///
+    /// The policy is deliberately the same one the previous backend used: walk
+    /// the encoding records in file order and let the last one we understand
+    /// win. Microsoft full-repertoire (3,10) beats Microsoft BMP (3,1) only
+    /// because a well-formed font lists it later. The alternative -- scoring
+    /// records -- would pick a different subtable on some fonts and move text
+    /// on a swap, for no gain.
     fn selectCmap(self: *Font) LoadError!u16 {
         const cm = try self.slice(self.cmap);
         const n = try u16At(cm, 2);
@@ -2812,8 +2815,13 @@ pub fn phaseOffset(p: Phase) f32 {
     return @as(f32, @floatFromInt(@intFromEnum(p))) * 0.25;
 }
 
-/// A rasterised glyph, owned by the cache. Valid until the cache fills up and
-/// flushes; blit it before asking for the next glyph.
+/// A rasterised glyph, owned by the cache.
+///
+/// The pixels stay valid until its SIZE CLASS is evicted or the whole cache is
+/// reset. A class eviction is not a flush: the slot table keeps every other
+/// class's entries, and the evicted class's arena bytes are handed out again,
+/// so a `Mask` held across it can come back pointing at some other glyph. Blit
+/// it before asking for the next glyph.
 pub const Mask = struct {
     w: u32 = 0,
     h: u32 = 0,
@@ -2829,12 +2837,15 @@ pub const Mask = struct {
 /// the caller decides the size once, from `needed()`, and this carves that into
 /// the slot table, the outline scratch and the pixel arena.
 ///
-/// The arena is a bump allocator and the policy when it fills is to drop
-/// everything. Reclaiming a dead mask from the middle of a bump region is not
-/// possible without a compaction pass, and a compaction pass costs more than
-/// re-rasterising a working set that did not fit in the first place. If the
-/// flush count is high, the buffer is too small -- that is the signal to look
-/// at, and it is reported rather than hidden.
+/// The arena is partitioned into size classes, and each class is its own bump
+/// region. When a class cannot fit the next mask, THAT CLASS is evicted -- its
+/// slots are marked dead and its region starts over -- while the other classes
+/// keep their pixels. Dropping all four would throw away three working sets to
+/// make room in one. Reclaiming a dead mask from the middle of a bump region is
+/// not possible without a compaction pass, and a compaction pass costs more
+/// than re-rasterising a working set that did not fit in the first place. If
+/// the flush count is high, the buffer is too small -- that is the signal to
+/// look at, and it is reported rather than hidden.
 pub const Cache = struct {
     pub const Options = struct {
         slots: u16 = 512,
@@ -3092,8 +3103,11 @@ pub const Cache = struct {
         return null;
     }
 
-    /// Back to cold: no entries, an empty arena, zeroed counters. Storage is
-    /// untouched, so this is cheap and repeatable.
+    /// Back to cold: every slot empty and every class's region abandoned, so
+    /// the arena starts allocating from zero again. `stats` is NOT touched --
+    /// the counters are a running total across resets, which is what makes a
+    /// high flush count visible at all. Storage is untouched, so this is cheap
+    /// and repeatable.
     ///
     /// It exists because a cache's STARTING STATE is otherwise not something a
     /// caller can name. A test that wants to observe misses has to know it
@@ -3137,8 +3151,6 @@ pub const Cache = struct {
 /// algorithm -- a dozen scattered `u16` reads across a multi-KB segment array
 /// is simply more memory traffic than a 8 KB table that stays resident.
 ///
-/// Same contract as `Cache`: the caller owns the memory, there is no
-/// allocator, and `init` carves one buffer.
 /// Pair kerning with the feature's lookups resolved once, instead of rebuilt
 /// per query the way `Font.pairAdjust` has to.
 ///
@@ -3216,6 +3228,8 @@ pub const Kern = struct {
     }
 };
 
+/// Same contract as `Cache`: the caller owns the memory, there is no
+/// allocator, and `init` carves one buffer.
 pub const Lookup = struct {
     pub const Options = struct {
         /// A power of two divides evenly; anything else costs a modulo per
@@ -3560,7 +3574,7 @@ fn patchRec(buf: []u8, rec: usize, t: u32, off: usize, len: usize) void {
 /// and the format-12 map, when present, remaps 'A'..'B' to gid 1..2 and puts
 /// U+1F600 at gid 7 so a codepoint above the BMP is covered.
 fn buildTestFont(buf: []u8, with_fmt12: bool) []const u8 {
-    return buildTestFontImpl(buf, with_fmt12, false);
+    return buildTestFontImpl(buf, with_fmt12, false, .none);
 }
 
 /// The same 8-glyph face plus `fvar`, `avar` and `gvar`: one weight axis
@@ -3569,11 +3583,37 @@ fn buildTestFont(buf: []u8, with_fmt12: bool) []const u8 {
 /// SHORT offsets on purpose -- every real font big enough to matter ships long
 /// ones, and that hid a wrong index stride here for the whole of Inter.
 fn buildVarTestFont(buf: []u8) []const u8 {
-    return buildTestFontImpl(buf, false, true);
+    return buildTestFontImpl(buf, false, true, .none);
 }
 
-fn buildTestFontImpl(buf: []u8, with_fmt12: bool, comptime with_var: bool) []const u8 {
-    const ntables: usize = if (with_var) 11 else 8;
+/// The same 8-glyph face plus a well-formed but EMPTY `GSUB`: no scripts, no
+/// features, no lookups, so nothing substitutes. It exists because an empty
+/// `gsub_span` makes `shapeArabic` and `shapeThai` return before their placement
+/// path, which left that code with no way to be tested at all.
+/// What the fixture's `GSUB` contains.
+const GsubKind = enum {
+    /// No GSUB table at all.
+    none,
+    /// A header with three empty lists: loads, substitutes nothing.
+    empty,
+    /// One `ccmp` lookup that turns gid 0 into gid 1 followed by gid 2, so a
+    /// substitution really does LENGTHEN the run.
+    subst,
+};
+
+/// The same face with a `ccmp` lookup under `arab` and `thai` that expands one
+/// glyph into two. `shapeArabic` and `shapeThai` apply `ccmp` unconditionally,
+/// so both reach it.
+fn buildSubstTestFont(buf: []u8) []const u8 {
+    return buildTestFontImpl(buf, false, false, .subst);
+}
+
+fn buildGsubTestFont(buf: []u8) []const u8 {
+    return buildTestFontImpl(buf, false, false, .empty);
+}
+
+fn buildTestFontImpl(buf: []u8, with_fmt12: bool, comptime with_var: bool, comptime gsub: GsubKind) []const u8 {
+    const ntables: usize = 8 + (if (with_var) 3 else 0) + (if (gsub != .none) 1 else 0);
     var w = W{ .buf = buf };
 
     w.u32v(0x0001_0000); // sfnt version
@@ -3832,6 +3872,114 @@ fn buildTestFontImpl(buf: []u8, with_fmt12: bool, comptime with_var: bool) []con
         w.zeros(1); // pad: short offsets count in two byte units
         tags[nrec] = tag_gvar;
         recs[nrec] = .{ .at = gvar_start, .len = w.at - gvar_start };
+        nrec += 1;
+    }
+
+    if (gsub == .empty) {
+        // --- GSUB: header and three empty lists ---
+        //
+        // `Layout.init` resolves each list offset through `inside`, which wants
+        // four readable bytes at the offset, so the smallest table that loads is
+        // 20 bytes: 10 header, 2+2+2 of counts, 4 of pad.
+        const gsub_start = w.at;
+        w.u32v(0x0001_0000); // version 1.0
+        w.u16v(10); // scriptListOffset
+        w.u16v(12); // featureListOffset
+        w.u16v(14); // lookupListOffset
+        w.u16v(0); // ScriptList: scriptCount
+        w.u16v(0); // FeatureList: featureCount
+        w.u16v(0); // LookupList: lookupCount
+        w.zeros(4); // pad for `inside`
+        tags[nrec] = tag_gsub;
+        recs[nrec] = .{ .at = gsub_start, .len = w.at - gsub_start };
+        nrec += 1;
+    }
+
+    if (gsub == .subst) {
+        // --- GSUB: arab + thai, one ccmp feature, one type 2 lookup ---
+        //
+        // Type 2 (multiple substitution) is the one lookup type that makes the
+        // run LONGER, which is what the placement guard's `len` has to follow.
+        // Offsets are all relative to the start of the structure they belong
+        // to, so each one is patched once the target is written.
+        const g = w.at;
+        w.u32v(0x0001_0000); // version 1.0
+        const sl_at = w.at;
+        w.u16v(0); // scriptListOffset, patched
+        const fl_at = w.at;
+        w.u16v(0); // featureListOffset, patched
+        const ll_at = w.at;
+        w.u16v(0); // lookupListOffset, patched
+
+        // ScriptList: two scripts, both pointing at the same LangSys shape.
+        const sl = w.at;
+        w16(buf[0..], sl_at, @intCast(sl - g));
+        w.u16v(2); // scriptCount
+        const rec_arab = w.at;
+        w.u32v(tag("arab"));
+        w.u16v(0); // scriptOffset, patched
+        const rec_thai = w.at;
+        w.u32v(tag("thai"));
+        w.u16v(0); // scriptOffset, patched
+        const script_arab = w.at;
+        w16(buf[0..], rec_arab + 4, @intCast(script_arab - sl));
+        w.u16v(4); // defaultLangSysOffset: the LangSys follows the two counts
+        w.u16v(0); // langSysCount
+        // LangSys
+        w.u16v(0); // lookupOrder
+        w.u16v(0xFFFF); // requiredFeatureIndex: none
+        w.u16v(1); // featureIndexCount
+        w.u16v(0); // featureIndices[0]
+        // The Thai script reuses the arab one by offset: same feature set.
+        w16(buf[0..], rec_thai + 4, @intCast(script_arab - sl));
+
+        // FeatureList: ccmp -> lookup 0.
+        const fl = w.at;
+        w16(buf[0..], fl_at, @intCast(fl - g));
+        w.u16v(1); // featureCount
+        w.u32v(tag("ccmp"));
+        const feat_off_at = w.at;
+        w.u16v(0); // featureOffset, patched
+        const feat = w.at;
+        w16(buf[0..], feat_off_at, @intCast(feat - fl));
+        w.u16v(0); // featureParams
+        w.u16v(1); // lookupIndexCount
+        w.u16v(0); // lookupListIndices[0]
+
+        // LookupList: one type 2 lookup.
+        const ll = w.at;
+        w16(buf[0..], ll_at, @intCast(ll - g));
+        w.u16v(1); // lookupCount
+        const look_off_at = w.at;
+        w.u16v(0); // lookupOffset, patched
+        const look = w.at;
+        w16(buf[0..], look_off_at, @intCast(look - ll));
+        w.u16v(2); // lookupType: multiple substitution
+        w.u16v(0); // lookupFlag
+        w.u16v(1); // subTableCount
+        const sub_off_at = w.at;
+        w.u16v(0); // subtableOffset, patched
+        const sub = w.at;
+        w16(buf[0..], sub_off_at, @intCast(sub - look));
+        w.u16v(1); // substFormat 1
+        const cov_off_at = w.at;
+        w.u16v(0); // coverageOffset, patched
+        w.u16v(1); // sequenceCount
+        const seq_off_at = w.at;
+        w.u16v(0); // sequenceOffset[0], patched
+        const cov = w.at;
+        w16(buf[0..], cov_off_at, @intCast(cov - sub));
+        w.u16v(1); // coverageFormat 1
+        w.u16v(1); // glyphCount
+        w.u16v(0); // the glyph Arabic text maps to in this face: gid 0
+        const seq = w.at;
+        w16(buf[0..], seq_off_at, @intCast(seq - sub));
+        w.u16v(2); // glyphCount: one glyph becomes two
+        w.u16v(1);
+        w.u16v(2);
+
+        tags[nrec] = tag_gsub;
+        recs[nrec] = .{ .at = g, .len = w.at - g };
         nrec += 1;
     }
 
@@ -4521,6 +4669,56 @@ test "a placement or advance buffer shorter than the run is refused, not written
     var adv: [4]i32 = undefined;
     const n = try font.shape(&cps, &out, &place, .{ .advances = &adv });
     try std.testing.expect(n > 0 and n <= 4);
+}
+
+test "the Arabic and Thai placement paths check their buffer too" {
+    var fbuf: [2048]u8 = undefined;
+    const font = try Font.init(buildGsubTestFont(&fbuf));
+
+    // Non-vacuity: both functions return EARLY when there is no GSUB, so
+    // without this the test would pass while never reaching the code it names.
+    try std.testing.expect(font.gsub_span.len != 0);
+
+    const cps = [_]u21{ 0x0645, 0x062D, 0x0645, 0x062F };
+    var out: [4]u16 = @splat(0);
+
+    var short: [1]opentype.Offset = undefined;
+    try std.testing.expectError(error.BufferTooSmall, font.shapeArabic(&cps, &out, &short));
+    try std.testing.expectError(error.BufferTooSmall, font.shapeThai(&cps, &out, &short));
+
+    // A buffer the size of the run is accepted: the empty GSUB substitutes
+    // nothing, so the shaped length is the input length.
+    var full: [4]opentype.Offset = @splat(.{});
+    try std.testing.expectEqual(@as(usize, 4), try font.shapeArabic(&cps, &out, &full));
+    try std.testing.expectEqual(@as(usize, 4), try font.shapeThai(&cps, &out, &full));
+}
+
+test "a substitution that lengthens the run is what the placement check follows" {
+    var fbuf: [2048]u8 = undefined;
+    const font = try Font.init(buildSubstTestFont(&fbuf));
+    try std.testing.expect(font.gsub_span.len != 0);
+
+    // One codepoint, and its glyph is covered by a type 2 lookup that turns it
+    // into two glyphs. A buffer with ONE slot therefore still has to be refused:
+    // checking `place.len` against the codepoint count, or against `out.len`,
+    // would both let this through and write a second slot past the end.
+    const cps = [_]u21{0x0645};
+    var out: [4]u16 = @splat(0);
+
+    var one: [1]opentype.Offset = undefined;
+    try std.testing.expectError(error.BufferTooSmall, font.shapeArabic(&cps, &out, &one));
+    try std.testing.expectError(error.BufferTooSmall, font.shapeThai(&cps, &out, &one));
+
+    // Two slots take it, and the sequence is the one the lookup named.
+    var two: [2]opentype.Offset = @splat(.{});
+    try std.testing.expectEqual(@as(usize, 2), try font.shapeArabic(&cps, &out, &two));
+    try std.testing.expectEqual(@as(u16, 1), out[0]);
+    try std.testing.expectEqual(@as(u16, 2), out[1]);
+
+    out = @splat(0);
+    try std.testing.expectEqual(@as(usize, 2), try font.shapeThai(&cps, &out, &two));
+    try std.testing.expectEqual(@as(u16, 1), out[0]);
+    try std.testing.expectEqual(@as(u16, 2), out[1]);
 }
 
 test "a subset drops the outlines it was not given" {

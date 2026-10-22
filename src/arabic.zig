@@ -230,6 +230,67 @@ pub fn joiningType(cp: u21) Joining {
 
 /// The contextual form a letter takes. `none` means "no substitution", which
 /// is what an isolated letter or a non-Arabic codepoint gets.
+/// Canonical combining class (Unicode `ccc`) for the marks Arabic actually
+/// uses. Zero means "not a reorderable mark": a base letter, a tatweel, or a
+/// character from a block this table does not cover.
+///
+/// This is not the full Unicode property. It covers the Arabic block's marks
+/// (064B..0670, 06D6..06ED) and the Arabic signs (0610..061A), which is every
+/// mark a font can put on Arabic text. A character outside it sorts as a base,
+/// so an uncovered mark keeps its written order instead of being moved by a
+/// guessed class.
+pub fn combiningClass(cp: u21) u8 {
+    return switch (cp) {
+        0x064B => 27, // fathatan
+        0x064C => 28, // dammatan
+        0x064D => 29, // kasratan
+        0x064E => 30, // fatha
+        0x064F => 31, // damma
+        0x0650 => 32, // kasra
+        0x0651 => 33, // shadda
+        0x0652 => 34, // sukun
+        0x0653, 0x0654, 0x0657, 0x0658, 0x0659, 0x065A, 0x065B, 0x065D, 0x065E => 230,
+        0x0655, 0x0656, 0x065C, 0x065F => 220,
+        0x0670 => 35, // superscript alef
+        0x0610... 0x061A => 230,
+        0x06D6... 0x06DC => 230,
+        0x06DF... 0x06E2 => 230,
+        0x06E3 => 220,
+        0x06E4 => 230,
+        0x06E7, 0x06E8 => 230,
+        0x06EA => 220,
+        0x06EB, 0x06EC => 230,
+        0x06ED => 220,
+        else => 0,
+    };
+}
+
+/// Put combining marks in canonical order: a stable sort by combining class,
+/// inside each run bounded by anything of class 0. Two marks on one letter
+/// written shadda-then-fatha are stored fatha-last whatever order they were
+/// typed in, which decides which of them stacks on the other.
+///
+/// HarfBuzz does this as part of normalisation, before a single lookup runs,
+/// and a shaper that skips it disagrees with every HarfBuzz render of the most
+/// ordinary Arabic word. The sort is insertion sort because it is stable by
+/// construction and n here is the length of one word.
+pub fn canonicalOrder(cps: []u21) void {
+    var i: usize = 1;
+    while (i < cps.len) : (i += 1) {
+        const cls = combiningClass(cps[i]);
+        if (cls == 0) continue;
+        var j = i;
+        while (j > 0) {
+            const prev = combiningClass(cps[j - 1]);
+            if (prev == 0 or prev <= cls) break;
+            const tmp = cps[j - 1];
+            cps[j - 1] = cps[j];
+            cps[j] = tmp;
+            j -= 1;
+        }
+    }
+}
+
 pub const Form = enum { none, isolated, initial, medial, final };
 
 /// The form of each codepoint, given its neighbours. Writes at most
@@ -358,4 +419,33 @@ test "a short buffer truncates instead of overrunning" {
     try std.testing.expectEqual(@as(usize, 2), f.len);
     try std.testing.expectEqual(Form.initial, f[0]);
     try std.testing.expectEqual(Form.medial, f[1]);
+}
+
+test "marks sort into canonical order inside a letter" {
+    // fatha (30) then fathatan (27): the lighter class goes first.
+    var a = [_]u21{ 0x0644, 0x064E, 0x064B };
+    canonicalOrder(&a);
+    try std.testing.expectEqualSlices(u21, &[_]u21{ 0x0644, 0x064B, 0x064E }, &a);
+}
+
+test "canonical order does not move marks across a letter" {
+    // Two letters, each with a mark: leh fatha, then lam kasra. Sorting must
+    // stay inside each cluster, or a mark ends up on the wrong letter.
+    var a = [_]u21{ 0x0647, 0x064E, 0x0644, 0x0650 };
+    canonicalOrder(&a);
+    try std.testing.expectEqualSlices(u21, &[_]u21{ 0x0647, 0x064E, 0x0644, 0x0650 }, &a);
+}
+
+test "an equal class keeps the written order" {
+    // shadda (33) then sukun (34) is already sorted; sukun then shadda is not.
+    var a = [_]u21{ 0x0644, 0x0652, 0x0651 };
+    canonicalOrder(&a);
+    try std.testing.expectEqualSlices(u21, &[_]u21{ 0x0644, 0x0651, 0x0652 }, &a);
+}
+
+test "an uncovered mark keeps its written place" {
+    // 0x0640 tatweel has no class, so nothing crosses it.
+    var a = [_]u21{ 0x0644, 0x0652, 0x0640, 0x0651 };
+    canonicalOrder(&a);
+    try std.testing.expectEqualSlices(u21, &[_]u21{ 0x0644, 0x0652, 0x0640, 0x0651 }, &a);
 }

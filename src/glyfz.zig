@@ -294,6 +294,10 @@ pub fn outlineBounds(o: Outline) Box {
 /// Composite glyphs are inlined; eight is more nesting than any real font
 /// uses and stops a malformed one from recursing forever.
 pub const max_composite_depth = 8;
+/// Longest run `shapeArabic` will canonically reorder. Past this the text is
+/// shaped in written order rather than silently reordered in part -- the same
+/// bounded-buffer policy the lookup machinery uses.
+pub const max_order = 128;
 
 /// Composite component flag 0x0200: this component's metrics are the
 /// composite's metrics. It is how a font builds e.g. "a with acute" so the
@@ -945,10 +949,27 @@ pub const Font = struct {
     /// GSUB type 6 exists.
     pub fn shapeArabic(self: Font, cps: []const u21, out: []u16, place: ?[]opentype.Offset) GlyphError!usize {
         const n = @min(cps.len, out.len);
-        for (cps[0..n], out[0..n]) |cp, *g| g.* = self.glyphIndex(cp) catch 0;
+        // Canonical order first, on the CODEPOINTS, because it is a property of
+        // the text and not of the font: two marks on one letter sort by
+        // combining class before any lookup runs, which is what HarfBuzz does
+        // during normalisation. Reorder the glyphs instead and the joining-form
+        // loop would read a different character than the slot it applies to.
+        var ordered: [max_order]u21 = undefined;
+        var src: []const u21 = cps[0..n];
+        if (n <= max_order) {
+            @memcpy(ordered[0..n], cps[0..n]);
+            arabic.canonicalOrder(ordered[0..n]);
+            src = ordered[0..n];
+        }
+        for (src, out[0..n]) |cp, *g| g.* = self.glyphIndex(cp) catch 0;
         if (n == 0 or self.gsub_span.len == 0) return n;
 
         var l = opentype.Layout.init(self.data, self.gsub_span.off, self.gsub_span.len) catch return n;
+        // Which ligature component each slot followed. Ligature substitution
+        // fills this in and mark-to-ligature reads it back, because by then the
+        // components themselves are one glyph and nothing else remembers them.
+        var comps_of: [max_order]u8 = @splat(0xFF);
+        l.lig = comps_of[0..];
         // Marks are transparent to matching when a lookup asks for it, which is
         // what lets lam-alef form across a fatha WITHOUT eating the fatha.
         if (self.gdef_span.len != 0) l.gdef = opentype.Gdef.init(self.data, self.gdef_span.off, self.gdef_span.len) catch null;
@@ -959,7 +980,7 @@ pub const Font = struct {
         // substitution earlier in the run cannot move a neighbour's form.
         var i: usize = 0;
         while (i < len and i < n) : (i += 1) {
-            const feat = switch (arabic.formAt(cps[0..n], i)) {
+            const feat = switch (arabic.formAt(src, i)) {
                 .isolated => opentype.tag("isol"),
                 .initial => opentype.tag("init"),
                 .medial => opentype.tag("medi"),
@@ -986,7 +1007,9 @@ pub const Font = struct {
         if (place) |p| {
             @memset(p[0..len], .{});
             if (self.gpos_span.len != 0) {
-                if (opentype.Layout.init(self.data, self.gpos_span.off, self.gpos_span.len)) |gp| {
+                if (opentype.Layout.init(self.data, self.gpos_span.off, self.gpos_span.len)) |gp_init| {
+                    var gp = gp_init;
+                    gp.lig = comps_of[0..];
                     _ = gp.markAttach(arab, opentype.tag("mark"), out[0..len], len, p) catch 0;
                     _ = gp.markAttach(arab, opentype.tag("mkmk"), out[0..len], len, p) catch 0;
                 } else |_| {}

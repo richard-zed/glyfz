@@ -99,6 +99,10 @@ pub fn valueSize(vf: u16) usize {
 /// One GPOS or GSUB table, addressed over the caller's font bytes.
 pub const Layout = struct {
     data: []const u8,
+    /// One component index per buffer slot: which ligature component this
+    /// glyph followed, 0xFF when it followed none. Written by ligature
+    /// substitution because mark-to-ligature is the only reader.
+    lig: ?[]u8 = null,
     gdef: ?Gdef = null,
     script_list: usize,
     feature_list: usize,
@@ -592,6 +596,8 @@ pub const Layout = struct {
                 }
                 if (kind == 4) {
                     placed += try self.markBaseSub(sub, buf, len, out);
+                } else if (kind == 5) {
+                    placed += try self.markLigSub(sub, buf, len, out);
                 } else if (kind == 6) {
                     placed += try self.markMarkSub(sub, buf, len, out);
                 }
@@ -633,6 +639,32 @@ pub const Layout = struct {
             }
             const mi2 = under orelse continue;
 
+            // Two marks stack only if they sit on the SAME component of the
+            // same ligature. HarfBuzz enforces this with a ligature id plus a
+            // component index; the component alone is enough here, because the
+            // walk above cannot cross a letter. Without it a damma written after
+            // lam-lam-heh stacked onto the fatha over the SECOND lam and both
+            // got dragged to the first lam's anchor -- which is how a
+            // mark-to-ligature placement that had just succeeded was thrown away.
+            if (self.lig) |lg| {
+                const a: u8 = if (i < lg.len) lg[i] else 0xFF;
+                const b: u8 = if (j < lg.len) lg[j] else 0xFF;
+                if (a != b) continue;
+            }
+
+            // Two marks stack only if they sit on the SAME component of the
+            // same ligature. HarfBuzz enforces this with a ligature id plus a
+            // component index; the component alone is enough here, because the
+            // walk above cannot cross a letter. Without this, a damma written
+            // after lam-lam-heh stack onto the fatha over the SECOND lam and
+            // both get dragged to the first lam's anchor -- which is how the
+            // mark-to-ligature placement that just succeeded got thrown away.
+            if (self.lig) |lg| {
+                const a: u8 = if (i < lg.len) lg[i] else 0xFF;
+                const b: u8 = if (j < lg.len) lg[j] else 0xFF;
+                if (a != b) continue;
+            }
+
             const cls = try u16At(self.data, mark1_array + 2 + @as(usize, mi) * 4);
             if (cls >= class_count) continue;
             const mark1_anchor = mark1_array + try u16At(self.data, mark1_array + 2 + @as(usize, mi) * 4 + 2);
@@ -644,6 +676,71 @@ pub const Layout = struct {
             const bx = try i16At(self.data, mark1_anchor + 2);
             const by = try i16At(self.data, mark1_anchor + 4);
             out[i] = .{ .x = out[j].x + (ax - bx), .y = out[j].y + (ay - by) };
+            placed += 1;
+        }
+        return placed;
+    }
+
+    /// GPOS type 5, mark-to-ligature. A mark over a ligature anchors to the
+    /// anchor drawn for the COMPONENT it belongs to, not to one anchor for the
+    /// whole ligature -- which is why a fatha on lam-alef sits where the alef
+    /// left room instead of at the join.
+    ///
+    /// WHICH component comes from ligature formation, which records one index
+    /// per surviving slot (`Layout.lig`). A mark written between two components
+    /// attaches to the one it followed -- the reason lam-lam-heh puts its fatha
+    /// over the second lam and not over the heh. Where no record exists, the
+    /// mark takes the LAST component, which is HarfBuzz's own fallback when its
+    /// ligature ids do not match.
+    fn markLigSub(self: Layout, sub: usize, buf: []const u16, len: usize, out: []Offset) Error!usize {
+        if (try u16At(self.data, sub) != 1) return 0;
+        const mark_cov = sub + try u16At(self.data, sub + 2);
+        const lig_cov = sub + try u16At(self.data, sub + 4);
+        const class_count = try u16At(self.data, sub + 6);
+        const mark_array = sub + try u16At(self.data, sub + 8);
+        const lig_array = sub + try u16At(self.data, sub + 10);
+        const lig_count = try u16At(self.data, lig_array);
+
+        var placed: usize = 0;
+        var i: usize = 0;
+        while (i < len) : (i += 1) {
+            const mi = (try self.coverageIndex(mark_cov, buf[i])) orelse continue;
+            // Walk back to the ligature: other marks may sit between them.
+            var j = i;
+            var lig_index: ?u16 = null;
+            while (j > 0) {
+                j -= 1;
+                if ((try self.coverageIndex(mark_cov, buf[j])) != null) continue;
+                lig_index = try self.coverageIndex(lig_cov, buf[j]);
+                break;
+            }
+            const li = lig_index orelse continue;
+            if (li >= lig_count) continue;
+
+            // MarkRecord: class, then the anchor offset within MarkArray.
+            const cls = try u16At(self.data, mark_array + 2 + @as(usize, mi) * 4);
+            if (cls >= class_count) continue;
+            const mark_anchor = mark_array + try u16At(self.data, mark_array + 2 + @as(usize, mi) * 4 + 2);
+
+            // LigatureAttach: one row per component, one anchor per class in
+            // each row, offsets from the LigatureAttach itself.
+            const att = lig_array + try u16At(self.data, lig_array + 2 + @as(usize, li) * 2);
+            const comp_count = try u16At(self.data, att);
+            if (comp_count == 0) continue;
+            const recorded: u8 = if (self.lig) |lg| (if (i < lg.len) lg[i] else 0xFF) else 0xFF;
+            const comp: u16 = if (recorded == 0xFF or recorded >= comp_count)
+                comp_count - 1
+            else
+                recorded;
+            const anchor_off = try u16At(self.data, att + 2 + (@as(usize, comp) * class_count + cls) * 2);
+            if (anchor_off == 0) continue;
+            const lig_anchor = att + anchor_off;
+
+            const bx = try i16At(self.data, lig_anchor + 2);
+            const by = try i16At(self.data, lig_anchor + 4);
+            const mx = try i16At(self.data, mark_anchor + 2);
+            const my = try i16At(self.data, mark_anchor + 4);
+            out[i] = .{ .x = bx - mx, .y = by - my };
             placed += 1;
         }
         return placed;
@@ -835,6 +932,9 @@ pub const Layout = struct {
                     }
                     if (got != comps) continue;
                     buf[pos] = lig_glyph;
+                    if (self.lig) |lg| {
+                        if (pos < lg.len) lg[pos] = 0;
+                    }
                     // Keep everything that was not consumed as a component, so
                     // the stepped-over marks survive in order after the ligature.
                     var write = pos + 1;
@@ -850,6 +950,21 @@ pub const Layout = struct {
                         }
                         if (consumed) continue;
                         buf[write] = buf[r];
+                        // Remember WHICH component this glyph followed. That is
+                        // the whole of what mark-to-ligature needs to pick the
+                        // anchor the designer drew under this mark, and it is
+                        // knowledge that exists only here: once the components
+                        // are gone nothing on the buffer still names them.
+                        if (self.lig) |lg| {
+                            if (write < lg.len) {
+                                var done: u8 = 1; // component 0 sits at `pos`
+                                var k: usize = 1;
+                                while (k < comps) : (k += 1) {
+                                    if (positions[k] < r) done += 1;
+                                }
+                                lg[write] = done - 1;
+                            }
+                        }
                         write += 1;
                     }
                     return .{ .hit = true, .len = write, .advance = 1 };

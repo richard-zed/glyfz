@@ -1073,7 +1073,15 @@ pub const Font = struct {
         len = l.applyFeature(arab, opentype.tag("ccmp"), out, len) catch len;
         len = l.applyFeature(arab, opentype.tag("locl"), out, len) catch len;
 
-        for ([_]u32{ opentype.tag("rlig"), opentype.tag("calt"), opentype.tag("liga") }) |feat| {
+        // `liga` is deliberately absent. DejaVu puts the Arabic PRESENTATION
+        // FORMS under `liga` (uni0640 + uni064B -> uniFE71), and HarfBuzz's
+        // arab shaper never enables that feature -- across 924 mark sequences
+        // it forms no tatweel+mark ligature at all, though it does form the
+        // mark-consuming ones in rlig (`0621 0651` -> 6017). Enabling liga
+        // here fused 11 cases into glyphs nobody renders, while leaving the
+        // rlig ligatures intact: they are a different feature, not a
+        // different mark rule.
+        for ([_]u32{ opentype.tag("rlig"), opentype.tag("calt") }) |feat| {
             len = l.applyFeature(arab, feat, out, len) catch len;
         }
 

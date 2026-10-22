@@ -265,8 +265,8 @@ pub fn combiningClass(cp: u21) u8 {
         // 103 above-vowels below 107 tone marks, so a tone written over an
         // upper vowel keeps that order and the stack is drawn the way the
         // font's anchors assume.
-        0x0E34... 0x0E3A => 103,
-        0x0E48... 0x0E4B => 107,
+        0x0E34...0x0E3A => 103,
+        0x0E48...0x0E4B => 107,
         else => 0,
     };
 }

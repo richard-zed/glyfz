@@ -209,9 +209,19 @@ of three interleaved runs): 22.9 ns/hit at 11px, 15.2 at 16px, 13.4 at 24px,
 One regression is worth recording because it is easy to reintroduce.
 `Font.variationId` used to take the font **by value** while running on every
 cache hit; `Font` carries thirteen spans, so each hit copied it. Hits were 39%
-to 152% slower than the 0.2.x line before that was found. A method that runs per
-glyph or per hit takes `*const Font`, and one that runs once per codepoint does
-not need to.
+to 152% slower than the 0.2.x line before that was found.
+
+The rule is narrower than that: the copy only bites where it survives the
+optimiser, which is a method called per hit inside the hot loop. The decode
+chain (`bitmapBox`, `edgesInto`, `outline`, `headerBox`) still takes `Font` by
+value deliberately -- converting all nine signatures to `*const Font` was
+measured and did not help: ReleaseFast decode came out
+668.8/445.9/422.9/344.1/321.6 ns against 654.1/450.6/420.8/368.4/351.5
+unpatched, flat and slightly worse at 11px. Debug pays either way, because
+nothing is elided there: the same delta is ~197 ns/glyph in Debug against ~46
+ns at ReleaseFast. The rest of the gap to 0.2.x decode is added per-glyph
+work, not copies, and it is small in context -- end to end at 48px the
+rasterise moved 4821 to 4906 ns (+1.8%).
 
 `zig build bench -Doptimize=ReleaseFast -Dfont=<ttf>` reproduces the raster,
 decode and cache columns, and nothing else, since there is no second

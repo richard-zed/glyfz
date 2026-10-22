@@ -282,10 +282,18 @@ fn iupContour(
             inline for (.{ true, false }) |is_x| {
                 const src: []const f32 = if (is_x) xs else ys;
                 const dst: []f32 = if (is_x) dx else dy;
+                // A point outside its two references' coordinates takes the
+                // NEARER reference's delta. Extrapolating instead reaches
+                // values neither reference has, which is not what a hinted
+                // outline going through the same positions does.
                 dst[m] = if (src[b] == src[a])
                     dst[a]
-                else
-                    dst[a] + (src[m] - src[a]) / (src[b] - src[a]) * (dst[b] - dst[a]);
+                else blk: {
+                    const frac = (src[m] - src[a]) / (src[b] - src[a]);
+                    if (frac <= 0) break :blk dst[a];
+                    if (frac >= 1) break :blk dst[b];
+                    break :blk dst[a] + frac * (dst[b] - dst[a]);
+                };
             }
         }
         pos += step;

@@ -1762,9 +1762,22 @@ pub const Font = struct {
     /// Simple glyphs only. A composite's point numbers are its component
     /// records and its deltas move those offsets, which
     /// applies before the component's transform.
-    fn varyOutline(self: Font, gid: u16, pts: []Point, contour_ends: []const u16) void {
+    /// `contour_ends` arrives as ABSOLUTE indices into the caller's flattened
+    /// point buffer; `base` is where this glyph's points start. gvar's intervals
+    /// are glyph-local, so rebase before handing them to the variation engine --
+    /// without this a component varies against its parent's point numbering.
+    fn varyOutline(self: Font, gid: u16, base: usize, pts: []Point, contour_ends: []const u16) void {
         if (self.n_coords == 0 or self.gvar_span.len == 0 or pts.len == 0) return;
         if (pts.len > variations.max_points) return;
+        if (contour_ends.len > variations.max_points) return;
+
+        var rel_ends: [variations.max_points]u16 = undefined;
+        for (contour_ends, 0..) |e, i| {
+            const abs: usize = e;
+            if (abs < base) return;
+            rel_ends[i] = @intCast(abs - base);
+        }
+        const ends = rel_ends[0..contour_ends.len];
 
         var xs: [variations.max_points]f32 = undefined;
         var ys: [variations.max_points]f32 = undefined;
@@ -1784,7 +1797,7 @@ pub const Font = struct {
             self.coords[0..self.n_coords],
             gid,
             n,
-            contour_ends,
+            ends,
             xs[0..n],
             ys[0..n],
             dx[0..n],
@@ -2162,7 +2175,7 @@ fn decodeInto(self: Font, gid: u16, cur: *Cursor, depth: u32) GlyphError!void {
         // Vary here rather than at the top of `outline`, because a composite's
         // components are themselves glyphs with their own deltas and they are
         // decoded through this same function.
-        self.varyOutline(gid, cur.points[first_n..cur.n], cur.ends[first_nc..cur.nc]);
+        self.varyOutline(gid, first_n, cur.points[first_n..cur.n], cur.ends[first_nc..cur.nc]);
     } else {
         const ncomp = componentCount(data) catch 0;
         var dxb: [comp_cap]f32 = @splat(0);

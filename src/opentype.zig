@@ -386,6 +386,96 @@ pub const Layout = struct {
         return self.featureLookupsDefault(feat, out) catch return &.{};
     }
 
+    /// Apply lookup `index` at one position, stopping at the first subtable
+    /// that changes the buffer. `depth` bounds the nesting a contextual lookup
+    /// can ask for, so a font that points a lookup at itself cannot loop.
+    fn applyLookupAt(self: Layout, index: u16, buf: []u16, len: usize, pos: usize, depth: u4) Error!usize {
+        if (depth > 8) return len;
+        const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, index) * 2);
+        const kind = try u16At(self.data, lookup);
+        const sub_count = try u16At(self.data, lookup + 4);
+        var cur = len;
+        var i: usize = 0;
+        while (i < sub_count) : (i += 1) {
+            const sub = lookup + try u16At(self.data, lookup + 6 + i * 2);
+            var real_kind = kind;
+            var real = sub;
+            if (kind == 7) {
+                real_kind = try u16At(self.data, sub + 2);
+                real = sub + try u32At(self.data, sub + 4);
+            }
+            const step = try self.substAt(real_kind, real, buf, cur, pos, depth);
+            cur = step.len;
+            if (step.hit) break;
+        }
+        return cur;
+    }
+
+    /// GSUB type 6, chaining contextual. Format 3 only: every coverage set is
+    /// an explicit list of positions, which is what real fonts use for this.
+    /// Formats 1 and 2 (glyph and class based rule sets) are not implemented
+    /// and match nothing, so a font using them keeps its unsubstituted glyphs
+    /// rather than producing wrong ones.
+    fn chainAt(self: Layout, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4) Error!Step {
+        if (try u16At(self.data, sub) != 3) return .{};
+        var at = sub + 2;
+
+        const back_n = try u16At(self.data, at);
+        at += 2;
+        const back_off = at;
+        at += @as(usize, back_n) * 2;
+
+        const in_n = try u16At(self.data, at);
+        at += 2;
+        const in_off = at;
+        at += @as(usize, in_n) * 2;
+
+        const ahead_n = try u16At(self.data, at);
+        at += 2;
+        const ahead_off = at;
+        at += @as(usize, ahead_n) * 2;
+
+        const rec_n = try u16At(self.data, at);
+        at += 2;
+        const rec_off = at;
+
+        // Input coverage, left to right from pos.
+        if (in_n == 0 or pos + in_n > len) return .{};
+        for (0..in_n) |i| {
+            const cov = sub + try u16At(self.data, in_off + i * 2);
+            if ((try self.coverageIndex(cov, buf[pos + i])) == null) return .{};
+        }
+        // Backtrack reads backwards from pos, nearest first: coverage j matches
+        // the glyph j positions to the left.
+        if (pos < back_n) return .{};
+        for (0..back_n) |j| {
+            const cov = sub + try u16At(self.data, back_off + j * 2);
+            if ((try self.coverageIndex(cov, buf[pos - 1 - j])) == null) return .{};
+        }
+        // Lookahead starts after the input.
+        if (pos + in_n + ahead_n > len) return .{};
+        for (0..ahead_n) |j| {
+            const cov = sub + try u16At(self.data, ahead_off + j * 2);
+            if ((try self.coverageIndex(cov, buf[pos + in_n + j])) == null) return .{};
+        }
+
+        // Records name a position inside the input and a lookup to run there.
+        // A nested lookup may change the buffer length, so later target
+        // positions shift by however much the earlier ones moved.
+        var cur = len;
+        var shift: isize = 0;
+        for (0..rec_n) |r| {
+            const seq = try u16At(self.data, rec_off + r * 4);
+            const li = try u16At(self.data, rec_off + r * 4 + 2);
+            const target = @as(isize, @intCast(pos)) + @as(isize, @intCast(seq)) + shift;
+            if (target < 0 or target >= @as(isize, @intCast(cur))) continue;
+            const before = cur;
+            cur = try self.applyLookupAt(li, buf, cur, @intCast(target), depth + 1);
+            shift += @as(isize, @intCast(cur)) - @as(isize, @intCast(before));
+        }
+        return .{ .hit = true, .len = cur, .advance = in_n };
+    }
+
     /// Apply one feature at ONE buffer position, which is what a joining form
     /// needs: `init` applies to the letters that take an initial form and to
     /// nothing else. Returns the (possibly changed) buffer length.
@@ -394,22 +484,7 @@ pub const Layout = struct {
         var lookups_buf: [32]u16 = undefined;
         var cur = len;
         for (self.lookupsFor(script, feat, &lookups_buf)) |li| {
-            const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, li) * 2);
-            const kind = try u16At(self.data, lookup);
-            const sub_count = try u16At(self.data, lookup + 4);
-            var i: usize = 0;
-            while (i < sub_count) : (i += 1) {
-                const sub = lookup + try u16At(self.data, lookup + 6 + i * 2);
-                var real_kind = kind;
-                var real = sub;
-                if (kind == 7) {
-                    real_kind = try u16At(self.data, sub + 2);
-                    real = sub + try u32At(self.data, sub + 4);
-                }
-                const step = try self.substAt(real_kind, real, buf, cur, pos);
-                cur = step.len;
-                if (step.hit) break;
-            }
+            cur = try self.applyLookupAt(li, buf, cur, pos, 0);
         }
         return cur;
     }
@@ -443,7 +518,7 @@ pub const Layout = struct {
         var pos: usize = 0;
         var n = len;
         while (pos < n) {
-            const step = try self.substAt(real_kind, real, buf, n, pos);
+            const step = try self.substAt(real_kind, real, buf, n, pos, 0);
             if (step.hit) {
                 n = step.len;
                 pos += step.advance;
@@ -456,7 +531,10 @@ pub const Layout = struct {
 
     const Step = struct { hit: bool = false, len: usize = 0, advance: usize = 1 };
 
-    fn substAt(self: Layout, kind: u16, sub: usize, buf: []u16, len: usize, pos: usize) Error!Step {
+    fn substAt(self: Layout, kind: u16, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4) Error!Step {
+        // Contextual lookups gate other lookups rather than substituting a
+        // glyph, so they do not have a coverage table at offset 2.
+        if (kind == 6) return self.chainAt(sub, buf, len, pos, depth);
         const gid = buf[pos];
         const cov = sub + try u16At(self.data, sub + 2);
         const idx = (try self.coverageIndex(cov, gid)) orelse return .{};

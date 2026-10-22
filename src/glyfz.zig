@@ -867,6 +867,13 @@ pub const Font = struct {
     /// Font y points up and bitmap y points down, hence the negations: the
     /// top of the bitmap comes from the glyph's yMax.
     pub fn bitmapBox(self: Font, gid: u16, scale: f32, phase_x: f32) GlyphError!PixelBox {
+        return self.bitmapBoxPhase(gid, scale, phase_x, 0);
+    }
+
+    /// `bitmapBox` with a vertical phase too. Type set on a fractional baseline
+    /// needs both axes: an x-only phase leaves every glyph snapped to a whole
+    /// pixel vertically, which is why rows looked uneven at 1.25x.
+    pub fn bitmapBoxPhase(self: Font, gid: u16, scale: f32, phase_x: f32, phase_y: f32) GlyphError!PixelBox {
         const b = (try self.headerBox(gid)) orelse
             return .{ .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 };
         const f = struct {
@@ -876,9 +883,9 @@ pub const Font = struct {
         };
         return .{
             .x0 = @intFromFloat(@floor(f.v(b.x0, scale, phase_x))),
-            .y0 = @intFromFloat(@floor(f.v(-b.y1, scale, 0))),
+            .y0 = @intFromFloat(@floor(f.v(-b.y1, scale, phase_y))),
             .x1 = @intFromFloat(@ceil(f.v(b.x1, scale, phase_x))),
-            .y1 = @intFromFloat(@ceil(f.v(-b.y0, scale, 0))),
+            .y1 = @intFromFloat(@ceil(f.v(-b.y0, scale, phase_y))),
         };
     }
 
@@ -895,11 +902,27 @@ pub const Font = struct {
         ends: []u16,
         edges: []Edge,
     ) GlyphError!usize {
+        return self.edgesIntoPhase(gid, scale, phase_x, 0, box, points, ends, edges);
+    }
+
+    /// `edgesInto` with a vertical phase.
+    pub fn edgesIntoPhase(
+        self: Font,
+        gid: u16,
+        scale: f32,
+        phase_x: f32,
+        phase_y: f32,
+        box: PixelBox,
+        points: []Point,
+        ends: []u16,
+        edges: []Edge,
+    ) GlyphError!usize {
         const o = try self.outline(gid, points, ends);
         var em = Emitter{
             .edges = edges,
             .scale = scale,
             .phase_x = phase_x,
+            .phase_y = phase_y,
             .ox = @floatFromInt(box.x0),
             .oy = @floatFromInt(box.y0),
             // Flatness is expressed in pixels, so in font units it scales.
@@ -929,7 +952,23 @@ pub const Font = struct {
         acc: []f32,
         coverage: []u8,
     ) GlyphError!Raster {
-        const box = try self.bitmapBox(gid, scale, phase_x);
+        return self.rasterPhase(gid, scale, phase_x, 0, points, ends, edges, acc, coverage);
+    }
+
+    /// `raster` with a vertical phase.
+    pub fn rasterPhase(
+        self: Font,
+        gid: u16,
+        scale: f32,
+        phase_x: f32,
+        phase_y: f32,
+        points: []Point,
+        ends: []u16,
+        edges: []Edge,
+        acc: []f32,
+        coverage: []u8,
+    ) GlyphError!Raster {
+        const box = try self.bitmapBoxPhase(gid, scale, phase_x, phase_y);
         const w: u32 = if (box.x1 > box.x0) @intCast(box.x1 - box.x0) else 0;
         const h: u32 = if (box.y1 > box.y0) @intCast(box.y1 - box.y0) else 0;
 
@@ -940,7 +979,7 @@ pub const Font = struct {
         if (coverage.len < need) return error.BufferTooSmall;
         if (acc.len < @as(usize, w) * 2 + 2) return error.BufferTooSmall;
 
-        const n = try self.edgesInto(gid, scale, phase_x, box, points, ends, edges);
+        const n = try self.edgesIntoPhase(gid, scale, phase_x, phase_y, box, points, ends, edges);
         try sweep(edges[0..n], w, h, acc, coverage[0..need]);
         return .{ .w = w, .h = h, .x0 = box.x0, .y0 = box.y0, .coverage = coverage[0..need] };
     }
@@ -1096,6 +1135,21 @@ pub const Font = struct {
         return len;
     }
 
+    /// Which way a run runs. Positions come back pen-relative for `.ltr` and
+    /// base-relative for `.rtl`, because that is what a caller drawing in each
+    /// direction actually needs.
+    pub const Direction = enum { ltr, rtl };
+
+    pub const ShapeOptions = struct {
+        direction: Direction = .ltr,
+        /// OpenType script tag, e.g. `opentype.tag("latn")`. Zero asks GlyfZ to
+        /// pick one, which means "the script that actually has these features
+        /// under it" rather than a hardcoded DFLT -- DejaVu puts its real kern and
+        /// liga lookups under `latn` and only a stub under DFLT.
+        script: u32 = 0,
+        lang: u32 = 0,
+    };
+
     /// Convert base-relative mark offsets into pen-relative ones.
     ///
     /// A mark's anchor offset is measured from the origin of the base it attaches
@@ -1123,6 +1177,134 @@ pub const Font = struct {
             }
             pen += adv;
         }
+    }
+
+    /// Shape a run of codepoints into glyph ids with no assumption about the
+    /// script beyond the default OpenType feature set: `ccmp`, `locl`, `rlig`,
+    /// `liga`, `clig`, `calt`, then `mark`/`mkmk` positioning.
+    ///
+    /// This is the entry point for text that needs no script-specific machine.
+    /// Arabic and Thai keep their own functions, because joining forms and
+    /// positional features are not expressible as a list of features.
+    ///
+    /// Kerning is NOT applied here, deliberately: it changes the pen, and this
+    /// function returns glyphs and mark offsets, not advances. Walk the pairs
+    /// with `kern()` -- or with GPOS once that is wired in -- as the run is
+    /// laid out.
+    pub fn shape(
+        self: Font,
+        cps: []const u21,
+        out: []u16,
+        place: ?[]opentype.Offset,
+        opts: ShapeOptions,
+    ) GlyphError!usize {
+        const n = @min(cps.len, out.len);
+        var ordered: [max_order]u21 = undefined;
+        var src: []const u21 = cps[0..n];
+        if (n <= max_order) {
+            @memcpy(ordered[0..n], cps[0..n]);
+            arabic.canonicalOrder(ordered[0..n]);
+            src = ordered[0..n];
+        }
+        for (src, out[0..n]) |cp, *g| g.* = self.glyphIndex(cp) catch 0;
+        if (n == 0) return n;
+
+        var len = n;
+        var comps_of: [max_order]u8 = @splat(0xFF);
+        const script = if (opts.script != 0) opts.script else self.pickScript();
+        if (self.gsub_span.len != 0) {
+            var l = opentype.Layout.init(self.data, self.gsub_span.off, self.gsub_span.len) catch return n;
+            l.lig = comps_of[0..];
+            if (self.gdef_span.len != 0) l.gdef = opentype.Gdef.init(self.data, self.gdef_span.off, self.gdef_span.len) catch null;
+            // Order is hb's default feature order, and it matters: ccmp
+            // rewrites the buffer (and can shorten it), so everything after it
+            // sees the glyphs it produced.
+            for ([_]u32{
+                opentype.tag("ccmp"), opentype.tag("locl"), opentype.tag("rlig"),
+                opentype.tag("liga"), opentype.tag("clig"), opentype.tag("calt"),
+            }) |feat| {
+                len = l.applyFeature(script, feat, out, len) catch len;
+            }
+        }
+
+        if (place) |p| {
+            @memset(p[0..len], .{});
+            if (self.gpos_span.len != 0) {
+                if (opentype.Layout.init(self.data, self.gpos_span.off, self.gpos_span.len)) |gp_init| {
+                    var gp = gp_init;
+                    gp.lig = comps_of[0..];
+                    _ = gp.markAttach(script, opentype.tag("mark"), out[0..len], len, p) catch 0;
+                    _ = gp.markAttach(script, opentype.tag("mkmk"), out[0..len], len, p) catch 0;
+                } else |_| {}
+            }
+            if (opts.direction == .ltr) {
+                var advs: [max_order]i32 = @splat(0);
+                for (out[0..len], 0..) |g, i| {
+                    advs[i] = if (self.hMetricsResolved(g)) |m| m.advance else |_| 0;
+                }
+                penRelative(advs[0..len], p[0..len]);
+            }
+        }
+        return len;
+    }
+
+    /// The script to use when the caller did not name one: whichever of `latn`
+    /// and `DFLT` actually carries the features this shaper applies.
+    fn pickScript(self: Font) u32 {
+        const latn = opentype.tag("latn");
+        const dflt = opentype.tag("DFLT");
+        inline for (.{ latn, dflt }) |cand| {
+            if (self.hasGsubFeature(cand, 0, opentype.tag("liga")) or
+                self.hasGsubFeature(cand, 0, opentype.tag("ccmp"))) return cand;
+        }
+        return dflt;
+    }
+
+    /// Does the file carry this table at all? Answers about the DIRECTORY, so
+    /// no parse of the table itself happens.
+    pub fn hasTable(self: Font, wanted: u32) bool {
+        if (self.data.len < 12) return false;
+        const n = (@as(usize, self.data[4]) << 8) | self.data[5];
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const rec = 12 + i * 16;
+            if (rec + 16 > self.data.len) return false;
+            const t = (@as(u32, self.data[rec]) << 24) | (@as(u32, self.data[rec + 1]) << 16) |
+                (@as(u32, self.data[rec + 2]) << 8) | @as(u32, self.data[rec + 3]);
+            if (t == wanted) return true;
+        }
+        return false;
+    }
+
+    /// Any kerning at all: a usable legacy `kern` table, or a `kern` feature in
+    /// GPOS. The two are different tables and a caller cannot otherwise tell
+    /// "this font does not kern" from "the kerning lives somewhere I did not
+    /// look".
+    pub fn hasKerning(self: Font) bool {
+        if (self.kern_ok) return true;
+        return self.hasGposFeature(0, 0, opentype.tag("kern"));
+    }
+
+    /// Is `feat` available for `script` (0 = pick one) in GPOS?
+    pub fn hasGposFeature(self: Font, script: u32, lang: u32, feat: u32) bool {
+        return self.hasFeatureIn(self.gpos_span, script, lang, feat);
+    }
+
+    /// Is `feat` available for `script` (0 = pick one) in GSUB?
+    pub fn hasGsubFeature(self: Font, script: u32, lang: u32, feat: u32) bool {
+        return self.hasFeatureIn(self.gsub_span, script, lang, feat);
+    }
+
+    fn hasFeatureIn(self: Font, span: Span, script: u32, lang: u32, feat: u32) bool {
+        if (span.len == 0) return false;
+        var l = opentype.Layout.init(self.data, span.off, span.len) catch return false;
+        var ids: [32]u16 = undefined;
+        if (script == 0) {
+            const got = l.featureLookupsDefault(feat, &ids) catch return false;
+            return got.len != 0;
+        }
+        const got = l.featureLookups(script, lang, feat, &ids) catch return false;
+        return got.len != 0;
     }
 
     test "a left-to-right mark ends up pen-relative, not base-relative" {
@@ -1615,6 +1797,7 @@ const Emitter = struct {
     n: usize = 0,
     scale: f32,
     phase_x: f32,
+    phase_y: f32 = 0,
     ox: f32,
     oy: f32,
     flat_sq: f32,
@@ -1622,8 +1805,8 @@ const Emitter = struct {
     fn line(self: *Emitter, x0: f32, y0: f32, x1: f32, y1: f32) GlyphError!void {
         const px0 = x0 * self.scale + self.phase_x - self.ox;
         const px1 = x1 * self.scale + self.phase_x - self.ox;
-        const py0 = -y0 * self.scale - self.oy;
-        const py1 = -y1 * self.scale - self.oy;
+        const py0 = -y0 * self.scale + self.phase_y - self.oy;
+        const py1 = -y1 * self.scale + self.phase_y - self.oy;
         // A horizontal edge contributes no area to a row.
         if (py0 == py1) return;
         if (self.n == self.edges.len) return error.BufferTooSmall;
@@ -1920,6 +2103,7 @@ pub const Cache = struct {
         gid: u16 = 0,
         scale_key: u32 = 0,
         phase: Phase = .zero,
+        phase_y: Phase = .zero,
         /// The size class the pixels came from, so an eviction knows whose
         /// slot to drop without consulting any other bookkeeping.
         cls: u8 = 0,
@@ -2045,8 +2229,17 @@ pub const Cache = struct {
     /// at a different size than the caller lays out with. The scale is the
     /// primitive; ppem is the convenience wrapper above.
     pub fn maskAt(self: *Cache, font: Font, gid: u16, scale: f32, phase: Phase) GlyphError!Mask {
+        return self.maskAtXY(font, gid, scale, phase, .zero);
+    }
+
+    /// `maskAt` with a vertical phase as well.
+    ///
+    /// The y phase belongs in the KEY, not just the call: two masks of one glyph
+    /// that differ only vertically are different pictures, so sharing a slot
+    /// between them would serve the wrong one forever.
+    pub fn maskAtXY(self: *Cache, font: Font, gid: u16, scale: f32, phase: Phase, phase_y: Phase) GlyphError!Mask {
         const scale_key: u32 = @bitCast(scale);
-        if (self.find(gid, scale_key, phase)) |s| {
+        if (self.find(gid, scale_key, phase, phase_y)) |s| {
             self.stats.hits += 1;
             const at = self.arena_at + self.class_at[s.cls] + s.off;
             return .{ .w = s.w, .h = s.h, .x0 = s.x0, .y0 = s.y0, .pixels = self.mem[at..][0 .. @as(usize, s.w) * s.h] };
@@ -2055,7 +2248,12 @@ pub const Cache = struct {
         self.stats.misses += 1;
         if (!(scale > 0) or font.units_per_em == 0) return .{};
         const ph = phaseOffset(phase);
-        const box = try font.bitmapBox(gid, scale, ph);
+        const phy = phaseOffset(phase_y);
+        // Size the arena from the box the raster will ACTUALLY use. Measuring
+        // with the x phase alone under-reserves by a row whenever a y phase
+        // pushes a ceil over, and the failure surfaces as BufferTooSmall on a
+        // glyph that fits at every whole-pixel offset.
+        const box = try font.bitmapBoxPhase(gid, scale, ph, phy);
         const w: u32 = if (box.x1 > box.x0) @intCast(box.x1 - box.x0) else 0;
         const h: u32 = if (box.y1 > box.y0) @intCast(box.y1 - box.y0) else 0;
         if (w == 0 or h == 0) return .{ .x0 = box.x0, .y0 = box.y0 };
@@ -2066,22 +2264,23 @@ pub const Cache = struct {
         // Only this class gives way. Masks of other sizes keep their pixels.
         if (self.class_used[cls] + len > self.class_cap[cls]) self.evictClass(cls);
 
-        var slot = self.freeSlot(gid, scale_key, phase);
+        var slot = self.freeSlot(gid, scale_key, phase, phase_y);
         if (slot == null) {
             // Every slot is spoken for; the table, not the pixels, is the
             // limit. Rare enough to take the blunt path.
             self.flush();
-            slot = self.freeSlot(gid, scale_key, phase);
+            slot = self.freeSlot(gid, scale_key, phase, phase_y);
         }
         const s = slot orelse return error.BufferTooSmall;
 
         const at = self.arena_at + self.class_at[cls] + self.class_used[cls];
-        const r = try font.raster(gid, scale, ph, self.points, self.ends, self.edges, self.scratch, self.mem[at..][0..len]);
+        const r = try font.rasterPhase(gid, scale, ph, phy, self.points, self.ends, self.edges, self.scratch, self.mem[at..][0..len]);
 
         s.* = .{
             .gid = gid,
             .scale_key = scale_key,
             .phase = phase,
+            .phase_y = phase_y,
             .cls = @intCast(cls),
             .off = @intCast(self.class_used[cls]),
             .w = r.w,
@@ -2094,30 +2293,30 @@ pub const Cache = struct {
         return .{ .w = r.w, .h = r.h, .x0 = r.x0, .y0 = r.y0, .pixels = r.coverage };
     }
 
-    fn probeStart(self: *Cache, gid: u16, scale_key: u32, phase: Phase) usize {
+    fn probeStart(self: *Cache, gid: u16, scale_key: u32, phase: Phase, phase_y: Phase) usize {
         // The scale enters the key by its raw bits. Quantising it onto a size
         // lattice would let two neighbouring sizes share a mask, which is the
         // wrong glyph by design; a caller that animates size loses hit rate
         // instead, and that is the honest failure.
-        var key: u64 = (@as(u64, gid) << 40) ^ (@as(u64, scale_key) << 2) ^ @as(u64, @intFromEnum(phase));
+        var key: u64 = (@as(u64, gid) << 40) ^ (@as(u64, scale_key) << 4) ^ (@as(u64, @intFromEnum(phase)) << 2) ^ @as(u64, @intFromEnum(phase_y));
         key *%= 0x9E3779B97F4A7C15;
         key ^= key >> 29;
         return @as(usize, key >> 16) % self.slots.len;
     }
 
-    fn find(self: *Cache, gid: u16, scale_key: u32, phase: Phase) ?*Slot {
-        const start = self.probeStart(gid, scale_key, phase);
+    fn find(self: *Cache, gid: u16, scale_key: u32, phase: Phase, phase_y: Phase) ?*Slot {
+        const start = self.probeStart(gid, scale_key, phase, phase_y);
         var i: usize = 0;
         while (i < self.slots.len) : (i += 1) {
             const s = &self.slots[(start + i) % self.slots.len];
             if (s.state == .empty) return null; // an empty slot ends the probe run
-            if (s.state == .live and s.gid == gid and s.scale_key == scale_key and s.phase == phase) return s;
+            if (s.state == .live and s.gid == gid and s.scale_key == scale_key and s.phase == phase and s.phase_y == phase_y) return s;
         }
         return null;
     }
 
-    fn freeSlot(self: *Cache, gid: u16, scale_key: u32, phase: Phase) ?*Slot {
-        const start = self.probeStart(gid, scale_key, phase);
+    fn freeSlot(self: *Cache, gid: u16, scale_key: u32, phase: Phase, phase_y: Phase) ?*Slot {
+        const start = self.probeStart(gid, scale_key, phase, phase_y);
         var i: usize = 0;
         while (i < self.slots.len) : (i += 1) {
             const s = &self.slots[(start + i) % self.slots.len];
@@ -3178,7 +3377,7 @@ test "a dead slot keeps its probe chain walkable, an empty one ends it" {
     const gid: u16 = 42;
     const sk: u32 = @bitCast(@as(f32, 0.25));
     const n = cache.slots.len;
-    const start = cache.probeStart(gid, sk, .zero);
+    const start = cache.probeStart(gid, sk, .zero, .zero);
     const near = start % n;
     const under_test = (start + 1) % n;
     const far = (start + 2) % n;
@@ -3190,12 +3389,80 @@ test "a dead slot keeps its probe chain walkable, an empty one ends it" {
 
     // Evicted pixels: the chain has to walk over it.
     cache.slots[under_test] = .{ .state = .dead };
-    try std.testing.expect(cache.find(gid, sk, .zero) != null);
+    try std.testing.expect(cache.find(gid, sk, .zero, .zero) != null);
 
     // A slot that was never used ends the run: nothing is ever stored past one,
     // so a lookup must stop rather than scan the rest of the table.
     cache.slots[under_test] = .{ .state = .empty };
-    try std.testing.expect(cache.find(gid, sk, .zero) == null);
+    try std.testing.expect(cache.find(gid, sk, .zero, .zero) == null);
+}
+
+test "a vertical phase moves the mask, and is part of the cache key" {
+    var mem: [Cache.needed(.{})]u8 align(8) = undefined;
+    var fbuf: [4096]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fbuf, false));
+    var cache = try Cache.init(&mem, .{});
+
+    const flat = try cache.maskAtXY(font, 6, 0.2, .zero, .zero);
+    const before = cache.stats;
+
+    // Same glyph, same scale, offset half a pixel DOWN: a different picture.
+    const half = try cache.maskAtXY(font, 6, 0.2, .zero, .half);
+    try std.testing.expect(cache.stats.misses == before.misses + 1);
+    try std.testing.expect(half.y0 != flat.y0 or !std.mem.eql(u8, half.pixels, flat.pixels));
+
+    // And each y phase is cached on its own, so asking again is free.
+    const again = try cache.maskAtXY(font, 6, 0.2, .zero, .zero);
+    try std.testing.expect(cache.stats.hits == 1);
+    try std.testing.expectEqualSlices(u8, flat.pixels, again.pixels);
+}
+
+test "two vertical phases never share a cache slot" {
+    // White-box on purpose. The hash already separates two different y phases,
+    // so a black-box test passes whether or not the lookup COMPARES the phase
+    // -- it proves the hash, not the guard. With a one-slot table every probe
+    // starts at the same index, which is the only way to make the comparison
+    // the deciding factor.
+    var mem: [Cache.needed(.{ .slots = 1 })]u8 align(8) = undefined;
+    var cache = try Cache.init(&mem, .{ .slots = 1 });
+    const sk: u32 = @bitCast(@as(f32, 0.25));
+    cache.slots[0] = .{ .gid = 6, .scale_key = sk, .phase = .zero, .phase_y = .zero, .state = .live };
+
+    try std.testing.expect(cache.find(6, sk, .zero, .zero) != null);
+    try std.testing.expect(cache.find(6, sk, .zero, .half) == null);
+    try std.testing.expect(cache.find(6, sk, .half, .zero) == null);
+    try std.testing.expect(cache.find(6, sk, .zero, .three_quarters) == null);
+}
+
+test "capability queries answer from the directory, not from a guess" {
+    var fbuf: [4096]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fbuf, false));
+    try std.testing.expect(font.hasTable(tag("glyf")));
+    try std.testing.expect(font.hasTable(tag("cmap")));
+    try std.testing.expect(!font.hasTable(tag("zzzz")));
+    // The test face carries no layout tables at all, so every feature query is
+    // a clean no rather than an error.
+    try std.testing.expect(!font.hasGsubFeature(0, 0, tag("liga")));
+    try std.testing.expect(!font.hasGposFeature(0, 0, tag("kern")));
+    try std.testing.expect(!font.hasKerning());
+}
+
+test "the generic shaper is identity on a face with no layout tables" {
+    var fbuf: [4096]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fbuf, false));
+    const cps = [_]u21{ 0x41, 0x42 }; // 'A' 'B', both mapped
+    var out: [4]u16 = @splat(0);
+    var place: [4]opentype.Offset = @splat(.{});
+    const n = try font.shape(&cps, &out, &place, .{});
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(try font.glyphIndex(0x41), out[0]);
+    try std.testing.expectEqual(try font.glyphIndex(0x42), out[1]);
+    try std.testing.expectEqual(@as(i16, 0), place[0].x);
+
+    // An unknown script is not an error either: nothing applies, the glyphs stay.
+    const n2 = try font.shape(&cps, &out, &place, .{ .script = tag("zzzz") });
+    try std.testing.expectEqual(@as(usize, 2), n2);
+    try std.testing.expectEqual(try font.glyphIndex(0x41), out[0]);
 }
 
 test "phase classes quantise to the nearest quarter pixel" {

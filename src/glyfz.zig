@@ -1073,9 +1073,83 @@ pub const Font = struct {
                     _ = gp.markAttach(thai, opentype.tag("mark"), out[0..len], len, p) catch 0;
                     _ = gp.markAttach(thai, opentype.tag("mkmk"), out[0..len], len, p) catch 0;
                 } else |_| {}
+
+                // Thai runs LEFT TO RIGHT, so a mark's pen sits after the base
+                // it attaches to, while the anchors above are measured from the
+                // base's own origin. A caller drawing at the pen would push
+                // every mark right by the base's advance -- 600 units on
+                // uni0E01, which is exactly the disagreement a hb comparison
+                // reports as a constant offset. Convert once, here, rather than
+                // making every caller subtract a distance it cannot see.
+                //
+                // Arabic deliberately does NOT get this: it runs right to left,
+                // where the mark's pen already IS the base's origin, so the raw
+                // anchor delta is already pen-relative. That asymmetry is a
+                // property of the writing direction, not of the fonts.
+                var advs: [max_order]i32 = @splat(0);
+                for (out[0..len], 0..) |g, i| {
+                    advs[i] = if (self.hMetricsResolved(g)) |m| m.advance else |_| 0;
+                }
+                penRelative(advs[0..len], p[0..len]);
             }
         }
         return len;
+    }
+
+    /// Convert base-relative mark offsets into pen-relative ones.
+    ///
+    /// A mark's anchor offset is measured from the origin of the base it attaches
+    /// to, but a caller draws at the pen, and in a left-to-right script the pen has
+    /// already moved past that base by its advance. Subtracting that distance is
+    /// what makes `draw(pen + place)` land the mark on its base -- without it every
+    /// mark drifts right by the base's advance (600 units on Thai uni0E01).
+    ///
+    /// A glyph whose advance is zero is a mark; the last glyph with a real advance
+    /// is the base it belongs to. A mark with no recorded offset is left alone,
+    /// because a zero there means "no anchor", not "place at the base's origin".
+    fn penRelative(advances: []const i32, place: []opentype.Offset) void {
+        var pen: i32 = 0;
+        var base_pen: i32 = 0;
+        for (advances, 0..) |adv, i| {
+            if (adv == 0) {
+                if (place[i].x != 0 or place[i].y != 0) {
+                    const corr: i32 = @as(i32, place[i].x) - (pen - base_pen);
+                    const lo: i32 = std.math.minInt(i16);
+                    const hi: i32 = std.math.maxInt(i16);
+                    place[i].x = @intCast(std.math.clamp(corr, lo, hi));
+                }
+            } else {
+                base_pen = pen;
+            }
+            pen += adv;
+        }
+    }
+
+    test "a left-to-right mark ends up pen-relative, not base-relative" {
+        const advs = [_]i32{ 600, 0 };
+        var place = [_]opentype.Offset{ .{}, .{ .x = 598 } };
+        penRelative(&advs, &place);
+        try std.testing.expectEqual(@as(i16, 0), place[0].x);
+        try std.testing.expectEqual(@as(i16, -2), place[1].x);
+
+        // two marks after one base both measure from that base, not from each other
+        const advs2 = [_]i32{ 600, 0, 0 };
+        var place2 = [_]opentype.Offset{ .{}, .{ .x = 598 }, .{ .x = 598 } };
+        penRelative(&advs2, &place2);
+        try std.testing.expectEqual(@as(i16, -2), place2[1].x);
+        try std.testing.expectEqual(@as(i16, -2), place2[2].x);
+
+        // a mark with no anchor recorded stays untouched
+        const advs3 = [_]i32{ 500, 0 };
+        var place3 = [_]opentype.Offset{ .{}, .{} };
+        penRelative(&advs3, &place3);
+        try std.testing.expectEqual(@as(i16, 0), place3[1].x);
+
+        // and a shift larger than i16 saturates instead of wrapping
+        const advs4 = [_]i32{ 70000, 0 };
+        var place4 = [_]opentype.Offset{ .{}, .{ .x = 10 } };
+        penRelative(&advs4, &place4);
+        try std.testing.expectEqual(std.math.minInt(i16), place4[1].x);
     }
 
     /// The colour layers of a glyph, written into `out`.

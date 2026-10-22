@@ -980,6 +980,7 @@ pub const Font = struct {
             if (self.gpos_span.len != 0) {
                 if (opentype.Layout.init(self.data, self.gpos_span.off, self.gpos_span.len)) |gp| {
                     _ = gp.markAttach(arab, opentype.tag("mark"), out[0..len], len, p) catch 0;
+                    _ = gp.markAttach(arab, opentype.tag("mkmk"), out[0..len], len, p) catch 0;
                 } else |_| {}
             }
         }

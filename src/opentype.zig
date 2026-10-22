@@ -408,8 +408,13 @@ pub const Layout = struct {
                 real = sub + try u32At(self.data, sub + 4);
             }
             const step = try self.substAt(real_kind, real, buf, cur, pos, depth);
-            cur = step.len;
-            if (step.hit) break;
+            // Only a HIT carries a length. Step.len defaults to 0 for a miss,
+            // so assigning it unconditionally truncated the run to nothing at
+            // the first lookup that did not match.
+            if (step.hit) {
+                cur = step.len;
+                break;
+            }
         }
         return cur;
     }
@@ -501,9 +506,61 @@ pub const Layout = struct {
                     kind = try u16At(self.data, sub + 2);
                     sub = sub + try u32At(self.data, sub + 4);
                 }
-                if (kind != 4) continue;
-                placed += try self.markBaseSub(sub, buf, len, out);
+                if (kind == 4) {
+                    placed += try self.markBaseSub(sub, buf, len, out);
+                } else if (kind == 6) {
+                    placed += try self.markMarkSub(sub, buf, len, out);
+                }
             }
+        }
+        return placed;
+    }
+
+    /// GPOS type 6, mark-to-mark: the second of two marks stacked on one
+    /// letter. The upper mark anchors to the lower one and INHERITS that mark's
+    /// offset, so a fatha over a shadda sits on the shadda rather than sinking
+    /// to wherever the shadda's own anchor put it.
+    fn markMarkSub(self: Layout, sub: usize, buf: []const u16, len: usize, out: []Offset) Error!usize {
+        if (try u16At(self.data, sub) != 1) return 0;
+        const mark1_cov = sub + try u16At(self.data, sub + 2);
+        const mark2_cov = sub + try u16At(self.data, sub + 4);
+        const class_count = try u16At(self.data, sub + 6);
+        const mark1_array = sub + try u16At(self.data, sub + 8);
+        const mark2_array = sub + try u16At(self.data, sub + 10);
+
+        var placed: usize = 0;
+        var i: usize = 0;
+        while (i < len) : (i += 1) {
+            const mi = (try self.coverageIndex(mark1_cov, buf[i])) orelse continue;
+            // The thing underneath is the nearest preceding glyph of the
+            // mark2 set -- another mark, not the letter.
+            var j = i;
+            var under: ?u16 = null;
+            while (j > 0) {
+                j -= 1;
+                if ((try self.coverageIndex(mark2_cov, buf[j])) != null) {
+                    under = try self.coverageIndex(mark2_cov, buf[j]);
+                    break;
+                }
+                // Stop at a letter. A mark two letters back is not under this
+                // one, and walking past the base is how a lone kasra ended up
+                // inheriting the offset of a sukun on the PREVIOUS letter.
+                if ((try self.coverageIndex(mark1_cov, buf[j])) == null) break;
+            }
+            const mi2 = under orelse continue;
+
+            const cls = try u16At(self.data, mark1_array + 2 + @as(usize, mi) * 4);
+            if (cls >= class_count) continue;
+            const mark1_anchor = mark1_array + try u16At(self.data, mark1_array + 2 + @as(usize, mi) * 4 + 2);
+            const mark2_anchor = mark2_array + try u16At(self.data, mark2_array + 2 + (@as(usize, mi2) * class_count + cls) * 2);
+            if (try u16At(self.data, mark2_anchor) == 0) continue;
+
+            const ax = try i16At(self.data, mark2_anchor + 2);
+            const ay = try i16At(self.data, mark2_anchor + 4);
+            const bx = try i16At(self.data, mark1_anchor + 2);
+            const by = try i16At(self.data, mark1_anchor + 4);
+            out[i] = .{ .x = out[j].x + (ax - bx), .y = out[j].y + (ay - by) };
+            placed += 1;
         }
         return placed;
     }

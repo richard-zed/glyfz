@@ -1,8 +1,8 @@
 //! GlyfZ -- a TrueType font parser and rasteriser.
 //!
 //! Reads `glyf`-based fonts, turns outlines into antialiased coverage masks,
-//! and keeps those masks between draws. It is not a shaper: no glyph
-//! substitution, no fallback chain, no line breaking.
+//! and keeps those masks between draws. It shapes Arabic and Thai through their
+//! GSUB features; there is no fallback chain and no line breaking.
 //!
 //! Three rules shape the code:
 //!
@@ -26,10 +26,16 @@
 //! this library's outline is quadratic, so CFF curves reach the caller already
 //! flattened to line points. See `cff.zig`.
 //!
+//! Variation comes from `gvar`, with `fvar` declaring the axes and `avar`
+//! remapping the user's coordinates on the way into the normalised space that
+//! the tuple regions are written in. A glyph is varied where it is DECODED, so
+//! a composite's components move with it. See `variations.zig`.
+//!
 //! Out of scope, deliberately: hinting (stb skips it, so unhinted is the bar),
-//! CFF2, variable axes, colour fonts, shaping, GPOS beyond pair adjustment,
-//! kern formats 2/3 and Apple's version 1 layout, vertical layout, and Unicode
-//! normalisation or line breaking.
+//! CFF2 -- the variable flavour of CFF; `glyf` variations are read, CFF2 is
+//! not --, any shaping beyond Arabic and Thai, COLRv1 (COLRv0 and CPAL are
+//! read), GPOS beyond pair adjustment, kern formats 2/3 and Apple's version 1
+//! layout, vertical layout, and Unicode normalisation or line breaking.
 
 const std = @import("std");
 const cff = @import("cff.zig");
@@ -1809,8 +1815,8 @@ pub const Font = struct {
         ) catch return;
         if (!any) return;
         for (pts, 0..) |*p, i| {
-            p.x += @intFromFloat(@round(dx[i]));
-            p.y += @intFromFloat(@round(dy[i]));
+            p.x += otRound(dx[i]);
+            p.y += otRound(dy[i]);
         }
     }
 
@@ -2142,6 +2148,15 @@ fn f2dot14(raw: i16) f32 {
     return @as(f32, @floatFromInt(raw)) / 16384.0;
 }
 
+/// OpenType's float-to-integer rounding: floor(v + 0.5), i.e. half UP, not half
+/// away from zero. The two only part company at an exact .5, and that is
+/// exactly where a coordinate pinned to a half-unit scalar lands -- wght 250 on
+/// Inter puts every tuple at a 0.5 ramp, so a negative product of -12.5 must
+/// give -12, not -13. fontTools and FreeType both round this way.
+fn otRound(v: f32) i32 {
+    return @intFromFloat(@floor(v + 0.5));
+}
+
 /// The glyph's byte range in `glyf`, via `loca`.
 fn glyphRange(self: Font, gid: u16) GlyphError![]const u8 {
     const loca = try self.slice(self.loca);
@@ -2410,8 +2425,8 @@ fn decodeComposite(self: Font, data: []const u8, cur: *Cursor, depth: u32, vdx: 
         for (cur.points[start..cur.n]) |*pt| {
             const px: f32 = @floatFromInt(pt.x);
             const py: f32 = @floatFromInt(pt.y);
-            pt.x = @intFromFloat(@round(a * px + c * py + dx));
-            pt.y = @intFromFloat(@round(b * px + d * py + dy));
+            pt.x = otRound(a * px + c * py + dx);
+            pt.y = otRound(b * px + d * py + dy);
         }
     }
 
@@ -3354,15 +3369,29 @@ fn patchRec(buf: []u8, rec: usize, t: u32, off: usize, len: usize) void {
 /// and the format-12 map, when present, remaps 'A'..'B' to gid 1..2 and puts
 /// U+1F600 at gid 7 so a codepoint above the BMP is covered.
 fn buildTestFont(buf: []u8, with_fmt12: bool) []const u8 {
+    return buildTestFontImpl(buf, with_fmt12, false);
+}
+
+/// The same 8-glyph face plus `fvar`, `avar` and `gvar`: one weight axis
+/// 400..700, an avar that maps 0.5 onto 0.6 (so the map is not the identity and
+/// the F2Dot14 snap is exercised), and deltas on gid 6 only. The gvar uses
+/// SHORT offsets on purpose -- every real font big enough to matter ships long
+/// ones, and that hid a wrong index stride here for the whole of Inter.
+fn buildVarTestFont(buf: []u8) []const u8 {
+    return buildTestFontImpl(buf, false, true);
+}
+
+fn buildTestFontImpl(buf: []u8, with_fmt12: bool, comptime with_var: bool) []const u8 {
+    const ntables: usize = if (with_var) 11 else 8;
     var w = W{ .buf = buf };
 
     w.u32v(0x0001_0000); // sfnt version
-    w.u16v(8); // numTables
+    w.u16v(@intCast(ntables)); // numTables
     w.u16v(0);
     w.u16v(0);
     w.u16v(0);
     const rec_base = w.at;
-    w.zeros(8 * 16);
+    w.zeros(ntables * 16);
 
     // --- cmap ---
     const cmap_start = w.at;
@@ -3524,9 +3553,98 @@ fn buildTestFont(buf: []u8, with_fmt12: bool) []const u8 {
     w.zeros(16); // the four memory-usage fields
     const r_post = Rec{ .at = post_start, .len = w.at - post_start };
 
-    const tags = [_]u32{ tag_cmap, tag_glyf, tag_loca, tag_head, tag_hhea, tag_hmtx, tag_maxp, tag_post };
-    const recs = [_]Rec{ r_cmap, r_glyf, r_loca, r_head, r_hhea, r_hmtx, r_maxp, r_post };
-    for (tags, recs, 0..) |t, r, i| patchRec(buf, rec_base + i * 16, t, r.at, r.len);
+    var tags: [ntables]u32 = undefined;
+    var recs: [ntables]Rec = undefined;
+    var nrec: usize = 0;
+    const base_tags = [_]u32{ tag_cmap, tag_glyf, tag_loca, tag_head, tag_hhea, tag_hmtx, tag_maxp, tag_post };
+    const base_recs = [_]Rec{ r_cmap, r_glyf, r_loca, r_head, r_hhea, r_hmtx, r_maxp, r_post };
+    for (base_tags, base_recs) |t, r| {
+        tags[nrec] = t;
+        recs[nrec] = r;
+        nrec += 1;
+    }
+
+    if (with_var) {
+        // --- fvar: one weight axis, 400 default, 700 max ---
+        const fvar_start = w.at;
+        w.u32v(0x0001_0000);
+        w.u16v(16); // axesArrayOffset
+        w.u16v(2); // reserved
+        w.u16v(1); // axisCount
+        w.u16v(20); // axisSize
+        w.u16v(0); // instanceCount
+        w.u16v(0); // instanceSize
+        w.u32v(tag("wght"));
+        w.u32v(400 << 16); // min, 16.16 fixed
+        w.u32v(400 << 16); // default
+        w.u32v(700 << 16); // max
+        w.u16v(0); // flags
+        w.u16v(256); // axisNameID
+        tags[nrec] = tag_fvar;
+        recs[nrec] = .{ .at = fvar_start, .len = w.at - fvar_start };
+        nrec += 1;
+
+        // --- avar: 0.5 maps to 0.6, so the remap is visibly not the identity ---
+        const avar_start = w.at;
+        w.u32v(0x0001_0000);
+        w.u16v(0); // reserved
+        w.u16v(1); // axisCount
+        w.u16v(4); // segmentCount
+        w.i16v(-16384);
+        w.i16v(-16384);
+        w.i16v(0);
+        w.i16v(0);
+        w.i16v(8192); // 0.5
+        w.i16v(9830); // -> 0.6, snapped to the 16.14 grid
+        w.i16v(16384);
+        w.i16v(16384);
+        tags[nrec] = tag_avar;
+        recs[nrec] = .{ .at = avar_start, .len = w.at - avar_start };
+        nrec += 1;
+
+        // --- gvar: deltas on gid 6 only; gids 0..5 and 7 carry nothing ---
+        const gvar_start = w.at;
+        const data_at: usize = 38; // 20 byte header + 9 short offsets
+        w.u32v(0x0001_0000); // version 1.0
+        w.u16v(1); // axisCount
+        w.u16v(0); // sharedTupleCount
+        w.u32v(data_at); // sharedTuplesOffset (no shared tuples)
+        w.u16v(8); // glyphCount
+        w.u16v(0); // flags: SHORT offsets
+        w.u32v(data_at); // glyphVariationDataArrayOffset
+        var g: usize = 0;
+        while (g < 6) : (g += 1) w.u16v(0); // gids 0..5: no data
+        w.u16v(0); // gid 6 starts at byte 0
+        w.u16v(12); // gid 7 starts at byte 24
+        w.u16v(12); // end of data
+        // gid 6: one tuple, embedded peak 1.0, all points touched.
+        w.u16v(1); // tupleVariationCount
+        w.u16v(10); // dataOffset: 4 byte header + 6 byte tuple header
+        w.u16v(13); // variationDataSize
+        w.u16v(0x8000); // EMBEDDED_PEAK_TUPLE, tuple index 0
+        w.i16v(16384); // peak 1.0
+        // x deltas 40, -20, 10 then four zero phantoms
+        w.u8v(0x00);
+        w.u8v(40);
+        w.u8v(0x00);
+        w.u8v(236); // -20
+        w.u8v(0x00);
+        w.u8v(10);
+        w.u8v(0x83); // four zeros
+        // y deltas 0, 30, -10 then four zero phantoms
+        w.u8v(0x80); // one zero
+        w.u8v(0x00);
+        w.u8v(30);
+        w.u8v(0x00);
+        w.u8v(246); // -10
+        w.u8v(0x83); // four zeros
+        w.zeros(1); // pad: short offsets count in two byte units
+        tags[nrec] = tag_gvar;
+        recs[nrec] = .{ .at = gvar_start, .len = w.at - gvar_start };
+        nrec += 1;
+    }
+
+    for (tags[0..nrec], recs[0..nrec], 0..) |t, r, i| patchRec(buf, rec_base + i * 16, t, r.at, r.len);
 
     return buf[0..w.at];
 }
@@ -3537,6 +3655,7 @@ test {
     // do not run, which is how a suite stays green while testing nothing.
     std.testing.refAllDecls(arabic);
     std.testing.refAllDecls(colr);
+    std.testing.refAllDecls(variations);
 }
 
 test "init reads the table directory and metrics" {
@@ -3754,7 +3873,6 @@ test "exact area agrees with brute-force supersampling on a triangle" {
         const d = @as(i32, a) - @as(i32, b);
         worst = @max(worst, if (d < 0) -d else d);
     }
-    std.debug.print("triangle: worst delta {d}\n", .{worst});
     // 24x24 samples leave a little noise; a wrong integral would be far worse.
     try std.testing.expect(worst <= 6);
 }
@@ -4758,4 +4876,69 @@ test {
     // A sibling file's tests only join the module's test binary if something
     // references its declarations -- the same reason elmz keeps this line.
     std.testing.refAllDecls(@import("opentype.zig"));
+}
+
+test "a variable face moves a glyph's points where it is decoded" {
+    var buf: [4096]u8 = undefined;
+    const f = try Font.init(buildVarTestFont(&buf));
+    var pa: [64]Point = undefined;
+    var ea: [16]u16 = undefined;
+
+    // The default instance leaves the gvar deltas parked.
+    const flat = try f.outline(6, &pa, &ea);
+    try std.testing.expectEqual(@as(usize, 3), flat.points.len);
+    try std.testing.expectEqual(@as(i32, 0), flat.points[0].x);
+    try std.testing.expectEqual(@as(i32, 100), flat.points[1].x);
+    try std.testing.expectEqual(@as(i32, 100), flat.points[2].y);
+
+    // wght 700 is the axis peak, so the scalar is exactly 1: point deltas are
+    // (40,0) (-20,30) (10,-10) on a triangle of (0,0) (100,0) (50,100).
+    const user = [_]f32{700};
+    const vf = f.withCoords(&user);
+    const o = try vf.outline(6, &pa, &ea);
+    try std.testing.expectEqual(@as(i32, 40), o.points[0].x);
+    try std.testing.expectEqual(@as(i32, 0), o.points[0].y);
+    try std.testing.expectEqual(@as(i32, 80), o.points[1].x);
+    try std.testing.expectEqual(@as(i32, 30), o.points[1].y);
+    try std.testing.expectEqual(@as(i32, 60), o.points[2].x);
+    try std.testing.expectEqual(@as(i32, 90), o.points[2].y);
+}
+
+test "a composite follows its varied component through a short offset table" {
+    var buf: [4096]u8 = undefined;
+    const f = try Font.init(buildVarTestFont(&buf));
+    const user = [_]f32{700};
+    const vf = f.withCoords(&user);
+    var pa: [64]Point = undefined;
+    var ea: [16]u16 = undefined;
+
+    // gid 7 is gid 6 shifted by (200,0) with no deltas of its own, so every
+    // point must land 200 past the varied child's. This is also the regression
+    // for the short-offset stride: indexed with the wrong stride the child's
+    // tuples are found at the wrong byte and nothing moves at all.
+    const c = try vf.outline(7, &pa, &ea);
+    try std.testing.expectEqual(@as(usize, 3), c.points.len);
+    try std.testing.expectEqual(@as(i32, 240), c.points[0].x);
+    try std.testing.expectEqual(@as(i32, 280), c.points[1].x);
+    try std.testing.expectEqual(@as(i32, 30), c.points[1].y);
+    try std.testing.expectEqual(@as(i32, 260), c.points[2].x);
+    try std.testing.expectEqual(@as(i32, 90), c.points[2].y);
+}
+
+test "a halfway instance rounds a delta half up, not away from zero" {
+    var buf: [4096]u8 = undefined;
+    const f = try Font.init(buildVarTestFont(&buf));
+    // 550 normalises to 0.5, avar maps that to 0.6, and the F2Dot14 grid makes
+    // it 9830/16384 = 0.599976. So -20 scales to -11.9995, which must give -12:
+    // floor(v + 0.5). Rounding away from zero would have said -13.
+    const user = [_]f32{550};
+    const vf = f.withCoords(&user);
+    var pa: [64]Point = undefined;
+    var ea: [16]u16 = undefined;
+    const o = try vf.outline(6, &pa, &ea);
+    try std.testing.expectEqual(@as(i32, 24), o.points[0].x);
+    try std.testing.expectEqual(@as(i32, 88), o.points[1].x);
+    try std.testing.expectEqual(@as(i32, 18), o.points[1].y);
+    try std.testing.expectEqual(@as(i32, 56), o.points[2].x);
+    try std.testing.expectEqual(@as(i32, 94), o.points[2].y);
 }

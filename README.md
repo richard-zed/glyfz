@@ -52,7 +52,10 @@ Two properties are the whole point:
 | codepoint lookup cache, carrying the resolved advance | done |
 | malformed input: truncation and bit-flip sweeps | done |
 | `post`: italic angle, underline, fixed pitch | done |
-| hinting, CFF2, variable axes, colour fonts, kern 2/3 | out of scope |
+| variable axes: `fvar`, `avar`, `gvar`, on glyphs and on composites | done |
+| colour: COLRv0 layers with CPAL palettes | done |
+| Arabic and Thai shaping, over GSUB features | done |
+| hinting, CFF2, COLRv1, kern formats 2/3 | out of scope |
 | GPOS beyond pair adjustment: contextual positioning, mark attachment, GDEF filtering, Device tables | out of scope |
 
 Two kerning surfaces, and they answer different questions. `kern()` reads the

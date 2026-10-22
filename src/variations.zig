@@ -87,7 +87,18 @@ pub fn normalizeAxis(a: Axis, v: f32, avar: []const u8, axis_index: usize) f32 {
         n = if (span <= 0) 0 else (v - a.default) / span;
     }
     n = std.math.clamp(n, -1, 1);
-    return avarMap(avar, axis_index, n);
+    // Normalised coordinates are F2Dot14 everywhere else in the format: avar's
+    // mapping points, gvar's tuple regions, all of it. Snapping the instance
+    // coordinate to that same grid before any tuple is evaluated is what a
+    // static instancer does, and it matters: a scalar product that lands within
+    // a unit of a .5 boundary otherwise rounds the other way from every other
+    // implementation (Inter at wght 700 wants 8847/16384, not 0.5400049).
+    return quantizeF2Dot14(avarMap(avar, axis_index, n));
+}
+
+fn quantizeF2Dot14(v: f32) f32 {
+    const scaled = @round(v * 16384.0);
+    return std.math.clamp(scaled / 16384.0, -1, 1);
 }
 
 /// Piecewise-linear `avar` remap. Segments are stored per axis, in axis order,
@@ -286,8 +297,15 @@ fn iupContour(
                 // NEARER reference's delta. Extrapolating instead reaches
                 // values neither reference has, which is not what a hinted
                 // outline going through the same positions does.
+                //
+                // Two references sharing a coordinate on this axis say nothing
+                // about where the point sits between them, so there is no
+                // basis for a weighted answer: the axis gets NO movement
+                // unless both references agree on one. Carrying the lower
+                // reference's delta is the tempting shortcut and it is wrong
+                // -- on a vertical stem it slides the point sideways.
                 dst[m] = if (src[b] == src[a])
-                    dst[a]
+                    (if (dst[b] == dst[a]) dst[a] else 0)
                 else blk: {
                     const frac = (src[m] - src[a]) / (src[b] - src[a]);
                     if (frac <= 0) break :blk dst[a];
@@ -333,9 +351,13 @@ pub fn applyGlyph(
     const data_at: usize = try u32At(d, 16);
     if (data_at >= d.len) return false;
 
+    // Offset array format: long = uint32 entries, short = uint16 entries at
+    // HALF the stride, so the short path indexes with gid * 2, not gid * 4.
+    // Inter ships long offsets and hid this; a short-offset face shifted every
+    // glyph onto another glyph's deltas (glyph 18 read glyph 36's entries).
     const long = (flags & 1) != 0;
-    const o0: usize = if (long) try u32At(d, 20 + @as(usize, gid) * 4) else @as(usize, try u16At(d, 20 + @as(usize, gid) * 4)) * 2;
-    const o1: usize = if (long) try u32At(d, 20 + (@as(usize, gid) + 1) * 4) else @as(usize, try u16At(d, 20 + (@as(usize, gid) + 1) * 4)) * 2;
+    const o0: usize = if (long) try u32At(d, 20 + @as(usize, gid) * 4) else @as(usize, try u16At(d, 20 + @as(usize, gid) * 2)) * 2;
+    const o1: usize = if (long) try u32At(d, 20 + (@as(usize, gid) + 1) * 4) else @as(usize, try u16At(d, 20 + (@as(usize, gid) + 1) * 2)) * 2;
     if (o1 <= o0) return false;
     if (data_at + o1 > d.len) return error.Malformed;
     const gd = d[data_at + o0 ..][0 .. o1 - o0];
@@ -464,4 +486,43 @@ pub fn applyGlyph(
         any = true;
     }
     return any;
+}
+
+test "a normalised axis lands on the F2Dot14 grid" {
+    const a = Axis{ .tag = 0, .min = 100, .default = 400, .max = 900 };
+    // (700 - 400) / (900 - 400) = 0.6, which 16.14 cannot represent: the grid
+    // step is 1/16384, so the nearest value is 9830/16384 = 0.599976. Getting
+    // this wrong moves a scalar product across a rounding boundary and a whole
+    // glyph lands one unit off, which is exactly what the oracles caught.
+    try std.testing.expectEqual(@as(f32, 9830.0 / 16384.0), normalizeAxis(a, 700, &.{}, 0));
+    // The default sits exactly on zero rather than one step away from it.
+    try std.testing.expectEqual(@as(f32, 0), normalizeAxis(a, 400, &.{}, 0));
+    // And the ends are exact, so a peak of 1 gets a scalar of exactly 1.
+    try std.testing.expectEqual(@as(f32, 1), normalizeAxis(a, 700, &.{}, 0) * 0 + normalizeAxis(a, 900, &.{}, 0));
+}
+
+test "IUP yields no delta when both references share a coordinate" {
+    // Contour (0,0) (100,0) (50,0) (100,0) with point 2 untouched. Its two
+    // references, points 1 and 3, both sit at x=100 but carry different deltas,
+    // so there is no ramp to read: the rule is zero, not the first reference's
+    // value. This one case was 695 wrong glyphs' worth of trouble.
+    const xs = [_]f32{ 0, 100, 50, 100 };
+    const ys = [_]f32{ 0, 0, 0, 0 };
+    var dx = [_]f32{ 7, 30, 0, 12 };
+    var dy = [_]f32{ 0, 0, 0, 0 };
+    var touched = [_]bool{ true, true, false, true };
+    iupContour(&xs, &ys, &dx, &dy, &touched, 0, 4);
+    try std.testing.expectEqual(@as(f32, 0), dx[2]);
+
+    // A point strictly between two references still interpolates linearly, so
+    // the equal-coordinate rule cannot have swallowed the ordinary path. The
+    // references here are points 0 and 3 (both ends of the walk), so x=50 lands
+    // halfway and takes half of the 90 unit delta.
+    const xs2 = [_]f32{ 0, 20, 50, 100 };
+    var dx2 = [_]f32{ 0, 0, 0, 90 };
+    var dy2 = [_]f32{ 0, 0, 0, 0 };
+    var touched2 = [_]bool{ true, false, false, true };
+    iupContour(&xs2, &ys, &dx2, &dy2, &touched2, 0, 4);
+    try std.testing.expectEqual(@as(f32, 45), dx2[2]);
+    try std.testing.expectEqual(@as(f32, 18), dx2[1]);
 }

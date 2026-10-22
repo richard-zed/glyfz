@@ -24,6 +24,51 @@ pub fn tag(comptime s: *const [4]u8) u32 {
 /// Where a mark sits relative to the glyph it attaches to, in font units.
 pub const Offset = struct { x: i16 = 0, y: i16 = 0 };
 
+/// GDEF, only as much of it as matching needs: which glyphs are marks, so a
+/// lookup flagged IgnoreMarks can step over them instead of being blocked.
+pub const Gdef = struct {
+    data: []const u8,
+    class_def: usize = 0, // absolute offset, 0 when the table has none
+
+    pub fn init(data: []const u8, off: u32, len: u32) Error!Gdef {
+        if (data.len < off + len or len < 12) return error.Truncated;
+        var g: Gdef = .{ .data = data };
+        const rel = try u16At(data, off + 4);
+        if (rel != 0) g.class_def = off + rel;
+        return g;
+    }
+
+    pub fn classOf(self: Gdef, gid: u16) Error!u16 {
+        if (self.class_def == 0) return 0;
+        const at = self.class_def;
+        switch (try u16At(self.data, at)) {
+            1 => {
+                const start = try u16At(self.data, at + 2);
+                const count = try u16At(self.data, at + 4);
+                if (gid < start or gid >= start + count) return 0;
+                return try u16At(self.data, at + 6 + @as(usize, gid - start) * 2);
+            },
+            2 => {
+                const count = try u16At(self.data, at + 2);
+                var i: usize = 0;
+                while (i < count) : (i += 1) {
+                    const rec = at + 4 + i * 6;
+                    const lo = try u16At(self.data, rec);
+                    const hi = try u16At(self.data, rec + 2);
+                    if (gid >= lo and gid <= hi) return try u16At(self.data, rec + 4);
+                }
+                return 0;
+            },
+            else => return 0,
+        }
+    }
+
+    /// Class 3 is "mark" in GDEF's GlyphClassDef.
+    pub fn isMark(self: Gdef, gid: u16) Error!bool {
+        return (try self.classOf(gid)) == 3;
+    }
+};
+
 pub const Adjust = struct {
     x_placement: i16 = 0,
     y_placement: i16 = 0,
@@ -54,6 +99,7 @@ pub fn valueSize(vf: u16) usize {
 /// One GPOS or GSUB table, addressed over the caller's font bytes.
 pub const Layout = struct {
     data: []const u8,
+    gdef: ?Gdef = null,
     script_list: usize,
     feature_list: usize,
     lookup_list: usize,
@@ -368,11 +414,12 @@ pub const Layout = struct {
         for (lookups) |li| {
             const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, li) * 2);
             const kind = try u16At(self.data, lookup);
+            const flags = try u16At(self.data, lookup + 2);
             const sub_count = try u16At(self.data, lookup + 4);
             var i: usize = 0;
             while (i < sub_count) : (i += 1) {
                 const sub = lookup + try u16At(self.data, lookup + 6 + i * 2);
-                const step = try self.substPass(kind, sub, out, len);
+                const step = try self.substPass(kind, sub, out, len, flags);
                 len = step;
             }
         }
@@ -396,6 +443,7 @@ pub const Layout = struct {
         if (depth > 8) return len;
         const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, index) * 2);
         const kind = try u16At(self.data, lookup);
+        const flags = try u16At(self.data, lookup + 2);
         const sub_count = try u16At(self.data, lookup + 4);
         var cur = len;
         var i: usize = 0;
@@ -407,7 +455,7 @@ pub const Layout = struct {
                 real_kind = try u16At(self.data, sub + 2);
                 real = sub + try u32At(self.data, sub + 4);
             }
-            const step = try self.substAt(real_kind, real, buf, cur, pos, depth);
+            const step = try self.substAt(real_kind, real, buf, cur, pos, depth, flags);
             // Only a HIT carries a length. Step.len defaults to 0 for a miss,
             // so assigning it unconditionally truncated the run to nothing at
             // the first lookup that did not match.
@@ -424,7 +472,7 @@ pub const Layout = struct {
     /// Formats 1 and 2 (glyph and class based rule sets) are not implemented
     /// and match nothing, so a font using them keeps its unsubstituted glyphs
     /// rather than producing wrong ones.
-    fn chainAt(self: Layout, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4) Error!Step {
+    fn chainAt(self: Layout, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16) Error!Step {
         if (try u16At(self.data, sub) != 3) return .{};
         var at = sub + 2;
 
@@ -448,11 +496,34 @@ pub const Layout = struct {
         const rec_off = at;
 
         // Input coverage, left to right from pos.
-        if (in_n == 0 or pos + in_n > len) return .{};
-        for (0..in_n) |i| {
-            const cov = sub + try u16At(self.data, in_off + i * 2);
-            if ((try self.coverageIndex(cov, buf[pos + i])) == null) return .{};
+        //
+        // With lookupFlag IgnoreMarks (or UseMarkFilteringSet) a mark does not
+        // break the match: it is stepped over and LEFT IN PLACE, which is how
+        // HarfBuzz ligates لَا while keeping the fatha. `positions` maps each
+        // matched input slot back to its buffer index so the records below
+        // still name the right glyph.
+        if (in_n == 0 or in_n > 16) return .{};
+        const skip_marks = (flags & 0x0008 != 0) or (flags & 0x0010 != 0);
+        var positions: [16]usize = undefined;
+        var got: usize = 0;
+        var p = pos;
+        while (got < in_n) {
+            if (p >= len) return .{};
+            if (skip_marks) {
+                if (self.gdef) |g| {
+                    if (try g.isMark(buf[p])) {
+                        p += 1;
+                        continue;
+                    }
+                }
+            }
+            const cov = sub + try u16At(self.data, in_off + got * 2);
+            if ((try self.coverageIndex(cov, buf[p])) == null) return .{};
+            positions[got] = p;
+            got += 1;
+            p += 1;
         }
+        const matched_end = p;
         // Backtrack reads backwards from pos, nearest first: coverage j matches
         // the glyph j positions to the left.
         if (pos < back_n) return .{};
@@ -461,10 +532,22 @@ pub const Layout = struct {
             if ((try self.coverageIndex(cov, buf[pos - 1 - j])) == null) return .{};
         }
         // Lookahead starts after the input.
-        if (pos + in_n + ahead_n > len) return .{};
-        for (0..ahead_n) |j| {
-            const cov = sub + try u16At(self.data, ahead_off + j * 2);
-            if ((try self.coverageIndex(cov, buf[pos + in_n + j])) == null) return .{};
+        var ap = matched_end;
+        var adone: usize = 0;
+        while (adone < ahead_n) {
+            if (ap >= len) return .{};
+            if (skip_marks) {
+                if (self.gdef) |g| {
+                    if (try g.isMark(buf[ap])) {
+                        ap += 1;
+                        continue;
+                    }
+                }
+            }
+            const cov = sub + try u16At(self.data, ahead_off + adone * 2);
+            if ((try self.coverageIndex(cov, buf[ap])) == null) return .{};
+            adone += 1;
+            ap += 1;
         }
 
         // Records name a position inside the input and a lookup to run there.
@@ -475,13 +558,14 @@ pub const Layout = struct {
         for (0..rec_n) |r| {
             const seq = try u16At(self.data, rec_off + r * 4);
             const li = try u16At(self.data, rec_off + r * 4 + 2);
-            const target = @as(isize, @intCast(pos)) + @as(isize, @intCast(seq)) + shift;
+            if (seq >= got) continue;
+            const target = @as(isize, @intCast(positions[seq])) + shift;
             if (target < 0 or target >= @as(isize, @intCast(cur))) continue;
             const before = cur;
             cur = try self.applyLookupAt(li, buf, cur, @intCast(target), depth + 1);
             shift += @as(isize, @intCast(cur)) - @as(isize, @intCast(before));
         }
-        return .{ .hit = true, .len = cur, .advance = in_n };
+        return .{ .hit = true, .len = cur, .advance = matched_end - pos };
     }
 
     /// GPOS type 4, mark-to-base. Each mark glyph offsets itself by
@@ -627,18 +711,19 @@ pub const Layout = struct {
         for (self.lookupsFor(script, feat, &lookups_buf)) |li| {
             const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, li) * 2);
             const kind = try u16At(self.data, lookup);
+            const flags = try u16At(self.data, lookup + 2);
             const sub_count = try u16At(self.data, lookup + 4);
             var i: usize = 0;
             while (i < sub_count) : (i += 1) {
                 const sub = lookup + try u16At(self.data, lookup + 6 + i * 2);
-                cur = try self.substPass(kind, sub, buf, cur);
+                cur = try self.substPass(kind, sub, buf, cur, flags);
             }
         }
         return cur;
     }
 
     /// Walk `buf[0..len]` applying one subtable at every position.
-    fn substPass(self: Layout, kind: u16, sub: usize, buf: []u16, len: usize) Error!usize {
+    fn substPass(self: Layout, kind: u16, sub: usize, buf: []u16, len: usize, flags: u16) Error!usize {
         var real_kind = kind;
         var real = sub;
         if (kind == 7) {
@@ -649,7 +734,7 @@ pub const Layout = struct {
         var pos: usize = 0;
         var n = len;
         while (pos < n) {
-            const step = try self.substAt(real_kind, real, buf, n, pos, 0);
+            const step = try self.substAt(real_kind, real, buf, n, pos, 0, flags);
             if (step.hit) {
                 n = step.len;
                 pos += step.advance;
@@ -662,10 +747,10 @@ pub const Layout = struct {
 
     const Step = struct { hit: bool = false, len: usize = 0, advance: usize = 1 };
 
-    fn substAt(self: Layout, kind: u16, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4) Error!Step {
+    fn substAt(self: Layout, kind: u16, sub: usize, buf: []u16, len: usize, pos: usize, depth: u4, flags: u16) Error!Step {
         // Contextual lookups gate other lookups rather than substituting a
         // glyph, so they do not have a coverage table at offset 2.
-        if (kind == 6) return self.chainAt(sub, buf, len, pos, depth);
+        if (kind == 6) return self.chainAt(sub, buf, len, pos, depth, flags);
         const gid = buf[pos];
         const cov = sub + try u16At(self.data, sub + 2);
         const idx = (try self.coverageIndex(cov, gid)) orelse return .{};

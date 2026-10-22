@@ -948,12 +948,12 @@ pub const Font = struct {
         for (cps[0..n], out[0..n]) |cp, *g| g.* = self.glyphIndex(cp) catch 0;
         if (n == 0 or self.gsub_span.len == 0) return n;
 
-        const l = opentype.Layout.init(self.data, self.gsub_span.off, self.gsub_span.len) catch return n;
+        var l = opentype.Layout.init(self.data, self.gsub_span.off, self.gsub_span.len) catch return n;
+        // Marks are transparent to matching when a lookup asks for it, which is
+        // what lets lam-alef form across a fatha WITHOUT eating the fatha.
+        if (self.gdef_span.len != 0) l.gdef = opentype.Gdef.init(self.data, self.gdef_span.off, self.gdef_span.len) catch null;
         const arab = opentype.tag("arab");
         var len = n;
-
-        len = l.applyFeature(arab, opentype.tag("ccmp"), out, len) catch len;
-        len = l.applyFeature(arab, opentype.tag("locl"), out, len) catch len;
 
         // Joining forms are decided from the CODEPOINTS, not the glyphs, so a
         // substitution earlier in the run cannot move a neighbour's form.
@@ -968,6 +968,14 @@ pub const Font = struct {
             };
             len = l.applyFeatureAt(arab, feat, out, len, i) catch len;
         }
+
+        // ccmp runs AFTER the joining forms, not before, and that order is
+        // load-bearing: ccmp merges two marks into one glyph (fatha + shadda
+        // becomes uni0651.fatha), so it shortens the buffer. Deciding forms
+        // afterwards indexed codepoints by glyph position and gave the last
+        // letter of مُحَمَّد its isolated form.
+        len = l.applyFeature(arab, opentype.tag("ccmp"), out, len) catch len;
+        len = l.applyFeature(arab, opentype.tag("locl"), out, len) catch len;
 
         for ([_]u32{ opentype.tag("rlig"), opentype.tag("calt"), opentype.tag("liga") }) |feat| {
             len = l.applyFeature(arab, feat, out, len) catch len;

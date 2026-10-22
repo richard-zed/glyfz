@@ -1,6 +1,8 @@
 # GlyfZ
 
-A TrueType font parser and rasteriser for Zig 0.16. No allocator, glyph caching.
+A font decoder and glyph rasteriser for Zig 0.16: TrueType and CFF outlines,
+GSUB/GPOS shaping, variable-font instances, COLR colour. No allocator -- every
+cache is caller-owned memory.
 
 ## Disclaimer
 
@@ -8,9 +10,10 @@ Basically everything here, outside of this disclaimer, and a bit more, was writt
 
 I'm using this for a UI library, didn't want to use the C dependency, kinda ported stb over to Zig. Removed the allocations in the library itself, added caching, and some other optimizations or attempts. And here we are. This has been used in that library already. With the cache hot, it performs better than stb. Cold, is a different story. The benchmark we have showed roughly parity. The real world comparison without caching was not as close. There were other issues though. I'm rambling. That's it. Hope you find this helpful.
 
-GlyfZ reads `glyf`-based fonts, turns outlines into antialiased coverage masks,
-and keeps those masks between draws. It is not a shaper: no glyph substitution,
-no fallback chain, no line breaking.
+GlyfZ reads `glyf` and CFF-based fonts, turns outlines into antialiased
+coverage masks, and keeps those masks between draws. It shapes Arabic and Thai
+over GSUB and kerns from GPOS, but it has no fallback chain and no line breaking:
+those are the caller's job.
 
 ```zig
 var font = try glyfz.Font.init(bytes);           // bytes are yours
@@ -58,8 +61,8 @@ Two properties are the whole point:
 | colour: COLRv0 layers with CPAL palettes | done |
 | Arabic and Thai shaping, over GSUB features | done |
 | hinting, COLRv1, kern formats 2/3 | out of scope |
-| CFF2 outlines | planned |
-| GSUB beyond Arabic and Thai, and GSUB 1.1 FeatureVariations | planned |
+| CFF2 outlines | not implemented |
+| GSUB beyond Arabic and Thai, and GSUB 1.1 FeatureVariations | not implemented |
 | GPOS beyond pair adjustment: contextual positioning, GDEF mark filtering, Device tables | out of scope |
 
 Two kerning surfaces, and they answer different questions. `kern()` reads the
@@ -151,7 +154,7 @@ The first two agree on translate-only composites, and so does the third.
 
 Two checks still in this repo:
 
-- **`zig build test`** -- the unit suite, 49 tests, no font file needed. The
+- **`zig build test`** -- the unit suite, 117 tests, no font file needed. The
   coverage sweep is graded against brute-force supersampling and hand-computed
   shapes, so it is never marked by its own algebra.
 - **`zig build fuzz -Dfont=<ttf>`** -- a truncated face at every 4000th byte,
@@ -197,9 +200,18 @@ Read that honestly: the rasteriser is at parity at UI sizes and behind at
 display sizes. It is not faster than stb. The cache is where the win is, and it
 is a win stb cannot match at the call site, because stb has no cache at all.
 
-The cache-hit column came from the harness that no longer ships; `bench` prints
-its own cached figure, and the two have disagreed by several times over while the
-raster column matched. Treat that column as a magnitude, not a measurement.
+The cache-hit column above came from a harness that no longer ships, and its
+figures are an order of magnitude away from what the shipped `bench` prints for
+the same work. Quote the bench instead (ReleaseFast, default 512 slots, median
+of three interleaved runs): 22.9 ns/hit at 11px, 15.2 at 16px, 13.4 at 24px,
+12.6 at 34px, 11.7 at 48px. The older column is a magnitude only.
+
+One regression is worth recording because it is easy to reintroduce.
+`Font.variationId` used to take the font **by value** while running on every
+cache hit; `Font` carries thirteen spans, so each hit copied it. Hits were 39%
+to 152% slower than the 0.2.x line before that was found. A method that runs per
+glyph or per hit takes `*const Font`, and one that runs once per codepoint does
+not need to.
 
 `zig build bench -Doptimize=ReleaseFast -Dfont=<ttf>` reproduces the raster,
 decode and cache columns, and nothing else, since there is no second
@@ -216,6 +228,49 @@ zig build fuzz  -Dfont=/path/to/font.ttf      # malformed input: rejected, never
 
 No font is vendored, so `bench` and `fuzz` both need `-Dfont=` (or
 `GLYFZ_BENCH_FONT` / `GLYFZ_TEST_FONT`). Aim them at an awkward face on purpose.
+
+## Profiles
+
+Two lines ship, and they are not the same library.
+
+| profile | ref | Zig | contains |
+|---|---|---|---|
+| full | `Zig-0.16` and `main` | 0.16 and 0.17 | outlines, shaping, variations, colour |
+| minimal | `v0.2.0-zig0.16`, `v0.2.1-zig0.17` | 0.16 and 0.17 | Latin TrueType `glyf` decode and rasterise, mask and lookup caches |
+
+The minimal line is frozen: TrueType outlines only, no CFF, no shaping, no
+variations, no colour. Take it if you want the smaller API surface to read --
+Zig compiles only reachable code, so a consumer that never shapes already elides
+those modules from the full build. What the minimal line buys is fewer types,
+not a smaller binary.
+
+```zon
+.glyfz = .{
+    // full
+    .url = "git+https://github.com/scribbles-code/glyfz?ref=Zig-0.16",
+    // minimal
+    // .url = "git+https://github.com/scribbles-code/glyfz?ref=v0.2.1-zig0.17",
+    .hash = "...",
+},
+```
+
+## Caches, and the memory they need
+
+Neither cache allocates; both are carved from a buffer you supply.
+
+`Cache` holds rasterised coverage keyed on glyph, scale and subpixel phase, and
+partitions its arena by mask size so one display-size glyph does not evict the
+alphabet. `Cache.init` refuses a buffer smaller than the options require. When a
+size class fills, that class alone gives way and `stats.flushes` counts it: a
+high flush count says the arena is undersized for the working set, which is a
+number to look at rather than a behaviour to infer. `Lookup` caches codepoint to
+glyph index and *resolved* advance, which collapses the `USE_MY_METRICS`
+component walk to once per codepoint.
+
+`slots` defaults to 512. Probe chains are open-addressed and end at the first
+empty slot, so a working set approaching that count costs real time: 470 live
+entries at the default lengthened hits by roughly a third. Size `slots` to the
+number of glyph-scale pairs you expect hot.
 
 ## Known gaps
 
@@ -251,6 +306,14 @@ No font is vendored, so `bench` and `fuzz` both need `-Dfont=` (or
 - **The one consumer pins a commit.** A Zig GUI toolkit links this at a specific
   revision rather than by version range, so an API change here reaches it only
   when that pin is moved on purpose. Nothing else consumes GlyfZ.
+
+- **No bitmap or compressed container.** CBDT/CBLC and `sbix` are not read, so
+  a colour-emoji face in its usual format renders nothing; COLR v0 works, and a
+  COLR v1 face falls back to its v0 layer list. WOFF and WOFF2 are not read
+  either -- decompression needs an allocator, which this library deliberately
+  does not have, so hand it a plain `.ttf` or `.otf`.
+- **No line breaking.** UAX #14 is absent, so a CJK paragraph is one unbreakable
+  line; `wrap` records the last space it saw. No bidi, no NFC normalisation.
 
 ## Licence
 

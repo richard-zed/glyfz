@@ -1018,6 +1018,56 @@ pub const Font = struct {
         return len;
     }
 
+    /// Shape a Thai run. Thai needs no reordering: the consonants, vowels and
+    /// tone marks keep their written order, which is why this is short. What it
+    /// does need is the substitutions (`ccmp` composes the vowels that have
+    /// precomposed forms, `liga` is the font's own preference) and the mark
+    /// placement, because a tone mark left at the origin sits inside the
+    /// consonant instead of above it.
+    ///
+    /// Canonical order runs first for the same reason as Arabic: a tone mark
+    /// written before an upper vowel is stored after it, and the order decides
+    /// which of them the font's anchors stack.
+    ///
+    /// What this does NOT do: `aalt` (an alternate, not something a run applies
+    /// on its own), word breaking, or the SARA AM decomposition HarfBuzz does
+    /// only for fonts that lack the precomposed glyph.
+    pub fn shapeThai(self: Font, cps: []const u21, out: []u16, place: ?[]opentype.Offset) GlyphError!usize {
+        const n = @min(cps.len, out.len);
+        var ordered: [max_order]u21 = undefined;
+        var src: []const u21 = cps[0..n];
+        if (n <= max_order) {
+            @memcpy(ordered[0..n], cps[0..n]);
+            arabic.canonicalOrder(ordered[0..n]);
+            src = ordered[0..n];
+        }
+        for (src, out[0..n]) |cp, *g| g.* = self.glyphIndex(cp) catch 0;
+        if (n == 0) return n;
+        var len = n;
+        var comps_of: [max_order]u8 = @splat(0xFF);
+        const thai = opentype.tag("thai");
+        if (self.gsub_span.len != 0) {
+            var l = opentype.Layout.init(self.data, self.gsub_span.off, self.gsub_span.len) catch return n;
+            l.lig = comps_of[0..];
+            if (self.gdef_span.len != 0) l.gdef = opentype.Gdef.init(self.data, self.gdef_span.off, self.gdef_span.len) catch null;
+            len = l.applyFeature(thai, opentype.tag("ccmp"), out, len) catch len;
+            len = l.applyFeature(thai, opentype.tag("liga"), out, len) catch len;
+        }
+
+        if (place) |p| {
+            @memset(p[0..len], .{});
+            if (self.gpos_span.len != 0) {
+                if (opentype.Layout.init(self.data, self.gpos_span.off, self.gpos_span.len)) |gp_init| {
+                    var gp = gp_init;
+                    gp.lig = comps_of[0..];
+                    _ = gp.markAttach(thai, opentype.tag("mark"), out[0..len], len, p) catch 0;
+                    _ = gp.markAttach(thai, opentype.tag("mkmk"), out[0..len], len, p) catch 0;
+                } else |_| {}
+            }
+        }
+        return len;
+    }
+
     /// Horizontal metrics for a glyph, straight out of `hmtx`. Ids past
     /// `numberOfHMetrics` repeat the last advance and read their bearing from
     /// the trailing array -- that is the format, not a shortcut.

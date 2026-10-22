@@ -99,13 +99,13 @@ pub fn main() !void {
 
         // Cached: warm the whole set (every one a miss), then time pure hits.
         const ppem: u16 = @intFromFloat(@round(scale * @as(f32, @floatFromInt(font.units_per_em))));
-        for (glyphs[0..n]) |gid| _ = cache.mask(font, gid, ppem, .zero) catch continue;
+        for (glyphs[0..n]) |gid| _ = cache.mask(&font, gid, ppem, .zero) catch continue;
 
         var best_cached: i128 = std.math.maxInt(i128);
         r = 0;
         while (r < reps) : (r += 1) {
             const t0 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
-            for (glyphs[0..n]) |gid| _ = cache.mask(font, gid, ppem, .zero) catch continue;
+            for (glyphs[0..n]) |gid| _ = cache.mask(&font, gid, ppem, .zero) catch continue;
             const t1 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
             best_cached = @min(best_cached, t1 - t0);
         }
@@ -140,7 +140,7 @@ pub fn main() !void {
 
     // Warm: every codepoint is a miss the first time through.
     for (cps[0..ncp]) |c| {
-        _ = lookup.resolve(font, c) catch continue;
+        _ = lookup.resolve(&font, c) catch continue;
     }
     var lr: u32 = 0;
     while (lr < look_reps) : (lr += 1) {
@@ -157,7 +157,7 @@ pub fn main() !void {
     while (lr < look_reps) : (lr += 1) {
         const t0 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
         for (cps[0..ncp]) |c| {
-            _ = lookup.resolve(font, c) catch continue;
+            _ = lookup.resolve(&font, c) catch continue;
         }
         const t1 = std.Io.Timestamp.now(io, .awake).toNanoseconds();
         best_lookup = @min(best_lookup, t1 - t0);

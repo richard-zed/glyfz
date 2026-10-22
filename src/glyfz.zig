@@ -2644,7 +2644,7 @@ pub const Cache = struct {
     /// The mask for this glyph at this pixel size and phase, rasterising it if
     /// it is not already held.
     /// A mask at a pixel size, for callers who think in ppem.
-    pub fn mask(self: *Cache, font: Font, gid: u16, ppem: u16, phase: Phase) GlyphError!Mask {
+    pub fn mask(self: *Cache, font: *const Font, gid: u16, ppem: u16, phase: Phase) GlyphError!Mask {
         if (ppem == 0 or font.units_per_em == 0) return .{};
         const scale = @as(f32, @floatFromInt(ppem)) / @as(f32, @floatFromInt(font.units_per_em));
         return self.maskAt(font, gid, scale, phase);
@@ -2658,7 +2658,7 @@ pub const Cache = struct {
     /// unitsPerEm. Handing the cache a ppem would therefore silently rasterise
     /// at a different size than the caller lays out with. The scale is the
     /// primitive; ppem is the convenience wrapper above.
-    pub fn maskAt(self: *Cache, font: Font, gid: u16, scale: f32, phase: Phase) GlyphError!Mask {
+    pub fn maskAt(self: *Cache, font: *const Font, gid: u16, scale: f32, phase: Phase) GlyphError!Mask {
         return self.maskAtXY(font, gid, scale, phase, .zero);
     }
 
@@ -2667,7 +2667,7 @@ pub const Cache = struct {
     /// The y phase belongs in the KEY, not just the call: two masks of one glyph
     /// that differ only vertically are different pictures, so sharing a slot
     /// between them would serve the wrong one forever.
-    pub fn maskAtXY(self: *Cache, font: Font, gid: u16, scale: f32, phase: Phase, phase_y: Phase) GlyphError!Mask {
+    pub fn maskAtXY(self: *Cache, font: *const Font, gid: u16, scale: f32, phase: Phase, phase_y: Phase) GlyphError!Mask {
         const scale_key: u32 = @bitCast(scale);
         if (self.find(gid, scale_key, phase, phase_y)) |s| {
             self.stats.hits += 1;
@@ -2842,7 +2842,7 @@ pub const Lookup = struct {
     /// time. A failed resolution is not cached: it is rare, the caller has to
     /// handle the error anyway, and caching it would need a second kind of slot
     /// for no gain.
-    pub fn resolve(self: *Lookup, font: Font, cp: u21) GlyphError!Entry {
+    pub fn resolve(self: *Lookup, font: *const Font, cp: u21) GlyphError!Entry {
         const key: u32 = @intCast(cp);
         const start = self.probeStart(key);
         var i: usize = 0;
@@ -3669,14 +3669,14 @@ test "a cached mask matches a direct rasterisation, and repeats are hits" {
     const scale = @as(f32, @floatFromInt(ppem)) / @as(f32, @floatFromInt(font.units_per_em));
     const direct = try font.raster(6, scale, 0, &pts, &ends, &edges, &scratch, &cov);
 
-    const first = try cache.mask(font, 6, ppem, .zero);
+    const first = try cache.mask(&font, 6, ppem, .zero);
     try std.testing.expectEqual(@as(u64, 0), cache.stats.hits);
     try std.testing.expectEqual(@as(u64, 1), cache.stats.misses);
     try std.testing.expectEqual(direct.w, first.w);
     try std.testing.expectEqual(direct.h, first.h);
     try std.testing.expectEqualSlices(u8, direct.coverage, first.pixels);
 
-    const second = try cache.mask(font, 6, ppem, .zero);
+    const second = try cache.mask(&font, 6, ppem, .zero);
     try std.testing.expectEqual(@as(u64, 1), cache.stats.hits);
     try std.testing.expectEqual(@as(u64, 1), cache.stats.misses);
     try std.testing.expectEqualSlices(u8, first.pixels, second.pixels);
@@ -3688,18 +3688,18 @@ test "the cache key covers size and phase, not just the glyph" {
     var cbuf: [64 * 1024]u8 align(8) = undefined;
     var cache = try Cache.init(&cbuf, .{ .slots = 16, .max_points = 256, .max_edges = 256, .max_width = 64, .arena = 48 * 1024 });
 
-    _ = try cache.mask(font, 6, 16, .zero);
-    _ = try cache.mask(font, 6, 16, .zero);
+    _ = try cache.mask(&font, 6, 16, .zero);
+    _ = try cache.mask(&font, 6, 16, .zero);
     try std.testing.expectEqual(@as(u64, 1), cache.stats.hits);
     try std.testing.expectEqual(@as(u64, 1), cache.stats.misses);
 
     // A different size is a different mask, and so is a different phase.
-    _ = try cache.mask(font, 6, 17, .zero);
+    _ = try cache.mask(&font, 6, 17, .zero);
     try std.testing.expectEqual(@as(u64, 2), cache.stats.misses);
-    _ = try cache.mask(font, 6, 16, .half);
+    _ = try cache.mask(&font, 6, 16, .half);
     try std.testing.expectEqual(@as(u64, 3), cache.stats.misses);
 
-    _ = try cache.mask(font, 6, 16, .zero);
+    _ = try cache.mask(&font, 6, 16, .zero);
     try std.testing.expectEqual(@as(u64, 2), cache.stats.hits);
 }
 
@@ -3720,7 +3720,7 @@ test "a full arena flushes instead of handing back stale pixels" {
     var ppem: u16 = 6;
     var last: Mask = .{};
     while (ppem < 40) : (ppem += 1) {
-        last = try cache.mask(font, 6, ppem, .zero);
+        last = try cache.mask(&font, 6, ppem, .zero);
     }
     try std.testing.expect(cache.stats.flushes > 0);
 
@@ -3745,7 +3745,7 @@ test "filling one size class does not evict the small masks" {
     });
 
     // One small mask: the kind a row of text asks for on every frame.
-    const small = try cache.mask(font, 6, 8, .zero);
+    const small = try cache.mask(&font, 6, 8, .zero);
     try std.testing.expect(small.pixels.len > 0);
     var snapshot: [4096]u8 = undefined;
     @memcpy(snapshot[0..small.pixels.len], small.pixels);
@@ -3755,13 +3755,13 @@ test "filling one size class does not evict the small masks" {
     // hot ones to make room for themselves.
     var ppem: u16 = 300;
     while (ppem < 600) : (ppem += 1) {
-        _ = try cache.mask(font, 6, ppem, .zero);
-        _ = try cache.mask(font, 7, ppem, .zero);
+        _ = try cache.mask(&font, 6, ppem, .zero);
+        _ = try cache.mask(&font, 7, ppem, .zero);
     }
     try std.testing.expect(cache.stats.flushes > 0); // it really did give way
 
     const mid = cache.stats;
-    const again = try cache.mask(font, 6, 8, .zero);
+    const again = try cache.mask(&font, 6, 8, .zero);
     try std.testing.expectEqual(mid.misses, cache.stats.misses);
     try std.testing.expectEqual(mid.hits + 1, cache.stats.hits);
     try std.testing.expectEqualSlices(u8, snapshot[0..again.pixels.len], again.pixels);
@@ -3786,18 +3786,18 @@ test "evicting a class leaves the keys behind its holes findable" {
     // and the caller gets the WRONG mask rather than a slow one.
     var ppem: u16 = 8;
     while (ppem < 14) : (ppem += 1) {
-        _ = try cache.mask(font, 6, ppem, .zero);
-        _ = try cache.mask(font, 7, ppem * 40, .zero);
+        _ = try cache.mask(&font, 6, ppem, .zero);
+        _ = try cache.mask(&font, 7, ppem * 40, .zero);
     }
     const smalls = [_]u16{ 8, 9, 10, 11, 12, 13 };
     const before = cache.stats;
 
     var storm: u16 = 300;
-    while (storm < 500) : (storm += 1) _ = try cache.mask(font, 6, storm, .zero);
+    while (storm < 500) : (storm += 1) _ = try cache.mask(&font, 6, storm, .zero);
     try std.testing.expect(cache.stats.flushes > 0);
 
     const mid = cache.stats;
-    for (smalls) |p| _ = try cache.mask(font, 6, p, .zero);
+    for (smalls) |p| _ = try cache.mask(&font, 6, p, .zero);
     // Every small key is still there: no new rasterisations, all hits.
     try std.testing.expectEqual(mid.misses, cache.stats.misses);
     try std.testing.expectEqual(mid.hits + smalls.len, cache.stats.hits);
@@ -3837,16 +3837,16 @@ test "a vertical phase moves the mask, and is part of the cache key" {
     const font = try Font.init(buildTestFont(&fbuf, false));
     var cache = try Cache.init(&mem, .{});
 
-    const flat = try cache.maskAtXY(font, 6, 0.2, .zero, .zero);
+    const flat = try cache.maskAtXY(&font, 6, 0.2, .zero, .zero);
     const before = cache.stats;
 
     // Same glyph, same scale, offset half a pixel DOWN: a different picture.
-    const half = try cache.maskAtXY(font, 6, 0.2, .zero, .half);
+    const half = try cache.maskAtXY(&font, 6, 0.2, .zero, .half);
     try std.testing.expect(cache.stats.misses == before.misses + 1);
     try std.testing.expect(half.y0 != flat.y0 or !std.mem.eql(u8, half.pixels, flat.pixels));
 
     // And each y phase is cached on its own, so asking again is free.
-    const again = try cache.maskAtXY(font, 6, 0.2, .zero, .zero);
+    const again = try cache.maskAtXY(&font, 6, 0.2, .zero, .zero);
     try std.testing.expect(cache.stats.hits == 1);
     try std.testing.expectEqualSlices(u8, flat.pixels, again.pixels);
 }
@@ -4025,7 +4025,7 @@ test "the usage shown in the README compiles and runs" {
         .arena = 16 * 1024,
     }); // storage is yours
     const gid = try font.glyphIndex('A');
-    const m = try cache.mask(font, gid, 16, .zero); // a hash lookup once warm
+    const m = try cache.mask(&font, gid, 16, .zero); // a hash lookup once warm
 
     try std.testing.expect(m.w > 0 and m.h > 0);
     try std.testing.expectEqual(m.pixels.len, @as(usize, m.w) * m.h);
@@ -4058,7 +4058,7 @@ fn sweepUse(bytes: []const u8, cmem: []align(8) u8, deep: bool) void {
         _ = font.hMetrics(gid) catch {};
         _ = font.bitmapBox(gid, 0.0175, 0) catch {};
         _ = font.bitmapBox(gid, 0.0175, 0.5) catch {};
-        _ = cache.mask(font, gid, 13, .zero) catch {};
+        _ = cache.mask(&font, gid, 13, .zero) catch {};
     }
     _ = font.kern(2, 3);
     _ = font.kern(6, 7);
@@ -4281,7 +4281,7 @@ test "lookup: a cached resolve agrees with the cmap and hmtx" {
     var l = try Lookup.init(&mem, .{});
 
     for ([_]u21{ 'A', 'B', 'C', 0x1F600, 'A', 'z', 0x20 }) |cp| {
-        const got = try l.resolve(f, cp);
+        const got = try l.resolve(&f, cp);
         try std.testing.expectEqual(try f.glyphIndex(cp), got.gid);
         try std.testing.expectEqual((try f.hMetrics(got.gid)).advance, got.advance);
     }
@@ -4294,17 +4294,17 @@ test "lookup: the second resolve is a hit, the first is not" {
     var mem: [Lookup.needed(.{})]u8 align(8) = undefined;
     var l = try Lookup.init(&mem, .{});
 
-    _ = try l.resolve(f, 'A');
+    _ = try l.resolve(&f, 'A');
     try std.testing.expectEqual(@as(u64, 1), l.stats.misses);
     try std.testing.expectEqual(@as(u64, 0), l.stats.hits);
 
-    _ = try l.resolve(f, 'A');
-    _ = try l.resolve(f, 'A');
+    _ = try l.resolve(&f, 'A');
+    _ = try l.resolve(&f, 'A');
     try std.testing.expectEqual(@as(u64, 1), l.stats.misses);
     try std.testing.expectEqual(@as(u64, 2), l.stats.hits);
 
     // resolve must not mutate the font or the entry it hands back.
-    try std.testing.expectEqual(@as(u16, 6), (try l.resolve(f, 'A')).gid);
+    try std.testing.expectEqual(@as(u16, 6), (try l.resolve(&f, 'A')).gid);
 }
 
 test "lookup: eviction never returns another codepoint's glyph" {
@@ -4320,7 +4320,7 @@ test "lookup: eviction never returns another codepoint's glyph" {
     var round: usize = 0;
     while (round < 3) : (round += 1) {
         for ([_]u21{ 'A', 'B', 'z' }) |cp| {
-            const got = try l.resolve(f, cp);
+            const got = try l.resolve(&f, cp);
             try std.testing.expectEqual(try f.glyphIndex(cp), got.gid);
         }
     }
@@ -4527,13 +4527,13 @@ test "Lookup stores the RESOLVED advance, so a hit cannot report a stale one" {
     var mem: [Lookup.needed(.{ .slots = 16 })]u8 align(8) = undefined;
     var l = try Lookup.init(&mem, .{ .slots = 16 });
 
-    const first = try l.resolve(f, 0x42);
+    const first = try l.resolve(&f, 0x42);
     try std.testing.expectEqual(@as(u16, 7), first.gid);
     try std.testing.expectEqual(@as(u16, 600), first.advance);
     try std.testing.expectEqual(@as(u32, 1), l.stats.misses);
 
     // Served from the slot, and still the resolved number.
-    const again = try l.resolve(f, 0x42);
+    const again = try l.resolve(&f, 0x42);
     try std.testing.expectEqual(@as(u16, 600), again.advance);
     try std.testing.expectEqual(@as(u32, 1), l.stats.hits);
 }

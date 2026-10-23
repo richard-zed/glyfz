@@ -1065,7 +1065,7 @@ pub const Font = struct {
                 .final => opentype.tag("fina"),
                 .none => continue,
             };
-            len = l.applyFeatureAt(arab, feat, out, len, i) catch len;
+            len = l.applyFeatureAt(arab, 0, feat, out, len, i) catch len;
         }
 
         // ccmp runs AFTER the joining forms, not before, and that order is
@@ -1073,8 +1073,8 @@ pub const Font = struct {
         // becomes uni0651.fatha), so it shortens the buffer. Deciding forms
         // afterwards indexed codepoints by glyph position and gave the last
         // letter of مُحَمَّد its isolated form.
-        len = l.applyFeature(arab, opentype.tag("ccmp"), out, len) catch len;
-        len = l.applyFeature(arab, opentype.tag("locl"), out, len) catch len;
+        len = l.applyFeature(arab, 0, opentype.tag("ccmp"), out, len) catch len;
+        len = l.applyFeature(arab, 0, opentype.tag("locl"), out, len) catch len;
 
         // `liga` is deliberately absent. DejaVu puts the Arabic PRESENTATION
         // FORMS under `liga` (uni0640 + uni064B -> uniFE71), and HarfBuzz's
@@ -1085,7 +1085,7 @@ pub const Font = struct {
         // rlig ligatures intact: they are a different feature, not a
         // different mark rule.
         for ([_]u32{ opentype.tag("rlig"), opentype.tag("calt") }) |feat| {
-            len = l.applyFeature(arab, feat, out, len) catch len;
+            len = l.applyFeature(arab, 0, feat, out, len) catch len;
         }
 
         // Marks are positioned after substitution, because the substitutions
@@ -1102,8 +1102,8 @@ pub const Font = struct {
                 if (opentype.Layout.init(self.data, self.gpos_span.off, self.gpos_span.len)) |gp_init| {
                     var gp = gp_init;
                     gp.lig = comps_of[0..];
-                    _ = gp.markAttach(arab, opentype.tag("mark"), out[0..len], len, p) catch 0;
-                    _ = gp.markAttach(arab, opentype.tag("mkmk"), out[0..len], len, p) catch 0;
+                    _ = gp.markAttach(arab, 0, opentype.tag("mark"), out[0..len], len, p) catch 0;
+                    _ = gp.markAttach(arab, 0, opentype.tag("mkmk"), out[0..len], len, p) catch 0;
                 } else |_| {}
             }
         }
@@ -1142,8 +1142,8 @@ pub const Font = struct {
             var l = opentype.Layout.init(self.data, self.gsub_span.off, self.gsub_span.len) catch return n;
             l.lig = comps_of[0..];
             if (self.gdef_span.len != 0) l.gdef = opentype.Gdef.init(self.data, self.gdef_span.off, self.gdef_span.len) catch null;
-            len = l.applyFeature(thai, opentype.tag("ccmp"), out, len) catch len;
-            len = l.applyFeature(thai, opentype.tag("liga"), out, len) catch len;
+            len = l.applyFeature(thai, 0, opentype.tag("ccmp"), out, len) catch len;
+            len = l.applyFeature(thai, 0, opentype.tag("liga"), out, len) catch len;
         }
 
         if (place) |p| {
@@ -1158,8 +1158,8 @@ pub const Font = struct {
                 if (opentype.Layout.init(self.data, self.gpos_span.off, self.gpos_span.len)) |gp_init| {
                     var gp = gp_init;
                     gp.lig = comps_of[0..];
-                    _ = gp.markAttach(thai, opentype.tag("mark"), out[0..len], len, p) catch 0;
-                    _ = gp.markAttach(thai, opentype.tag("mkmk"), out[0..len], len, p) catch 0;
+                    _ = gp.markAttach(thai, 0, opentype.tag("mark"), out[0..len], len, p) catch 0;
+                    _ = gp.markAttach(thai, 0, opentype.tag("mkmk"), out[0..len], len, p) catch 0;
                 } else |_| {}
 
                 // Thai runs LEFT TO RIGHT, so a mark's pen sits after the base
@@ -1221,6 +1221,17 @@ pub const Font = struct {
         /// lookup indices would be applied to this face's tables, and wrong
         /// kerning is worse than slow kerning.
         kern_cache: ?*const Kern = null,
+        /// Extra SUBSTITUTION features, applied after the default set and in
+        /// this order: `fwid`, `hwid`, `vert`, `vrt2`, `smcp`, `onum` ...
+        ///
+        /// The default set is what a run needs to be SPELLED correctly. These
+        /// are style choices -- half-width forms, vertical forms, small caps --
+        /// so naming them is the caller's job, not a guess this function
+        /// should make on their behalf. A tag with no lookups under the run's
+        /// script is a no-op rather than an error: the same tag applied to a
+        /// Latin face is simply not there.
+        features: ?[]const u32 = null,
+
         /// Apply pair kerning: the `kern` feature in GPOS, falling back to the
         /// legacy `kern` table when the face has no such feature.
         ///
@@ -1703,7 +1714,7 @@ pub const Font = struct {
 
         var len = n;
         var comps_of: [max_order]u8 = @splat(0xFF);
-        const script = if (opts.script != 0) opts.script else self.pickScript();
+        const script = if (opts.script != 0) opts.script else self.scriptOf(src[0..n]);
         if (self.gsub_span.len != 0 and opts.substitute) {
             var l = opentype.Layout.init(self.data, self.gsub_span.off, self.gsub_span.len) catch return n;
             // Fixed-size scratch: a longer run loses component tracking rather
@@ -1717,8 +1728,14 @@ pub const Font = struct {
                 opentype.tag("ccmp"), opentype.tag("locl"), opentype.tag("rlig"),
                 opentype.tag("liga"), opentype.tag("clig"), opentype.tag("calt"),
             }) |feat| {
-                len = l.applyFeature(script, feat, out, len) catch len;
+                len = l.applyFeature(script, opts.lang, feat, out, len) catch len;
             }
+            // Caller-named features come after, so they see the run the
+            // default set produced -- `vert` on a glyph `locl` just swapped in
+            // is the case that matters for CJK.
+            if (opts.features) |extra| for (extra) |feat| {
+                len = l.applyFeature(script, opts.lang, feat, out, len) catch len;
+            };
         }
 
         if (place) |p| {
@@ -1733,8 +1750,8 @@ pub const Font = struct {
                 if (opentype.Layout.init(self.data, self.gpos_span.off, self.gpos_span.len)) |gp_init| {
                     var gp = gp_init;
                     gp.lig = comps_of[0..];
-                    _ = gp.markAttach(script, opentype.tag("mark"), out[0..len], len, p) catch 0;
-                    _ = gp.markAttach(script, opentype.tag("mkmk"), out[0..len], len, p) catch 0;
+                    _ = gp.markAttach(script, opts.lang, opentype.tag("mark"), out[0..len], len, p) catch 0;
+                    _ = gp.markAttach(script, opts.lang, opentype.tag("mkmk"), out[0..len], len, p) catch 0;
                 } else |_| {}
             }
         }
@@ -1799,8 +1816,34 @@ pub const Font = struct {
         }
     }
 
-    /// The script to use when the caller did not name one: whichever of `latn`
-    /// and `DFLT` actually carries the features this shaper applies.
+    /// The script of the TEXT, for choosing features.
+    ///
+    /// `pickScript` answers from the FONT -- does it carry `liga` or `ccmp
+    /// under `latn`? -- which is why a face with both Latin and CJK always
+    /// reported `latn` and nothing under `hani` or `kana` was ever reachable.
+    /// Shaping needs the script of the characters. First character that has a
+    /// script of its own wins, as in HarfBuzz: space, digits and punctuation
+    /// are Common and decide nothing about what the text is.
+    ///
+    /// Choosing a script that the face does not carry costs nothing, because
+    /// `lookupsFor` falls back to the default script when a lookup list comes
+    /// back empty.
+    fn scriptOf(self: Font, cps: []const u21) u32 {
+        for (cps) |cp| {
+            if (scriptOfCodepoint(cp)) |s| return s;
+        }
+        // Nothing but Common characters, or nothing at all: the font's own
+        // answer is the honest one.
+        return self.pickScript();
+    }
+
+    /// The script to use when the caller did not name one and the text decides
+    /// nothing (nothing but Common characters, or an empty run): whichever of
+    /// `latn` and `DFLT` actually carries the features this shaper applies.
+    ///
+    /// This answers from the FONT, not the text, so it is only the fallback --
+    /// `scriptOf` asks it last. On a face carrying both Latin and CJK this
+    /// always says `latn`, which is why it cannot be the primary answer.
     fn pickScript(self: Font) u32 {
         const latn = opentype.tag("latn");
         const dflt = opentype.tag("DFLT");
@@ -1809,6 +1852,64 @@ pub const Font = struct {
                 self.hasGsubFeature(cand, 0, opentype.tag("ccmp"))) return cand;
         }
         return dflt;
+    }
+
+    /// Script by Unicode block, for the ranges whose features a run keys off.
+    ///
+    /// `null` means Common or Inherited: that character says nothing about what
+    /// the run is, so the next one is asked. Arabic and Thai are deliberately not
+    /// here -- `shapeArabic` and `shapeThai` own those and carry their own feature
+    /// lists, so this table only has to cover what `shape` itself decides.
+    pub fn scriptOfCodepoint(cp: u21) ?u32 {
+        return switch (cp) {
+            // Han: radicals, extension A, the main block, compatibility ideographs
+            // and the supplementary planes, which are the same script.
+            0x2E80...0x2EFF, 0x3400...0x4DBF, 0x4E00...0x9FFF, 0xF900...0xFAFF, 0x20000...0x2FA1F => opentype.tag("hani"),
+            // Kana: hiragana, katakana, the katakana phonetic extensions, and the
+            // halfwidth forms.
+            0x3040...0x30FF, 0x31F0...0x31FF, 0xFF66...0xFF9F => opentype.tag("kana"),
+            // Hangul: jamo, compatibility jamo, and the precomposed syllables.
+            0x1100...0x11FF, 0x3130...0x318F, 0xA960...0xA97F, 0xAC00...0xD7FF => opentype.tag("hang"),
+            // Latin, which is what a letter run falls back to today.
+            0x0041...0x005A, 0x0061...0x007A, 0x00C0...0x024F, 0x1E00...0x1EFF => opentype.tag("latn"),
+            else => null,
+        };
+    }
+
+    test "a codepoint's script is decided by its block, and Common decides nothing" {
+        // Each CJK script is its own, because their features differ.
+        try std.testing.expectEqual(opentype.tag("hani"), Font.scriptOfCodepoint(0x4E2D).?);
+        try std.testing.expectEqual(opentype.tag("kana"), Font.scriptOfCodepoint(0x3042).?);
+        try std.testing.expectEqual(opentype.tag("hang"), Font.scriptOfCodepoint(0xAC00).?);
+        try std.testing.expectEqual(opentype.tag("latn"), Font.scriptOfCodepoint('A').?);
+
+        // Space, digits and punctuation are Common: they must not get a vote, or
+        // a leading space would outvote the text it introduces.
+        try std.testing.expectEqual(@as(?u32, null), Font.scriptOfCodepoint(' '));
+        try std.testing.expectEqual(@as(?u32, null), Font.scriptOfCodepoint('7'));
+        try std.testing.expectEqual(@as(?u32, null), Font.scriptOfCodepoint(','));
+
+        // Supplementary-plane ideographs are Han, not an unknown block.
+        try std.testing.expectEqual(opentype.tag("hani"), Font.scriptOfCodepoint(0x20000).?);
+
+        // Arabic and Thai are absent on purpose: shapeArabic and shapeThai own
+        // them, so shape() must not start claiming them here.
+        try std.testing.expectEqual(@as(?u32, null), Font.scriptOfCodepoint(0x0645));
+    }
+
+    test "a run of Common characters falls back to the font, not to nothing" {
+        var buf: [8192]u8 = undefined;
+        const f = try Font.init(buildTestFont(&buf, false));
+
+        // Hanzi decide the run even behind a space.
+        try std.testing.expectEqual(
+            opentype.tag("hani"),
+            f.scriptOf(&[_]u21{ ' ', 0x4E2D }),
+        );
+        // Nothing but Common: whatever the face itself offers.
+        try std.testing.expectEqual(f.pickScript(), f.scriptOf(&[_]u21{ ' ', '1' }));
+        // Empty is the same case, and must not read past the slice.
+        try std.testing.expectEqual(f.pickScript(), f.scriptOf(&[_]u21{}));
     }
 
     /// Does the file carry this table at all? Answers about the DIRECTORY, so
@@ -3606,6 +3707,11 @@ const GsubKind = enum {
     /// One `ccmp` lookup that turns gid 0 into gid 1 followed by gid 2, so a
     /// substitution really does LENGTHEN the run.
     subst,
+    /// One `locl` lookup under a NAMED language system (`JAN `) and no default
+    /// language system at all, so `locl` is reachable only when the caller names
+    /// a language. This is the shape real CJK faces use: the default LangSys
+    /// carries no `locl`, and every regional LangSys carries one.
+    langsys,
 };
 
 /// The same face with a `ccmp` lookup under `arab` and `thai` that expands one
@@ -3617,6 +3723,10 @@ fn buildSubstTestFont(buf: []u8) []const u8 {
 
 fn buildGsubTestFont(buf: []u8) []const u8 {
     return buildTestFontImpl(buf, false, false, .empty);
+}
+
+fn buildLangsysTestFont(buf: []u8) []const u8 {
+    return buildTestFontImpl(buf, false, false, .langsys);
 }
 
 fn buildTestFontImpl(buf: []u8, with_fmt12: bool, comptime with_var: bool, comptime gsub: GsubKind) []const u8 {
@@ -3984,6 +4094,124 @@ fn buildTestFontImpl(buf: []u8, with_fmt12: bool, comptime with_var: bool, compt
         w.u16v(2); // glyphCount: one glyph becomes two
         w.u16v(1);
         w.u16v(2);
+
+        tags[nrec] = tag_gsub;
+        recs[nrec] = .{ .at = g, .len = w.at - g };
+        nrec += 1;
+    }
+
+    if (gsub == .langsys) {
+        // --- GSUB: one `locl` under a NAMED language system only ---
+        //
+        // There is deliberately NO default LangSys, so with `lang = 0` the
+        // feature is unreachable and the run comes back untouched. Naming
+        // `JAN ` is the only way in, which is the property being tested.
+        const g = w.at;
+        w.u32v(0x0001_0000); // version 1.0
+        const sl_at = w.at;
+        w.u16v(0); // scriptListOffset, patched
+        const fl_at = w.at;
+        w.u16v(0); // featureListOffset, patched
+        const ll_at = w.at;
+        w.u16v(0); // lookupListOffset, patched
+
+        // ScriptList: one script, no default LangSys.
+        const sl = w.at;
+        w16(buf[0..], sl_at, @intCast(sl - g));
+        w.u16v(1); // scriptCount
+        w.u32v(tag("DFLT"));
+        const rec_dflt = w.at;
+        w.u16v(0); // scriptOffset, patched
+        const script_rec = w.at;
+        w16(buf[0..], rec_dflt, @intCast(script_rec - sl));
+        w.u16v(0); // defaultLangSysOffset: none, so lang 0 reaches nothing
+        w.u16v(1); // langSysCount
+        w.u32v(tag("JAN "));
+        const rec_jan = w.at;
+        w.u16v(0); // langSysOffset, patched
+        // LangSys
+        const langs = w.at;
+        w16(buf[0..], rec_jan, @intCast(langs - script_rec));
+        w.u16v(0); // lookupOrder
+        w.u16v(0xFFFF); // requiredFeatureIndex
+        w.u16v(2); // featureIndexCount
+        w.u16v(0); // featureIndices[0] -> locl
+        w.u16v(1); // featureIndices[1] -> fwid
+
+        // FeatureList: locl -> lookup 0, fwid -> lookup 1. `locl` is in the
+        // default set and `fwid` is not, which is what lets a test tell
+        // "applied by default" from "applied because the caller named it".
+        const fl = w.at;
+        w16(buf[0..], fl_at, @intCast(fl - g));
+        w.u16v(2); // featureCount
+        w.u32v(tag("locl"));
+        const feat_off_at = w.at;
+        w.u16v(0); // featureOffset, patched
+        w.u32v(tag("fwid"));
+        const feat2_off_at = w.at;
+        w.u16v(0); // featureOffset, patched
+        const feat = w.at;
+        w16(buf[0..], feat_off_at, @intCast(feat - fl));
+        w.u16v(0); // featureParams
+        w.u16v(1); // lookupIndexCount
+        w.u16v(0); // lookupListIndices[0]
+        const feat2 = w.at;
+        w16(buf[0..], feat2_off_at, @intCast(feat2 - fl));
+        w.u16v(0); // featureParams
+        w.u16v(1); // lookupIndexCount
+        w.u16v(1); // lookupListIndices[0]
+
+        // LookupList: two type 1 lookups. Lookup 0 turns 'A' (gid 6) into gid 2.
+        // Lookup 1 covers ONLY gid 2 -- the glyph lookup 0 produces -- so it
+        // bites only if the default set ran first. If extras ran before the
+        // defaults, lookup 1 would see gid 6, miss, and the result would stay 2.
+        // That difference is what makes the ORDER observable instead of luck.
+        const ll = w.at;
+        w16(buf[0..], ll_at, @intCast(ll - g));
+        w.u16v(2); // lookupCount
+        const look_off_at = w.at;
+        w.u16v(0); // lookupOffset[0], patched
+        const look2_off_at = w.at;
+        w.u16v(0); // lookupOffset[1], patched
+        const look = w.at;
+        w16(buf[0..], look_off_at, @intCast(look - ll));
+        w.u16v(1); // lookupType: single substitution
+        w.u16v(0); // lookupFlag
+        w.u16v(1); // subTableCount
+        const sub_off_at = w.at;
+        w.u16v(0); // subtableOffset, patched
+        const sub = w.at;
+        w16(buf[0..], sub_off_at, @intCast(sub - look));
+        w.u16v(2); // substFormat 2
+        const cov_off_at = w.at;
+        w.u16v(0); // coverageOffset, patched
+        w.u16v(1); // glyphCount
+        w.u16v(2); // substituteGlyphIDs[0]: gid 6 becomes gid 2
+        const cov = w.at;
+        w16(buf[0..], cov_off_at, @intCast(cov - sub));
+        w.u16v(1); // coverageFormat 1
+        w.u16v(1); // glyphCount
+        w.u16v(6); // coverage glyph: gid 6, which is 'A' in this face
+
+        const look2 = w.at;
+        w16(buf[0..], look2_off_at, @intCast(look2 - ll));
+        w.u16v(1); // lookupType: single substitution
+        w.u16v(0); // lookupFlag
+        w.u16v(1); // subTableCount
+        const sub2_off_at = w.at;
+        w.u16v(0); // subtableOffset, patched
+        const sub2 = w.at;
+        w16(buf[0..], sub2_off_at, @intCast(sub2 - look2));
+        w.u16v(2); // substFormat 2
+        const cov2_off_at = w.at;
+        w.u16v(0); // coverageOffset, patched
+        w.u16v(1); // glyphCount
+        w.u16v(3); // gid 2 -> 3
+        const cov2 = w.at;
+        w16(buf[0..], cov2_off_at, @intCast(cov2 - sub2));
+        w.u16v(1); // coverageFormat 1
+        w.u16v(1); // glyphCount
+        w.u16v(2); // only gid 2, which is what lookup 0 PRODUCES
 
         tags[nrec] = tag_gsub;
         recs[nrec] = .{ .at = g, .len = w.at - g };
@@ -5587,4 +5815,80 @@ test "a CFF face resolves advances without glyf composite records" {
 
     // The codepoint path is what a caller actually uses.
     try std.testing.expectEqual(@as(u16, 1), try f.glyphIndex(0x41));
+}
+
+test "a language system is reachable only when the caller names one" {
+    var fbuf: [2048]u8 = undefined;
+    const font = try Font.init(buildLangsysTestFont(&fbuf));
+    try std.testing.expect(font.gsub_span.len != 0);
+
+    const dflt = opentype.tag("DFLT");
+    const jan = opentype.tag("JAN ");
+
+    // The fixture's `locl` lookup turns the glyph for 'A' into gid 2. Pin the
+    // cmap coupling explicitly, so a change to the fixture's cmap fails HERE
+    // with the reason, rather than as a mysterious "expected 1, found 6".
+    const a = try font.glyphIndex(0x41);
+    try std.testing.expectEqual(@as(u16, 6), a);
+
+    const cps = [_]u21{0x41};
+    var out: [4]u16 = @splat(0);
+
+    // The fixture has NO default LangSys, so naming no language cannot reach
+    // the feature and the glyph has to come back untouched. This is the whole
+    // reason `locl` needs a language at all: a real CJK face puts it ONLY under
+    // the regional LangSys records.
+    var n = try font.shape(&cps, &out, null, .{ .script = dflt });
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(a, out[0]);
+
+    // Naming the language system opens it.
+    out = @splat(0);
+    n = try font.shape(&cps, &out, null, .{ .script = dflt, .lang = jan });
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u16, 2), out[0]);
+
+    // A language the face does not carry behaves like naming none. Without this
+    // a lookup that ignored `lang` entirely would still pass the two cases
+    // above, because the fixture would substitute on both.
+    out = @splat(0);
+    _ = try font.shape(&cps, &out, null, .{ .script = dflt, .lang = opentype.tag("ZHS ") });
+    try std.testing.expectEqual(a, out[0]);
+}
+
+test "caller-named features run after the default set, not instead of it" {
+    var fbuf: [2048]u8 = undefined;
+    const font = try Font.init(buildLangsysTestFont(&fbuf));
+
+    const dflt = opentype.tag("DFLT");
+    const jan = opentype.tag("JAN ");
+    const cps = [_]u21{0x41};
+    var out: [4]u16 = @splat(0);
+    const a = try font.glyphIndex(0x41);
+
+    // `locl` is in the default set, so a language alone reaches it: 6 -> 2.
+    _ = try font.shape(&cps, &out, null, .{ .script = dflt, .lang = jan });
+    try std.testing.expectEqual(@as(u16, 2), out[0]);
+
+    // Naming a feature does NOT replace that set. `fwid` is not in the default
+    // list, so it runs only because it was named -- and it lands on gid 2,
+    // which exists only because `locl` already ran. Result 3 therefore proves
+    // defaults-then-extras; extras-first would have left gid 6 for `locl` to
+    // turn into 2.
+    out = @splat(0);
+    const only_fwid = [_]u32{opentype.tag("fwid")};
+    _ = try font.shape(&cps, &out, null, .{ .script = dflt, .lang = jan, .features = &only_fwid });
+    try std.testing.expectEqual(@as(u16, 3), out[0]);
+
+    // A tag the face does not carry is a no-op rather than an error, and it
+    // must not disturb the default set either.
+    out = @splat(0);
+    const only_liga = [_]u32{opentype.tag("liga")};
+    _ = try font.shape(&cps, &out, null, .{ .script = dflt, .lang = jan, .features = &only_liga });
+    try std.testing.expectEqual(@as(u16, 2), out[0]);
+
+    // Sanity: without the language, none of it is reachable, extras included.
+    out = @splat(0);
+    _ = try font.shape(&cps, &out, null, .{ .script = dflt, .features = &only_fwid });
+    try std.testing.expectEqual(a, out[0]);
 }

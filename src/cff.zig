@@ -440,7 +440,7 @@ fn minimal(b: *B, charstrings: []const []const u8) void {
     _ = b.put(&.{ 1, 0, 4, 1 }); // major, minor, hdrSize, offSize
     b.index(&.{"Test"});
 
-    var dict = [_]u8{0} ** 6;
+    var dict: [6]u8 = @splat(0);
     dict[0] = 29; // 32-bit operand
     dict[5] = op.char_strings;
     const dict_at = topIndex(b, &dict);
@@ -497,7 +497,7 @@ test "a private dict yields its widths and local subroutines" {
     b.index(&.{"Test"});
 
     // CharStrings, then Private (size, offset): 17 bytes, patched below.
-    var dict = [_]u8{0} ** 17;
+    var dict: [17]u8 = @splat(0);
     dict[0] = 29;
     dict[5] = op.char_strings;
     dict[6] = 29;
@@ -1133,7 +1133,7 @@ fn cffFace(b: *B, charstrings: []const []const u8, subrs: []const []const u8) vo
     _ = b.put(&.{ 1, 0, 4, 1 });
     b.index(&.{"Test"});
 
-    var dict = [_]u8{0} ** 17;
+    var dict: [17]u8 = @splat(0);
     dict[0] = 29;
     dict[5] = op.char_strings;
     dict[6] = 29;

@@ -5,16 +5,22 @@ on:
   pull_request:
 
 jobs:
-  zig-0_16:
+  zig:
     strategy:
      fail-fast: false
      matrix:
        include:
         - zig: "0.16.0"
           os: ubuntu-latest
+        - zig: "0.17.0"
+          os: ubuntu-latest
         - zig: "0.16.0"
           os: ubuntu-24.04-arm
+        - zig: "0.17.0"
+          os: ubuntu-24.04-arm
         - zig: "0.16.0"
+          os: windows-latest
+        - zig: "0.17.0"
           os: windows-latest
 
     runs-on: ${{ matrix.os }}

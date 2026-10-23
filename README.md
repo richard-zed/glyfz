@@ -10,6 +10,8 @@ Basically everything here, outside of this disclaimer, and a bit more, was writt
 
 I'm using this for a UI library, didn't want to use the C dependency, kinda ported stb over to Zig. Removed the allocations in the library itself, added caching, and some other optimizations or attempts. And here we are. This has been used in that library already. With the cache hot, it performs better than stb. Cold, is a different story. The benchmark we have showed roughly parity. The real world comparison without caching was not as close. There were other issues though. I'm rambling. That's it. Hope you find this helpful.
 
+## Usage
+
 GlyfZ reads `glyf` and CFF-based fonts, turns outlines into antialiased
 coverage masks, and keeps those masks between draws. It shapes Arabic and Thai
 over GSUB and kerns from GPOS, but it has no fallback chain and no line breaking:

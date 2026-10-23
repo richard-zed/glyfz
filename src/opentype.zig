@@ -430,11 +430,16 @@ pub const Layout = struct {
         return len;
     }
 
-    /// The lookups of `feat` under `script`, falling back to the default
-    /// script when that script does not carry it. Arabic lives under `arab`,
-    /// and a font may not repeat ccmp there.
-    fn lookupsFor(self: Layout, script: u32, feat: u32, out: []u16) []const u16 {
-        if (self.featureLookups(script, 0, feat, out)) |l| {
+    /// The lookups of `feat` under `script` and `lang`, falling back to the
+    /// default script when that script does not carry it. Arabic lives under
+    /// `arab`, and a font may not repeat ccmp there.
+    ///
+    /// `lang` is what `locl` turns on: a font stores regional glyph forms
+    /// (Japanese against Simplified Chinese, say) as separate LangSys records
+    /// carrying the same feature tag, so passing 0 asks for the default forms
+    /// and can never reach the others.
+    fn lookupsFor(self: Layout, script: u32, lang: u32, feat: u32, out: []u16) []const u16 {
+        if (self.featureLookups(script, lang, feat, out)) |l| {
             if (l.len > 0) return l;
         } else |_| {}
         return self.featureLookupsDefault(feat, out) catch return &.{};
@@ -579,10 +584,10 @@ pub const Layout = struct {
     /// The base is the nearest preceding glyph that is not itself a mark, and
     /// the class is the one the mark's MarkRecord names. Anchors are integer
     /// font units: no device tables, no variation deltas.
-    pub fn markAttach(self: Layout, script: u32, feat: u32, buf: []const u16, len: usize, out: []Offset) Error!usize {
+    pub fn markAttach(self: Layout, script: u32, lang: u32, feat: u32, buf: []const u16, len: usize, out: []Offset) Error!usize {
         var lookups_buf: [256]u16 = undefined;
         var placed: usize = 0;
-        for (self.lookupsFor(script, feat, &lookups_buf)) |li| {
+        for (self.lookupsFor(script, lang, feat, &lookups_buf)) |li| {
             const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, li) * 2);
             var kind = try u16At(self.data, lookup);
             const sub_count = try u16At(self.data, lookup + 4);
@@ -856,21 +861,21 @@ pub const Layout = struct {
     /// Apply one feature at ONE buffer position, which is what a joining form
     /// needs: `init` applies to the letters that take an initial form and to
     /// nothing else. Returns the (possibly changed) buffer length.
-    pub fn applyFeatureAt(self: Layout, script: u32, feat: u32, buf: []u16, len: usize, pos: usize) Error!usize {
+    pub fn applyFeatureAt(self: Layout, script: u32, lang: u32, feat: u32, buf: []u16, len: usize, pos: usize) Error!usize {
         if (pos >= len) return len;
         var lookups_buf: [256]u16 = undefined;
         var cur = len;
-        for (self.lookupsFor(script, feat, &lookups_buf)) |li| {
+        for (self.lookupsFor(script, lang, feat, &lookups_buf)) |li| {
             cur = try self.applyLookupAt(li, buf, cur, pos, 0);
         }
         return cur;
     }
 
     /// Apply one feature at every position, in order.
-    pub fn applyFeature(self: Layout, script: u32, feat: u32, buf: []u16, len: usize) Error!usize {
+    pub fn applyFeature(self: Layout, script: u32, lang: u32, feat: u32, buf: []u16, len: usize) Error!usize {
         var lookups_buf: [256]u16 = undefined;
         var cur = len;
-        for (self.lookupsFor(script, feat, &lookups_buf)) |li| {
+        for (self.lookupsFor(script, lang, feat, &lookups_buf)) |li| {
             const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, li) * 2);
             const kind = try u16At(self.data, lookup);
             const flags = try u16At(self.data, lookup + 2);
@@ -1838,7 +1843,7 @@ test "a chaining lookup substitutes through the lookup it names" {
     const l = try Layout.init(b.bytes(), 0, @intCast(b.len));
 
     var buf = [_]u16{ 10, 20 };
-    const n = try l.applyFeature(tag("DFLT"), tag("liga"), &buf, 2);
+    const n = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &buf, 2);
     try testing.expectEqual(@as(usize, 2), n);
     try testing.expectEqual(@as(u16, 15), buf[0]); // 10 -> 15 via lookup 0
     try testing.expectEqual(@as(u16, 20), buf[1]); // untouched
@@ -1852,7 +1857,7 @@ test "a chaining lookup whose lookahead fails changes nothing" {
     // Lookup 0 is not in the feature, so with the context broken there is
     // nothing left that could substitute the 10.
     var buf = [_]u16{ 10, 30 };
-    const n = try l.applyFeature(tag("DFLT"), tag("liga"), &buf, 2);
+    const n = try l.applyFeature(tag("DFLT"), 0, tag("liga"), &buf, 2);
     try testing.expectEqual(@as(usize, 2), n);
     try testing.expectEqual(@as(u16, 10), buf[0]);
     try testing.expectEqual(@as(u16, 30), buf[1]);

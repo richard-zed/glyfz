@@ -2226,6 +2226,13 @@ pub const Font = struct {
     /// where a subtle divergence would hide. What they MUST agree on is record
     /// length, and that is four flag bits adding 0, 2, 4 or 8 bytes.
     inline fn metricSource(self: Font, gid: u16) GlyphError!?u16 {
+        // A CFF face has no composite records to resolve. Its `seac` form builds
+        // an accented glyph out of the standard encoding, and the advance is
+        // still the face's own `hmtx` entry, so there is no flag to honour.
+        // Without this the `glyphRange` below fails on a face that has no
+        // `glyf`/`loca` at all, which made `hMetricsResolved` unusable for
+        // every OTF and pushed that knowledge onto callers.
+        if (self.is_cff) return null;
         const data = try glyphRange(self, gid);
         // An empty range is a blank glyph; a positive contour count is simple.
         if (data.len == 0) return null;
@@ -5792,6 +5799,165 @@ test "a cached kern gives the same advances and refuses a foreign face" {
     var adv_c: [8]i32 = undefined;
     _ = try f.shape(cps[0..text.len], c2[0..], null, .{ .advances = adv_c[0..], .kern_cache = &foreign });
     try std.testing.expectEqualSlices(i32, adv_a[0..text.len], adv_c[0..text.len]);
+}
+
+// ---------------------------------------------------------------------------
+// a CFF face, for the paths that must not assume `glyf`
+// ---------------------------------------------------------------------------
+
+/// A minimal OTTO face: `CFF ` outlines and no `glyf`/`loca` at all. Four
+/// glyphs, of which the first two carry a full `hmtx` record and the rest share
+/// the last advance plus a bearing, so both branches of the metric read are
+/// reachable.
+fn buildCffTestFont(buf: []u8) []const u8 {
+    const ntables: usize = 6;
+    var w = W{ .buf = buf };
+
+    w.u32v(tag("OTTO")); // sfnt version
+    w.u16v(@intCast(ntables)); // numTables
+    w.u16v(0);
+    w.u16v(0);
+    w.u16v(0);
+    w.zeros(ntables * 16); // table records, patched at the end
+
+    // --- cmap: format 4, A -> gid 1 and B -> gid 2 ---
+    const cmap_start = w.at;
+    w.u16v(0); // version
+    w.u16v(1); // numTables
+    const rec0 = w.at;
+    w.u16v(3); // platform
+    w.u16v(1); // encoding
+    w.u32v(0); // offset, patched
+    const f4 = w.at;
+    w.u16v(4); // format
+    const len4_at = w.at;
+    w.u16v(0); // length, patched
+    w.u16v(0); // language
+    w.u16v(6); // segCountX2
+    w.u16v(4); // searchRange
+    w.u16v(1); // entrySelector
+    w.u16v(2); // rangeShift
+    w.u16v(0x41); // endCode
+    w.u16v(0x42);
+    w.u16v(0xFFFF);
+    w.u16v(0); // reservedPad
+    w.u16v(0x41); // startCode
+    w.u16v(0x42);
+    w.u16v(0xFFFF);
+    w.i16v(0); // idDelta[0] -- the glyphIdArray entry already names the glyph
+    w.i16v(@bitCast(@as(u16, 0xFFC0))); // idDelta[1]
+    w.i16v(1); // idDelta[2]
+    w.u16v(6); // idRangeOffset[0]
+    w.u16v(0);
+    w.u16v(0);
+    w.u16v(1); // glyphIdArray[0]
+    w16(buf, len4_at, @intCast(w.at - f4));
+    w32(buf, rec0 + 4, @intCast(f4 - cmap_start));
+    const r_cmap = Rec{ .at = cmap_start, .len = w.at - cmap_start };
+
+    // --- CFF: header, Name INDEX, Top DICT INDEX, empty String and Global Subr
+    // INDEXes, then the CharStrings INDEX with its offset patched back in ---
+    const cff_start = w.at;
+    w.u8v(1); // major
+    w.u8v(0); // minor
+    w.u8v(4); // hdrSize
+    w.u8v(1); // offSize
+    w.u16v(1); // Name INDEX: one entry
+    w.u8v(1); // offSize
+    w.u8v(1);
+    w.u8v(5);
+    for ("Test") |c| w.u8v(c);
+    w.u16v(1); // Top DICT INDEX: one entry
+    w.u8v(1); // offSize
+    w.u8v(1);
+    w.u8v(7); // 1 + 6 bytes of DICT
+    w.u8v(29); // 32-bit operand follows
+    const cs_off_at = w.at;
+    w.u32v(0); // CharStrings offset, patched
+    w.u8v(17); // op char_strings
+    w.u16v(0); // String INDEX: empty
+    w.u16v(0); // Global Subr INDEX: empty
+    const cs_at = w.at;
+    w.u16v(4); // CharStrings INDEX: four glyphs
+    w.u8v(1); // offSize
+    w.u8v(1);
+    w.u8v(4); // 1 + "abc"
+    w.u8v(6); // 4 + "de"
+    w.u8v(6); // then two empty
+    w.u8v(6);
+    for ("abc") |c| w.u8v(c);
+    for ("de") |c| w.u8v(c);
+    w32(buf, cs_off_at, @intCast(cs_at - cff_start));
+    const r_cff = Rec{ .at = cff_start, .len = w.at - cff_start };
+
+    // --- head (54 bytes) ---
+    const head_start = w.at;
+    w.u32v(0x0001_0000);
+    w.u32v(0x0001_0000);
+    w.u32v(0);
+    w.u32v(0x5F0F_3CF5);
+    w.u16v(0);
+    w.u16v(1000); // unitsPerEm
+    w.zeros(16); // created, modified
+    w.zeros(8); // bbox
+    w.u16v(0); // macStyle
+    w.u16v(8); // lowestRecPPEM
+    w.i16v(2); // fontDirectionHint
+    w.i16v(0); // indexToLocFormat
+    w.i16v(0); // glyphDataFormat
+    const r_head = Rec{ .at = head_start, .len = w.at - head_start };
+
+    // --- hhea (36 bytes) ---
+    const hhea_start = w.at;
+    w.u32v(0x0001_0000);
+    w.i16v(880); // ascender
+    w.i16v(-120); // descender
+    w.i16v(0); // lineGap
+    w.u16v(600); // advanceWidthMax
+    w.zeros(6);
+    w.zeros(6);
+    w.zeros(8);
+    w.i16v(0); // metricDataFormat
+    w.u16v(2); // numberOfHMetrics
+    const r_hhea = Rec{ .at = hhea_start, .len = w.at - hhea_start };
+
+    // --- hmtx: two full records, then bearings for glyphs 2 and 3 ---
+    const hmtx_start = w.at;
+    w.u16v(600);
+    w.i16v(10);
+    w.u16v(500);
+    w.i16v(20);
+    w.i16v(30);
+    w.i16v(40);
+    const r_hmtx = Rec{ .at = hmtx_start, .len = w.at - hmtx_start };
+
+    // --- maxp 0.5 (6 bytes) ---
+    const maxp_start = w.at;
+    w.u32v(0x0000_5000);
+    w.u16v(4); // numGlyphs
+    const r_maxp = Rec{ .at = maxp_start, .len = w.at - maxp_start };
+
+    const tags: [ntables]u32 = .{ tag_cmap, tag_cff, tag_head, tag_hhea, tag_hmtx, tag_maxp };
+    const recs: [ntables]Rec = .{ r_cmap, r_cff, r_head, r_hhea, r_hmtx, r_maxp };
+    for (tags, recs, 0..) |t, r, i| patchRec(buf, 12 + i * 16, t, r.at, r.len);
+
+    return buf[0..w.at];
+}
+
+test "a CFF face resolves advances without glyf composite records" {
+    var buf: [4096]u8 = undefined;
+    const f = try Font.init(buildCffTestFont(&buf));
+    try std.testing.expect(f.is_cff);
+    try std.testing.expectEqual(@as(u16, 4), f.num_glyphs);
+
+    // Glyphs inside `numberOfHMetrics` carry their own advance ...
+    try std.testing.expectEqual(@as(u16, 600), (try f.hMetricsResolved(0)).advance);
+    try std.testing.expectEqual(@as(u16, 500), (try f.hMetricsResolved(1)).advance);
+    // ... and the rest inherit the last one.
+    try std.testing.expectEqual(@as(u16, 500), (try f.hMetricsResolved(3)).advance);
+
+    // The codepoint path is what a caller actually uses.
+    try std.testing.expectEqual(@as(u16, 1), try f.glyphIndex(0x41));
 }
 
 test "a full slot table recycles a mask instead of flushing every class" {

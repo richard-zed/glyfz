@@ -2844,10 +2844,20 @@ pub const Mask = struct {
 /// make room in one. Reclaiming a dead mask from the middle of a bump region is
 /// not possible without a compaction pass, and a compaction pass costs more
 /// than re-rasterising a working set that did not fit in the first place. If
-/// the flush count is high, the buffer is too small -- that is the signal to
-/// look at, and it is reported rather than hidden.
+/// the flush count is high, the buffer is too small. Since a full class and a
+/// full table both RECYCLE now, that signal is weaker than it reads: overflow
+/// usually shows up as a lower hit rate rather than as a flush, so the flush
+/// count catches only the case where no victim was big enough.
 pub const Cache = struct {
     pub const Options = struct {
+        /// Slots in the open-addressed key table.
+        ///
+        /// This must hold the whole working set, and it is the STRONGER of the
+        /// two limits: 1000 distinct glyphs against 512 slots measured 0.0%
+        /// hits even with an 8 MiB arena, because every insert had to recycle
+        /// and every look-up missed. Aim for at least the number of distinct
+        /// glyphs on screen; 2x that shortens probe chains, at the cost of the
+        /// table's memory.
         slots: u16 = 512,
         max_points: u16 = 1024,
         max_ends: u16 = 256,
@@ -2952,6 +2962,33 @@ pub const Cache = struct {
         total = std.mem.alignForward(usize, total, @alignOf(f32)) + (@as(usize, opts.max_width) * 2 + 2) * @sizeOf(f32);
         total = std.mem.alignForward(usize, total, 8) + @as(usize, opts.arena);
         return total;
+    }
+
+    /// Arena bytes to hold roughly `glyphs` distinct masks at `ppem`.
+    ///
+    /// `needed()` answers "how big a buffer does this configuration take".
+    /// That is a different question from "how much arena does my screen need",
+    /// and nothing used to answer the second. A caller could size its buffer
+    /// correctly by the library's own measure and still cache almost nothing,
+    /// because the default arena holds only about four hundred CJK glyphs at
+    /// 16px. The failure was silent: no error, no band, just a hit rate that
+    /// reads as a slow rasteriser.
+    ///
+    /// A mask costs about four bytes per em squared, so 24px is roughly twice
+    /// the size of 16px rather than 1.5 times -- area, not length. Measured on
+    /// NotoSansCJKsc: 2000 glyphs at 16px needed 2 MiB, 4000 needed 4 MiB, 1000
+    /// at 24px needed 2 MiB, each reaching 100%. This rounds up from those.
+    ///
+    /// The measurement already accounts for the four-way class split: one size
+    /// class only ever receives a quarter of the arena, and those numbers were
+    /// taken through that path rather than corrected for it afterwards.
+    ///
+    /// A heuristic, not a guarantee -- one face, one phase. Under-sizing is
+    /// survivable: the cache still works, it evicts sooner.
+    pub fn arenaFor(glyphs: usize, ppem: u16) u32 {
+        const e: u64 = ppem;
+        const total = @as(u64, glyphs) * 4 * e * e;
+        return @intCast(@min(total, std.math.maxInt(u32)));
     }
 
     pub fn init(mem: []align(8) u8, opts: Options) error{BufferTooSmall}!Cache {
@@ -5553,4 +5590,31 @@ test "a full slot table recycles a mask instead of flushing every class" {
     _ = try cache.mask(&font, 6, sizes[0].ppem, .zero);
     try std.testing.expectEqual(@as(u64, 1), cache.stats.hits);
     try std.testing.expectEqual(@as(u64, 7), cache.stats.misses);
+}
+
+test "arenaFor sizes from a working set, quadratically in point size" {
+    // Pins the calibration, not the cache. The fixture has two glyphs with ink,
+    // so a run of thousands is not available here; what is worth pinning is the
+    // constant, because a wrong one is silent -- a caller would size a buffer
+    // that looks right and caches a fraction of the screen.
+    //
+    // 2000 CJK glyphs at 16px needed 2 MiB when measured.
+    try std.testing.expectEqual(@as(u32, 2000 * 4 * 16 * 16), Cache.arenaFor(2000, 16));
+    try std.testing.expectEqual(@as(u32, 2_048_000), Cache.arenaFor(2000, 16));
+
+    // Area, not length: 24px is about twice 16px, not 1.5 times.
+    const per16 = Cache.arenaFor(1000, 16);
+    const per24 = Cache.arenaFor(1000, 24);
+    try std.testing.expect(per24 > per16 * 2);
+
+    // Linear in glyph count, and zero is zero rather than a minimum.
+    try std.testing.expectEqual(Cache.arenaFor(1000, 16) * 2, Cache.arenaFor(2000, 16));
+    try std.testing.expectEqual(@as(u32, 0), Cache.arenaFor(0, 16));
+
+    // Absurd inputs clamp instead of wrapping into a tiny arena.
+    try std.testing.expectEqual(std.math.maxInt(u32), Cache.arenaFor(1 << 30, 65535));
+
+    // The default arena is far too small for a CJK screen, which is the whole
+    // reason this function exists.
+    try std.testing.expect(Cache.arenaFor(2000, 16) > (Cache.Options{}).arena * 4);
 }

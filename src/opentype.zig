@@ -611,6 +611,71 @@ pub const Layout = struct {
         return placed;
     }
 
+    /// GPOS type 1, single adjustment: the advance or placement of one glyph,
+    /// moved on its own. `palt` and `halt` live here, and on a CJK face they
+    /// are the difference between ideographs stuck on an em grid and text that
+    /// reads as typeset. Format 1 gives every covered glyph the same value;
+    /// format 2 gives each its own.
+    fn singlePosSub(self: Layout, sub: usize, buf: []const u16, len: usize, out: []Adjust) Error!usize {
+        const fmt = try u16At(self.data, sub);
+        const cov = sub + try u16At(self.data, sub + 2);
+        const vf = try u16At(self.data, sub + 4);
+        switch (fmt) {
+            1 => {
+                const one = try self.readValue(sub + 6, vf);
+                var touched: usize = 0;
+                for (buf[0..len], out[0..len]) |g, *o| {
+                    if ((try self.coverageIndex(cov, g)) == null) continue;
+                    o.* = o.*.add(one);
+                    touched += 1;
+                }
+                return touched;
+            },
+            2 => {
+                const count = try u16At(self.data, sub + 6);
+                const sz = valueSize(vf);
+                var touched: usize = 0;
+                for (buf[0..len], out[0..len]) |g, *o| {
+                    const ci = (try self.coverageIndex(cov, g)) orelse continue;
+                    // A coverage index past the value array is a broken font,
+                    // not a reason to read whatever follows the subtable.
+                    if (ci >= count) continue;
+                    o.* = o.*.add(try self.readValue(sub + 8 + ci * sz, vf));
+                    touched += 1;
+                }
+                return touched;
+            },
+            else => return 0,
+        }
+    }
+
+    /// Apply every SinglePos lookup a feature names, adding into `out`.
+    ///
+    /// Additive rather than overwriting, so two features on one run compose:
+    /// `palt` and `halt` are both single adjustments and a caller may ask for
+    /// either or both.
+    pub fn adjustSingles(self: Layout, script: u32, lang: u32, feat: u32, buf: []const u16, len: usize, out: []Adjust) Error!usize {
+        if (out.len < len) return error.Truncated;
+        var lookups_buf: [256]u16 = undefined;
+        var touched: usize = 0;
+        for (self.lookupsFor(script, lang, feat, &lookups_buf)) |li| {
+            const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, li) * 2);
+            const sub_count = try u16At(self.data, lookup + 4);
+            var si: usize = 0;
+            while (si < sub_count) : (si += 1) {
+                const raw = lookup + try u16At(self.data, lookup + 6 + si * 2);
+                var kind = try u16At(self.data, lookup);
+                var sub = raw;
+                if (kind == 9) {
+                    kind = try u16At(self.data, sub + 2);
+                    sub = sub + try u32At(self.data, sub + 4);
+                }
+                if (kind == 1) touched += try self.singlePosSub(sub, buf, len, out);
+            }
+        }
+        return touched;
+    }
+
     /// GPOS type 6, mark-to-mark: the second of two marks stacked on one
     /// letter. The upper mark anchors to the lower one and INHERITS that mark's
     /// offset, so a fatha over a shadda sits on the shadda rather than sinking
@@ -1230,6 +1295,104 @@ fn gposPair2(b: *Builder) void {
     const h = header(b);
     const sh = shell(b, h, 2, "kern");
     place(b, sh, pair2(b));
+}
+
+/// SinglePos format 1: -120 advance for everything the coverage names.
+fn single1(b: *Builder) usize {
+    const sub = b.len;
+    _ = b.put16(1);
+    const cov = b.put16(0);
+    _ = b.put16(0x0004); // valueFormat: xAdvance only
+    _ = b.put16(@bitCast(@as(i16, -120)));
+    const covabs = b.len;
+    b.patch16(cov, covabs - sub);
+    _ = b.put16(1);
+    _ = b.put16(1);
+    _ = b.put16(5);
+    return sub;
+}
+
+/// SinglePos format 2: -50 for glyph 5, +70 for glyph 7.
+fn single2(b: *Builder) usize {
+    const sub = b.len;
+    _ = b.put16(2);
+    const cov = b.put16(0);
+    _ = b.put16(0x0004);
+    _ = b.put16(2); // valueCount
+    _ = b.put16(@bitCast(@as(i16, -50)));
+    _ = b.put16(@bitCast(@as(i16, 70)));
+    const covabs = b.len;
+    b.patch16(cov, covabs - sub);
+    _ = b.put16(1);
+    _ = b.put16(2);
+    _ = b.put16(5);
+    _ = b.put16(7);
+    return sub;
+}
+
+fn gposSingle1(b: *Builder) void {
+    const h = header(b);
+    const sh = shell(b, h, 1, "palt");
+    place(b, sh, single1(b));
+}
+
+fn gposSingle2(b: *Builder) void {
+    const h = header(b);
+    const sh = shell(b, h, 1, "halt");
+    place(b, sh, single2(b));
+}
+
+test "single-1 moves the advance of every covered glyph" {
+    var b = Builder.init();
+    gposSingle1(&b);
+    const data = b.bytes();
+    const l = try Layout.init(data, 0, @intCast(data.len));
+
+    var out: [4]Adjust = @splat(.{});
+    const gids = [_]u16{ 5, 6, 5 };
+    const n = try l.adjustSingles(tag("DFLT"), 0, tag("palt"), &gids, gids.len, &out);
+    // Two of the three are covered; the middle glyph is untouched.
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(i16, -120), out[0].x_advance);
+    try testing.expectEqual(@as(i16, 0), out[1].x_advance);
+    try testing.expectEqual(@as(i16, -120), out[2].x_advance);
+    // An advance adjustment, not a move: nothing drags the glyph sideways.
+    try testing.expectEqual(@as(i16, 0), out[0].x_placement);
+    try testing.expectEqual(@as(i16, 0), out[0].y_advance);
+}
+
+test "single-2 gives each covered glyph its own value" {
+    var b = Builder.init();
+    gposSingle2(&b);
+    const data = b.bytes();
+    const l = try Layout.init(data, 0, @intCast(data.len));
+
+    var out: [4]Adjust = @splat(.{});
+    const gids = [_]u16{ 5, 6, 7 };
+    _ = try l.adjustSingles(tag("DFLT"), 0, tag("halt"), &gids, gids.len, &out);
+    try testing.expectEqual(@as(i16, -50), out[0].x_advance);
+    try testing.expectEqual(@as(i16, 0), out[1].x_advance);
+    try testing.expectEqual(@as(i16, 70), out[2].x_advance);
+}
+
+test "adjustments from two features compose instead of overwriting" {
+    // The reason the values ADD. A caller applying palt and halt to one run
+    // must get the sum, or whichever ran last would silently win.
+    var acc: [1]Adjust = @splat(.{ .x_advance = 10 });
+    const extra = Adjust{ .x_advance = -7 };
+    acc[0] = acc[0].add(extra);
+    try testing.expectEqual(@as(i16, 3), acc[0].x_advance);
+}
+
+test "a buffer shorter than the run is refused, not written past" {
+    var b = Builder.init();
+    gposSingle1(&b);
+    const data = b.bytes();
+    const l = try Layout.init(data, 0, @intCast(data.len));
+
+    var out: [1]Adjust = @splat(.{});
+    const gids = [_]u16{ 5, 5, 5 };
+    try testing.expectError(error.Truncated, l.adjustSingles(tag("DFLT"), 0, tag("palt"), &gids, gids.len, &out));
 }
 
 test "tag is big-endian, the same as glyfz's" {

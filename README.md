@@ -1,6 +1,6 @@
 # GlyfZ
 
-A font decoder and glyph rasteriser for Zig 0.16: TrueType and CFF outlines,
+A font decoder and glyph rasteriser for Zig 0.16 and 0.17: TrueType and CFF outlines,
 GSUB/GPOS shaping, variable-font instances, COLR colour. No allocator -- every
 cache is caller-owned memory.
 
@@ -8,7 +8,7 @@ cache is caller-owned memory.
 
 Basically everything here, outside of this disclaimer, and a bit more, was written by AI. 
 
-I'm using this for a UI library, didn't want to use the C dependency, kinda ported stb over to Zig. Removed the allocations in the library itself, added caching, and some other optimizations or attempts. And here we are. This has been used in that library already. With the cache hot, it performs better than stb. Cold, is a different story. The benchmark we have showed roughly parity. The real world comparison without caching was not as close. There were other issues though. I'm rambling. That's it. Hope you find this helpful.
+I'm using this for a UI library, didn't want to use the C dependency, kinda ported stb over to Zig. Removed the allocations in the library itself, added caching, and some other optimizations or attempts. And here we are. This has been used in that library already. It performs better than stb by quite a bit thanks to the caching. We've put a lot of work into it. It's optimized for Latin, CJK, and Arabic so far with high pixel accuracy. The hope is to get it more feature complete. The lack of an allocator will make it difficult or impossible for things like COLRv1. But as good as we can get.
 
 ## Usage
 

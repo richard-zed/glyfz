@@ -1811,6 +1811,31 @@ pub const Font = struct {
         return dflt;
     }
 
+    /// GPOS single adjustments over a shaped run: `palt` and `halt` live here.
+    ///
+    /// `gids` are the glyphs `shape` produced, NOT codepoints. GPOS runs after
+    /// substitution and indexes coverage by glyph, so handing this codepoints
+    /// would adjust the wrong glyphs on any face that substitutes.
+    ///
+    /// Features add rather than overwrite, so `&.{ palt, halt }` composes.
+    /// A malformed GPOS adjusts nothing instead of failing, matching how
+    /// `shape` treats a feature it cannot apply.
+    ///
+    /// The script defaults to the font's own answer, since a face may carry
+    /// these under DFLT rather than latn. A CJK face keeping `palt` under
+    /// `hani` or `kana` needs `opts.script` named.
+    pub fn adjustAdvances(self: Font, gids: []const u16, out: []opentype.Adjust, feats: []const u32, opts: ShapeOptions) usize {
+        // Zeroed even when there is nothing to apply: a caller reusing the
+        // buffer would otherwise apply the previous run's values.
+        @memset(out[0..gids.len], .{});
+        if (gids.len == 0 or self.gpos_span.len == 0) return 0;
+        var l = opentype.Layout.init(self.data, self.gpos_span.off, self.gpos_span.len) catch return 0;
+        const script = if (opts.script != 0) opts.script else self.pickScript();
+        var touched: usize = 0;
+        for (feats) |f| touched += l.adjustSingles(script, opts.lang, f, gids, gids.len, out) catch 0;
+        return touched;
+    }
+
     /// Does the file carry this table at all? Answers about the DIRECTORY, so
     /// no parse of the table itself happens.
     /// How many variation axes the face declares. A static face has none.
@@ -5617,4 +5642,23 @@ test "arenaFor sizes from a working set, quadratically in point size" {
     // The default arena is far too small for a CJK screen, which is the whole
     // reason this function exists.
     try std.testing.expect(Cache.arenaFor(2000, 16) > (Cache.Options{}).arena * 4);
+}
+
+test "adjustAdvances zeroes its output even when the face has no GPOS" {
+    // The zeroing is the real assertion. A caller reuses one buffer across
+    // runs, so leaving stale numbers in place would apply the previous run's
+    // adjustments to the next line of text -- silently, and only visibly on
+    // the second draw.
+    var fb: [2048]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fb, false));
+
+    var out = [_]opentype.Adjust{ .{ .x_advance = 99 }, .{ .x_advance = 99 } };
+    const gids = [_]u16{ 6, 7 };
+    const n = font.adjustAdvances(&gids, &out, &.{opentype.tag("palt")}, .{});
+    try std.testing.expectEqual(@as(usize, 0), n);
+    try std.testing.expectEqual(@as(i16, 0), out[0].x_advance);
+    try std.testing.expectEqual(@as(i16, 0), out[1].x_advance);
+
+    // An empty run is not an error either.
+    try std.testing.expectEqual(@as(usize, 0), font.adjustAdvances(&.{}, &out, &.{opentype.tag("palt")}, .{}));
 }

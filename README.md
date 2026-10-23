@@ -259,9 +259,9 @@ not a smaller binary.
 ```zon
 .glyfz = .{
     // full
-    .url = "git+https://github.com/scribbles-code/glyfz?ref=Zig-0.16",
+    .url = "git+https://github.com/richard-zed/glyfz?ref=Zig-0.16",
     // minimal
-    // .url = "git+https://github.com/scribbles-code/glyfz?ref=v0.2.1-zig0.17",
+    // .url = "git+https://github.com/richard-zed/glyfz?ref=v0.2.1-zig0.17",
     .hash = "...",
 },
 ```

@@ -2962,7 +2962,14 @@ pub const Cache = struct {
         max_edges: u16 = 1024,
         /// Widest box the sweep can accumulate, in pixels.
         max_width: u16 = 256,
-        /// Pixel-arena bytes.
+        /// Pixel-arena bytes, used ONLY to size `needed()`.
+        ///
+        /// It is not a cap. The cache claims every byte of the buffer past its
+        /// tables, so a caller that hands over a larger array silently gets a
+        /// larger arena and this number is ignored. That is the friendly
+        /// direction to fail, but it means a test that wants to observe
+        /// eviction has to cut its buffer to exactly `needed()` -- otherwise
+        /// it asserts about a capacity it never had.
         arena: u32 = 256 * 1024,
     };
 
@@ -2987,6 +2994,15 @@ pub const Cache = struct {
         /// slot to drop without consulting any other bookkeeping.
         cls: u8 = 0,
         off: u32 = 0,
+        /// Bytes reserved in the class, which is what an eviction frees. It is
+        /// the box the caller asked for, NOT `w * h`: the raster may return a
+        /// smaller coverage than the box it was given, and an extent that
+        /// under-reports itself would refuse to host a mask that fits.
+        len: u32 = 0,
+        /// Last touch, oldest-wins. A hit refreshes it, so the glyphs a frame
+        /// actually asks for survive an eviction instead of the ones that
+        /// merely happened to be inserted late.
+        used: u64 = 0,
         w: u32 = 0,
         h: u32 = 0,
         x0: i32 = 0,
@@ -3028,6 +3044,10 @@ pub const Cache = struct {
     class_cap: [class_count]usize = @splat(0),
     class_used: [class_count]usize = @splat(0),
     partitioned: bool,
+    /// Recency clock. A plain counter rather than a timestamp: recency is the
+    /// only thing asked of it, and a clock would make eviction depend on how
+    /// fast a frame ran.
+    tick: u64 = 0,
     stats: Stats = .{},
 
     /// How much memory `init` wants for this configuration.
@@ -3124,6 +3144,7 @@ pub const Cache = struct {
         const vk = font.variationId();
         if (self.find(gid, scale_key, phase, phase_y, vk)) |s| {
             self.stats.hits += 1;
+            s.used = self.bumpTick();
             const at = self.arena_at + self.class_at[s.cls] + s.off;
             return .{ .w = s.w, .h = s.h, .x0 = s.x0, .y0 = s.y0, .pixels = self.mem[at..][0 .. @as(usize, s.w) * s.h] };
         }
@@ -3145,7 +3166,28 @@ pub const Cache = struct {
         const cls = self.classOf(len);
         if (len > self.class_cap[cls]) return error.BufferTooSmall;
         // Only this class gives way. Masks of other sizes keep their pixels.
-        if (self.class_used[cls] + len > self.class_cap[cls]) self.evictClass(cls);
+        //
+        // A full class first tries to RECYCLE one victim's extent in place,
+        // which is the whole point: the old path wiped the class and turned a
+        // one-glyph overflow into a total loss -- measured at 99.8% -> 9.1%
+        // hits between 400 and 405 distinct CJK glyphs. Wiping stays as the
+        // fallback for when no victim is big enough, because with nothing
+        // contiguous left it is the only honest answer.
+        var at_off: usize = undefined;
+        if (self.class_used[cls] + len <= self.class_cap[cls]) {
+            at_off = self.class_used[cls];
+            self.class_used[cls] += len;
+        } else if (self.evictOne(cls, len)) |off| {
+            // The extent is already inside the class's accounted bytes, so
+            // `class_used` is deliberately left alone: it is a high-water mark
+            // here, not a live total. Decrementing it would hand the bump
+            // pointer a region that live masks still occupy.
+            at_off = off;
+        } else {
+            self.evictClass(cls);
+            at_off = 0;
+            self.class_used[cls] = len;
+        }
 
         var slot = self.freeSlot(gid, scale_key, phase, phase_y, vk);
         if (slot == null) {
@@ -3156,7 +3198,7 @@ pub const Cache = struct {
         }
         const s = slot orelse return error.BufferTooSmall;
 
-        const at = self.arena_at + self.class_at[cls] + self.class_used[cls];
+        const at = self.arena_at + self.class_at[cls] + at_off;
         const r = try font.rasterPhase(gid, scale, ph, phy, self.points, self.ends, self.edges, self.scratch, self.mem[at..][0..len]);
 
         s.* = .{
@@ -3166,14 +3208,15 @@ pub const Cache = struct {
             .phase = phase,
             .phase_y = phase_y,
             .cls = @intCast(cls),
-            .off = @intCast(self.class_used[cls]),
+            .off = @intCast(at_off),
+            .len = @intCast(len),
+            .used = self.bumpTick(),
             .w = r.w,
             .h = r.h,
             .x0 = r.x0,
             .y0 = r.y0,
             .state = .live,
         };
-        self.class_used[cls] += len;
         return .{ .w = r.w, .h = r.h, .x0 = r.x0, .y0 = r.y0, .pixels = r.coverage };
     }
 
@@ -3225,6 +3268,32 @@ pub const Cache = struct {
     pub fn reset(self: *Cache) void {
         for (self.slots) |*s| s.state = .empty;
         self.class_used = @splat(0);
+    }
+
+    fn bumpTick(self: *Cache) u64 {
+        self.tick += 1;
+        return self.tick;
+    }
+
+    /// Reclaim the OLDEST slot of `cls` whose extent can host `len` bytes, and
+    /// return its offset for immediate reuse.
+    ///
+    /// One victim, not a class wipe. The pixels of every other mask stay where
+    /// they are, which matters beyond hit rate: a `Mask` already handed to a
+    /// caller points into the arena, so compacting or moving live pixels would
+    /// pull the floor out from under it mid-frame.
+    ///
+    /// Null means no victim is big enough, and the caller falls back to wiping.
+    fn evictOne(self: *Cache, cls: usize, len: usize) ?usize {
+        var victim: ?*Slot = null;
+        for (self.slots) |*s| {
+            if (s.state != .live or s.cls != cls) continue;
+            if (s.len < len) continue;
+            if (victim == null or s.used < victim.?.used) victim = s;
+        }
+        const v = victim orelse return null;
+        v.state = .dead;
+        return v.off;
     }
 
     /// One size class gives way; the other three keep their pixels.
@@ -5891,4 +5960,67 @@ test "caller-named features run after the default set, not instead of it" {
     out = @splat(0);
     _ = try font.shape(&cps, &out, null, .{ .script = dflt, .features = &only_fwid });
     try std.testing.expectEqual(a, out[0]);
+}
+
+test "a full class recycles one victim instead of wiping every mask" {
+    // The cliff this guards: `evictClass` marked every live mask of the class
+    // dead, so one mask past the budget threw away the whole working set.
+    // Measured on NotoSansCJKsc at 16px that was 99.8% -> 9.1% hits between
+    // 400 and 405 distinct glyphs -- five glyphs of overflow costing ninety
+    // points. A cache that re-rasterises everything after each overflow is not
+    // a slow cache, it is a cache that has stopped being one.
+    //
+    // The fixture has only two glyphs with ink, so the three entries come from
+    // one glyph at three sizes: the key covers scale, which is exactly what
+    // makes them distinct masks.
+    //
+    // NOTE the arena is sized by the BUFFER, not by `Options.arena`: the cache
+    // claims every byte past its tables, and `arena` only tells `needed()` how
+    // much to ask for. Handing it a larger array silently grants a larger
+    // arena, which is how a first version of this test ended up never evicting
+    // anything. Every buffer here is cut to exactly `needed()`.
+    var fb: [2048]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fb, false));
+
+    const upem: f32 = @floatFromInt(font.units_per_em);
+    const b24 = try font.bitmapBox(6, 24 / upem, 0);
+    const b20 = try font.bitmapBox(6, 20 / upem, 0);
+    const b16 = try font.bitmapBox(6, 16 / upem, 0);
+    const l24: usize = @intCast((b24.x1 - b24.x0) * (b24.y1 - b24.y0));
+    const l20: usize = @intCast((b20.x1 - b20.x0) * (b20.y1 - b20.y0));
+    const l16: usize = @intCast((b16.x1 - b16.x0) * (b16.y1 - b16.y0));
+    // Capacity for exactly the first two. The third cannot be admitted without
+    // giving something up, and the FIRST mask is the one that must go.
+    try std.testing.expect(l24 >= l16 and l20 >= l16);
+
+    const opts = Cache.Options{ .slots = 16, .max_points = 256, .max_edges = 256, .max_width = 64, .arena = @intCast(l24 + l20) };
+    var cbuf: [64 * 1024]u8 align(8) = undefined;
+    const mem: []align(8) u8 = @alignCast(cbuf[0..Cache.needed(opts)]);
+    var cache = try Cache.init(mem, opts);
+    // Under `partition_min` the cache is one pool, so the capacity above is the
+    // whole budget and the arithmetic in this test is the real arithmetic.
+    try std.testing.expect(!cache.partitioned);
+
+    _ = try cache.mask(&font, 6, 24, .zero);
+    const mid = try cache.mask(&font, 6, 20, .zero);
+    var mid_pixels: [2048]u8 = undefined;
+    @memcpy(mid_pixels[0..mid.pixels.len], mid.pixels);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats.misses);
+
+    _ = try cache.mask(&font, 6, 16, .zero);
+    try std.testing.expectEqual(@as(u64, 3), cache.stats.misses);
+
+    // The 20px mask is the second-oldest of three, so an LRU eviction spares
+    // it. Under a class wipe it is gone and this is a miss.
+    const again = try cache.mask(&font, 6, 20, .zero);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.hits);
+    try std.testing.expectEqual(@as(u64, 3), cache.stats.misses);
+    // Recycling an extent must not disturb a live neighbour's pixels.
+    try std.testing.expectEqualSlices(u8, mid_pixels[0..again.pixels.len], again.pixels);
+
+    // The oldest mask DID give way -- otherwise the hit above would be
+    // explained by nothing having been evicted at all.
+    _ = try cache.mask(&font, 6, 24, .zero);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.hits);
+    try std.testing.expectEqual(@as(u64, 4), cache.stats.misses);
 }

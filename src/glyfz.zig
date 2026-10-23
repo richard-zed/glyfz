@@ -3312,7 +3312,7 @@ pub const Cache = struct {
         // zig fmt: on
         key *%= 0x9E3779B97F4A7C15;
         key ^= key >> 29;
-        return @as(usize, key >> 16) % self.slots.len;
+        return @intCast((key >> 16) % self.slots.len);
     }
 
     fn find(self: *Cache, gid: u16, scale_key: u32, phase: Phase, phase_y: Phase, var_key: u32) ?*Slot {

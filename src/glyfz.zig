@@ -3065,30 +3065,42 @@ pub const Cache = struct {
         // hits between 400 and 405 distinct CJK glyphs. Wiping stays as the
         // fallback for when no victim is big enough, because with nothing
         // contiguous left it is the only honest answer.
-        var at_off: usize = undefined;
-        if (self.class_used[cls] + len <= self.class_cap[cls]) {
-            at_off = self.class_used[cls];
-            self.class_used[cls] += len;
-        } else if (self.evictOne(cls, len)) |off| {
-            // The extent is already inside the class's accounted bytes, so
-            // `class_used` is deliberately left alone: it is a high-water mark
-            // here, not a live total. Decrementing it would hand the bump
-            // pointer a region that live masks still occupy.
-            at_off = off;
-        } else {
-            self.evictClass(cls);
-            at_off = 0;
-            self.class_used[cls] = len;
-        }
-
+        // Table space first, and a table eviction doubles as an arena one:
+        // recycling a mask hands back its slot AND its extent, so the two
+        // limits cannot drift apart. Wiping the table stays as the fallback
+        // for when no victim is big enough.
+        //
+        // It has to be a victim of THIS class. `off` is relative to the
+        // class's own region, so borrowing an extent from another class and
+        // recording the new mask under this one would address the wrong bytes.
+        var recycled: ?usize = null;
         var slot = self.freeSlot(gid, scale_key, phase, phase_y, vk);
         if (slot == null) {
-            // Every slot is spoken for; the table, not the pixels, is the
-            // limit. Rare enough to take the blunt path.
-            self.flush();
-            slot = self.freeSlot(gid, scale_key, phase, phase_y, vk);
+            if (self.evictOne(cls, len)) |off| {
+                recycled = off;
+                slot = self.freeSlot(gid, scale_key, phase, phase_y, vk);
+            } else {
+                self.flush();
+                slot = self.freeSlot(gid, scale_key, phase, phase_y, vk);
+            }
         }
         const s = slot orelse return error.BufferTooSmall;
+
+        const at_off: usize = recycled orelse blk: {
+            if (self.class_used[cls] + len <= self.class_cap[cls]) {
+                const o = self.class_used[cls];
+                self.class_used[cls] += len;
+                break :blk o;
+            }
+            // A reclaimed extent is already inside the class's accounted
+            // bytes, so `class_used` is deliberately left alone: it is a
+            // high-water mark here, not a live total. Decrementing it would
+            // hand the bump pointer a region live masks still occupy.
+            if (self.evictOne(cls, len)) |off| break :blk off;
+            self.evictClass(cls);
+            self.class_used[cls] = len;
+            break :blk 0;
+        };
 
         const at = self.arena_at + self.class_at[cls] + at_off;
         const r = try font.rasterPhase(gid, scale, ph, phy, self.points, self.ends, self.edges, self.scratch, self.mem[at..][0..len]);
@@ -5490,4 +5502,55 @@ test "a cached kern gives the same advances and refuses a foreign face" {
     var adv_c: [8]i32 = undefined;
     _ = try f.shape(cps[0..text.len], c2[0..], null, .{ .advances = adv_c[0..], .kern_cache = &foreign });
     try std.testing.expectEqualSlices(i32, adv_a[0..text.len], adv_c[0..text.len]);
+}
+
+test "a full slot table recycles a mask instead of flushing every class" {
+    // The table had its own cliff, one level up from the arena's: when no slot
+    // was free, `flush` emptied ALL FOUR classes. Measured on NotoSansCJKsc
+    // with an 8 MiB arena -- pixels nowhere near full -- 1000 distinct glyphs
+    // against 512 slots scored 0.0% hits and 2000 against 1024 scored 0.0%.
+    // The arena was never the constraint there; the table was.
+    //
+    // Recycling keeps the two limits in step: an evicted mask returns both its
+    // slot and its extent.
+    var fb: [2048]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fb, false));
+    const upem: f32 = @floatFromInt(font.units_per_em);
+
+    // Six distinct entries from one inked glyph: the key covers scale. Sorted
+    // LARGEST FIRST so that every incoming mask has an older mask big enough
+    // to recycle -- otherwise the test would exercise the fallback wipe and
+    // prove the opposite of what it claims.
+    const Sizes = struct { ppem: u16, len: usize };
+    var sizes = [_]Sizes{ .{ .ppem = 24, .len = 0 }, .{ .ppem = 22, .len = 0 }, .{ .ppem = 20, .len = 0 }, .{ .ppem = 18, .len = 0 }, .{ .ppem = 16, .len = 0 }, .{ .ppem = 14, .len = 0 } };
+    for (&sizes) |*e| {
+        const b = try font.bitmapBox(6, @as(f32, @floatFromInt(e.ppem)) / upem, 0);
+        e.len = @intCast((b.x1 - b.x0) * (b.y1 - b.y0));
+    }
+    std.mem.sort(Sizes, &sizes, {}, struct {
+        fn gt(_: void, x: Sizes, y: Sizes) bool {
+            return x.len > y.len or (x.len == y.len and x.ppem > y.ppem);
+        }
+    }.gt);
+
+    const opts = Cache.Options{ .slots = 4, .max_points = 256, .max_edges = 256, .max_width = 64, .arena = 4096 };
+    var cbuf: [64 * 1024]u8 align(8) = undefined;
+    const mem: []align(8) u8 = @alignCast(cbuf[0..Cache.needed(opts)]);
+    var cache = try Cache.init(mem, opts);
+    try std.testing.expect(!cache.partitioned);
+
+    for (sizes) |e| _ = try cache.mask(&font, 6, e.ppem, .zero);
+    try std.testing.expectEqual(@as(u64, 6), cache.stats.misses);
+    // The whole point: six masks through four slots without a single wipe.
+    try std.testing.expectEqual(@as(u64, 0), cache.stats.flushes);
+
+    // Capacity 4, six inserted, so the two oldest gave way and the four most
+    // recent are live. Under a flush only the newest would survive.
+    _ = try cache.mask(&font, 6, sizes[2].ppem, .zero);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.hits);
+
+    // And the oldest really did go, so the hit above is not vacuous.
+    _ = try cache.mask(&font, 6, sizes[0].ppem, .zero);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.hits);
+    try std.testing.expectEqual(@as(u64, 7), cache.stats.misses);
 }

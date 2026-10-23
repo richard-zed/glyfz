@@ -6132,3 +6132,66 @@ test "caller-named features run after the default set, not instead of it" {
     _ = try font.shape(&cps, &out, null, .{ .script = dflt, .features = &only_fwid });
     try std.testing.expectEqual(a, out[0]);
 }
+
+test "a full class recycles one victim instead of wiping every mask" {
+    // The cliff this guards: `evictClass` marked every live mask of the class
+    // dead, so one mask past the budget threw away the whole working set.
+    // Measured on NotoSansCJKsc at 16px that was 99.8% -> 9.1% hits between
+    // 400 and 405 distinct glyphs -- five glyphs of overflow costing ninety
+    // points. A cache that re-rasterises everything after each overflow is not
+    // a slow cache, it is a cache that has stopped being one.
+    //
+    // The fixture has only two glyphs with ink, so the three entries come from
+    // one glyph at three sizes: the key covers scale, which is exactly what
+    // makes them distinct masks.
+    //
+    // NOTE the arena is sized by the BUFFER, not by `Options.arena`: the cache
+    // claims every byte past its tables, and `arena` only tells `needed()` how
+    // much to ask for. Handing it a larger array silently grants a larger
+    // arena, which is how a first version of this test ended up never evicting
+    // anything. Every buffer here is cut to exactly `needed()`.
+    var fb: [2048]u8 = undefined;
+    const font = try Font.init(buildTestFont(&fb, false));
+
+    const upem: f32 = @floatFromInt(font.units_per_em);
+    const b24 = try font.bitmapBox(6, 24 / upem, 0);
+    const b20 = try font.bitmapBox(6, 20 / upem, 0);
+    const b16 = try font.bitmapBox(6, 16 / upem, 0);
+    const l24: usize = @intCast((b24.x1 - b24.x0) * (b24.y1 - b24.y0));
+    const l20: usize = @intCast((b20.x1 - b20.x0) * (b20.y1 - b20.y0));
+    const l16: usize = @intCast((b16.x1 - b16.x0) * (b16.y1 - b16.y0));
+    // Capacity for exactly the first two. The third cannot be admitted without
+    // giving something up, and the FIRST mask is the one that must go.
+    try std.testing.expect(l24 >= l16 and l20 >= l16);
+
+    const opts = Cache.Options{ .slots = 16, .max_points = 256, .max_edges = 256, .max_width = 64, .arena = @intCast(l24 + l20) };
+    var cbuf: [64 * 1024]u8 align(8) = undefined;
+    const mem: []align(8) u8 = @alignCast(cbuf[0..Cache.needed(opts)]);
+    var cache = try Cache.init(mem, opts);
+    // Under `partition_min` the cache is one pool, so the capacity above is the
+    // whole budget and the arithmetic in this test is the real arithmetic.
+    try std.testing.expect(!cache.partitioned);
+
+    _ = try cache.mask(&font, 6, 24, .zero);
+    const mid = try cache.mask(&font, 6, 20, .zero);
+    var mid_pixels: [2048]u8 = undefined;
+    @memcpy(mid_pixels[0..mid.pixels.len], mid.pixels);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats.misses);
+
+    _ = try cache.mask(&font, 6, 16, .zero);
+    try std.testing.expectEqual(@as(u64, 3), cache.stats.misses);
+
+    // The 20px mask is the second-oldest of three, so an LRU eviction spares
+    // it. Under a class wipe it is gone and this is a miss.
+    const again = try cache.mask(&font, 6, 20, .zero);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.hits);
+    try std.testing.expectEqual(@as(u64, 3), cache.stats.misses);
+    // Recycling an extent must not disturb a live neighbour's pixels.
+    try std.testing.expectEqualSlices(u8, mid_pixels[0..again.pixels.len], again.pixels);
+
+    // The oldest mask DID give way -- otherwise the hit above would be
+    // explained by nothing having been evicted at all.
+    _ = try cache.mask(&font, 6, 24, .zero);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.hits);
+    try std.testing.expectEqual(@as(u64, 4), cache.stats.misses);
+}

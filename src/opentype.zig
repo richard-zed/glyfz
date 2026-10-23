@@ -413,7 +413,7 @@ pub const Layout = struct {
         @memcpy(out[0..in.len], in);
         var len = in.len;
 
-        var lookups_buf: [32]u16 = undefined;
+        var lookups_buf: [256]u16 = undefined;
         const lookups = try self.featureLookupsDefault(feat, &lookups_buf);
         for (lookups) |li| {
             const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, li) * 2);
@@ -580,7 +580,7 @@ pub const Layout = struct {
     /// the class is the one the mark's MarkRecord names. Anchors are integer
     /// font units: no device tables, no variation deltas.
     pub fn markAttach(self: Layout, script: u32, feat: u32, buf: []const u16, len: usize, out: []Offset) Error!usize {
-        var lookups_buf: [32]u16 = undefined;
+        var lookups_buf: [256]u16 = undefined;
         var placed: usize = 0;
         for (self.lookupsFor(script, feat, &lookups_buf)) |li| {
             const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, li) * 2);
@@ -793,7 +793,7 @@ pub const Layout = struct {
     /// nothing else. Returns the (possibly changed) buffer length.
     pub fn applyFeatureAt(self: Layout, script: u32, feat: u32, buf: []u16, len: usize, pos: usize) Error!usize {
         if (pos >= len) return len;
-        var lookups_buf: [32]u16 = undefined;
+        var lookups_buf: [256]u16 = undefined;
         var cur = len;
         for (self.lookupsFor(script, feat, &lookups_buf)) |li| {
             cur = try self.applyLookupAt(li, buf, cur, pos, 0);
@@ -803,17 +803,39 @@ pub const Layout = struct {
 
     /// Apply one feature at every position, in order.
     pub fn applyFeature(self: Layout, script: u32, feat: u32, buf: []u16, len: usize) Error!usize {
-        var lookups_buf: [32]u16 = undefined;
+        var lookups_buf: [256]u16 = undefined;
         var cur = len;
         for (self.lookupsFor(script, feat, &lookups_buf)) |li| {
             const lookup = self.lookup_list + try u16At(self.data, self.lookup_list + 2 + @as(usize, li) * 2);
             const kind = try u16At(self.data, lookup);
             const flags = try u16At(self.data, lookup + 2);
             const sub_count = try u16At(self.data, lookup + 4);
-            var i: usize = 0;
-            while (i < sub_count) : (i += 1) {
-                const sub = lookup + try u16At(self.data, lookup + 6 + i * 2);
-                cur = try self.substPass(kind, sub, buf, cur, flags);
+            // Subtables are ALTERNATIVES, not stages. At each position the
+            // first subtable that matches is the one that applies -- even when
+            // it records nothing. Running every subtable in turn let Amiri's
+            // lookup 48 fall past its deliberate no-op blocker and apply the
+            // LamLam form, which preempted the Lellah form in lookup 49.
+            var pos: usize = 0;
+            while (pos < cur) {
+                var applied = false;
+                var i: usize = 0;
+                while (i < sub_count) : (i += 1) {
+                    const sub = lookup + try u16At(self.data, lookup + 6 + i * 2);
+                    var real_kind = kind;
+                    var real = sub;
+                    if (kind == 7) {
+                        real_kind = try u16At(self.data, sub + 2);
+                        real = sub + try u32At(self.data, sub + 4);
+                    }
+                    const step = try self.substAt(real_kind, real, buf, cur, pos, 0, flags);
+                    if (step.hit) {
+                        cur = step.len;
+                        pos += step.advance;
+                        applied = true;
+                        break;
+                    }
+                }
+                if (!applied) pos += 1;
             }
         }
         return cur;

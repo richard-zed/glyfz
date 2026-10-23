@@ -295,6 +295,30 @@ pub fn canonicalOrder(cps: []u21) void {
             j -= 1;
         }
     }
+
+    // Then SHADDA goes to the front of its run.
+    //
+    // ccc alone puts shadda (33) after every vowel (27..32), which is not the
+    // order HarfBuzz stores: it moves shadda ahead of the marks it stacks on.
+    // The difference is observable -- fonts key the small-vowel forms off
+    // "shadda immediately before the vowel" (Amiri's lookup 55 backtracks on
+    // uni0651 before substituting uni064E -> uni064E.small), so submitting
+    // fatha-then-shadda loses the substitution and draws a full-size fatha
+    // under a full-size shadda.
+    //
+    // It has to be the same walk as the sort, not a second pass callers must
+    // remember: every caller that ordered marks would otherwise need it too.
+    i = 1;
+    while (i < cps.len) : (i += 1) {
+        if (cps[i] != 0x0651) continue;
+        var run = i;
+        while (run > 0 and combiningClass(cps[run - 1]) != 0) run -= 1;
+        if (run == i) continue;
+        const tmp = cps[i];
+        var j = i;
+        while (j > run) : (j -= 1) cps[j] = cps[j - 1];
+        cps[run] = tmp;
+    }
 }
 
 pub const Form = enum { none, isolated, initial, medial, final };

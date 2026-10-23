@@ -1,0 +1,74 @@
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>glyfz 0.5.3 bench</title>
+<style>
+:root{--bg:#1e1e2e;--panel:#313244;--ctl:#45475a;--tx:#cdd6f4;--mut:#a6adc8;--acc:#89b4fa;--grn:#a6e3a1;--yel:#f9e2af;--red:#f38ba8}
+*{box-sizing:border-box}
+body{margin:0;padding:24px;background:var(--bg);color:var(--tx);font:15px/1.55 -apple-system,system-ui,sans-serif}
+h1{font-size:21px;margin:0 0 4px}
+h2{font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin:30px 0 10px;font-weight:600}
+.sub{color:var(--mut);font-size:13px;margin-bottom:22px}
+.wrap{max-width:720px;margin:0 auto}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;font-size:14px}
+th{text-align:right;color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.05em;padding:8px 10px;border-bottom:1px solid var(--ctl)}
+th:first-child,td:first-child{text-align:left}
+td{padding:9px 10px;text-align:right;border-bottom:1px solid #26263a}
+tr:last-child td{border-bottom:none}
+.hi{color:var(--grn);font-weight:600}
+.dim{color:var(--mut)}
+.card{background:var(--panel);border-radius:10px;padding:16px 18px;margin:14px 0}
+.big{font-size:30px;font-weight:700;color:var(--grn);line-height:1.1}
+.big span{font-size:14px;font-weight:400;color:var(--mut);display:block;margin-top:6px}
+.grid{display:flex;gap:12px;flex-wrap:wrap}
+.grid>.card{flex:1;min-width:150px;margin:0}
+ul{margin:10px 0;padding-left:20px}li{margin:6px 0}
+code{background:#181825;padding:2px 5px;border-radius:4px;font-size:13px}
+.bar{height:6px;background:var(--acc);border-radius:3px;opacity:.85}
+.note{border-left:3px solid var(--yel);padding-left:14px;color:var(--mut);font-size:14px;margin:18px 0}
+</style>
+<div class="wrap">
+<h1>Cedar / glyfz — glyph cache bench</h1>
+<div class="sub">main @ <code>489e642</code> &nbsp;·&nbsp; Zig 0.17.0 &nbsp;·&nbsp; ReleaseFast &nbsp;·&nbsp; DejaVuSans, 2048 upem &nbsp;·&nbsp; 94 printable-ASCII glyphs</div>
+
+<div class="grid">
+  <div class="card"><div class="big">110–320×<span>cache hit vs full raster</span></div></div>
+  <div class="card"><div class="big">0<span>flushes over 18,800 hits</span></div></div>
+</div>
+
+<h2>Per glyph</h2>
+<table>
+<tr><th>size</th><th>raster ns</th><th>decode ns</th><th>cached ns</th><th>raster/hit</th><th style="width:90px"></th></tr>
+<tr><td>11 px</td><td>2526.7</td><td class="dim">706.0</td><td class="hi">22.9</td><td class="hi">110.2×</td><td><div class="bar" style="width:34%"></div></td></tr>
+<tr><td>16 px</td><td>2318.5</td><td class="dim">516.4</td><td class="hi">16.9</td><td class="hi">137.3×</td><td><div class="bar" style="width:43%"></div></td></tr>
+<tr><td>24 px</td><td>2799.8</td><td class="dim">477.9</td><td class="hi">16.0</td><td class="hi">174.9×</td><td><div class="bar" style="width:55%"></div></td></tr>
+<tr><td>34 px</td><td>2989.0</td><td class="dim">347.2</td><td class="hi">13.0</td><td class="hi">230.3×</td><td><div class="bar" style="width:72%"></div></td></tr>
+<tr><td>48 px</td><td>3879.8</td><td class="dim">325.5</td><td class="hi">12.1</td><td class="hi">320.2×</td><td><div class="bar" style="width:100%"></div></td></tr>
+</table>
+
+<h2>Lookup half</h2>
+<table>
+<tr><td>cmap + hmtx</td><td>16.0 ns/glyph</td></tr>
+<tr><td>lookup (hit)</td><td class="hi">2.6 ns/glyph — 6.2×</td></tr>
+<tr><td>lookup counters</td><td class="dim">47000 hits, 94 misses</td></tr>
+</table>
+
+<h2>Cache</h2>
+<table>
+<tr><td>hits</td><td class="hi">18,800</td></tr>
+<tr><td>misses</td><td>470</td></tr>
+<tr><td>flushes</td><td class="hi">0</td></tr>
+</table>
+
+<div class="note">
+<b>Cold vs hot.</b> A miss costs the full raster — 2,300–3,900 ns, which is where "parity with stb" comes from. A hit costs 12–23 ns. Decode falls as size grows because flattening subdivides curves less at coarser scales, not because less work is done.
+</div>
+
+<h2>Reading it honestly</h2>
+<ul>
+<li><b>Caching: the real win.</b> 110–320× cheaper per glyph on a hit. This is the claim that holds.</li>
+<li><b>Raster speed vs stb doing identical work: parity</b> (0.85–1.03×). Not a win, and never was the goal.</li>
+<li><b>Zero flushes</b> across 18,800 hits — <code>arenaFor</code> sizing plus one-victim recycling, on a realistic Latin working set.</li>
+<li>The bench cannot see the by-pointer change from 0.5.0→0.5.1; that needs the per-glyph microbench, since Lookup is ~1% of a glyph.</li>
+</ul>
+
+<div class="sub" style="margin-top:26px">Raw output: <code>/tmp/bench.log</code> &nbsp;·&nbsp; harness: <code>bench/bench.zig</code></div>
+</div>

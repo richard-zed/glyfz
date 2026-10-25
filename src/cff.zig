@@ -46,11 +46,17 @@ pub const op = struct {
     pub const ros: u16 = 1230;
     pub const fd_array: u16 = 1236;
     pub const fd_select: u16 = 1237;
+    /// CFF2 only: the ItemVariationStore. Keys a variation axis to deltas.
+    pub const vstore: u16 = 24;
 };
 
 fn u8At(d: []const u8, p: usize) Error!u8 {
     if (p >= d.len) return error.Truncated;
     return d[p];
+}
+
+fn i16At(d: []const u8, p: usize) Error!i16 {
+    return @bitCast(try u16At(d, p));
 }
 
 fn u16At(d: []const u8, p: usize) Error!u16 {
@@ -123,18 +129,62 @@ pub fn indexAt(d: []const u8, at: usize) Error!Index {
     return probe;
 }
 
+/// Read a CFF2 INDEX at `at`.
+///
+/// Differs from `indexAt` in one place only: the count is four bytes, not two.
+/// Neither the count nor the offset width is allowed to truncate, because CFF2
+/// is the flavour a CJK face arrives in and those run past 65535 glyphs -- a
+/// u16 count would silently read the wrong number of them.
+pub fn indexAt32(d: []const u8, at: usize) Error!Index {
+    if (at + 4 > d.len) return error.Truncated;
+    const count_raw = @as(u32, d[at]) << 24 | @as(u32, d[at + 1]) << 16 |
+        @as(u32, d[at + 2]) << 8 | d[at + 3];
+    if (count_raw == 0) {
+        return .{ .offsets_at = at + 4, .off_size = 0, .count = 0, .data_at = at + 4, .end_at = at + 4 };
+    }
+    if (count_raw > std.math.maxInt(u16)) return error.Unsupported;
+    const count: u16 = @intCast(count_raw);
+    const off_size = try u8At(d, at + 4);
+    if (off_size == 0 or off_size > 4) return error.Unsupported;
+    const offsets_at = at + 5;
+    const data_at = offsets_at + (@as(usize, count) + 1) * off_size;
+    if (data_at > d.len) return error.Truncated;
+    var probe = Index{ .offsets_at = offsets_at, .off_size = off_size, .count = count, .data_at = data_at, .end_at = data_at };
+    const last = try probe.rawOffset(d, count);
+    if (last < 1) return error.Truncated;
+    probe.end_at = data_at + last - 1;
+    if (probe.end_at > d.len) return error.Truncated;
+    return probe;
+}
+
 /// The operand bytes of the last occurrence of `want` in a DICT, or null.
 ///
 /// Last wins because that is how a DICT overrides itself; a reader that took
 /// the first would honour a stale value in a font that redefines one.
 pub fn dictFind(dict: []const u8, want: u16) Error!?[]const u8 {
+    return dictFindMax(dict, want, 21);
+}
+
+/// As `dictFind`, but treating single-byte codes up to `op_max` as operators.
+///
+/// CFF1's single-byte operators stop at 21. CFF2 does not: it adds 22, 23 and
+/// 24 (`vstore` being 24), so a CFF1-bounded scan reads those three as *numbers*
+/// and silently swallows the operator plus the entry after it. That is not a
+/// hypothetical -- it is why `vstore` was never found in a face that plainly
+/// declares one.
+pub fn dictFindMax(dict: []const u8, want: u16, op_max: u8) Error!?[]const u8 {
     var i: usize = 0;
     var found: ?[]const u8 = null;
     while (i < dict.len) {
         const start = i;
         while (i < dict.len) {
             const b = dict[i];
-            if (b <= 21) break;
+            if (b <= op_max) break;
+            if (b == 12) {
+                // An escaped two-byte operator opens a new entry; ending the
+                // operand run here is what lets the key branch below read it.
+                break;
+            }
             if (b == 28) {
                 i += 3;
             } else if (b == 29) {
@@ -155,7 +205,13 @@ pub fn dictFind(dict: []const u8, want: u16) Error!?[]const u8 {
                 return error.Unsupported;
             }
         }
-        if (i >= dict.len) return error.Truncated;
+        // A DICT that ends `operand key` is well formed, and the key is the
+        // last byte -- so `i == dict.len` means the entry before it is complete,
+        // not that the data ran out. Only a missing KEY is truncated.
+        if (i >= dict.len) {
+            if (i == dict.len and i > start) break;
+            return error.Truncated;
+        }
         const operands = dict[start..i];
         var key: u16 = dict[i];
         i += 1;
@@ -169,11 +225,156 @@ pub fn dictFind(dict: []const u8, want: u16) Error!?[]const u8 {
     return found;
 }
 
+/// The region count of each ItemVariationData in an ItemVariationStore, in
+/// index order.
+///
+/// Deltas live inline on the charstring stack, not here, so the store holds
+/// only regions and scalars. `blend` still needs the region count to size its
+/// operand block: `numBlends * (regions + 1)`.
+pub const VarStore = struct {
+    regions: [max_var_data]u16 = @splat(0),
+    count: usize = 0,
+    /// Region axes, start/peak/end in F2Dot14. Kept flat rather than nested so
+    /// the struct stays a plain value with no allocation.
+    triples: [max_var_data * max_axes][3]i16 = @splat(@splat(0)),
+    n_regions: usize = 0,
+    n_axes: usize = 0,
+    /// Where each ItemVariationData's delta block starts, and how its deltas are
+    /// packed: `itemCount` deltas per row, the first `short_count` of each row a
+    /// signed byte, the rest signed 16-bit.
+    delta_at: [max_var_data]usize = @splat(0),
+    short_count: [max_var_data]u16 = @splat(0),
+    /// Normalised axis coordinates, one per axis. Zero is the default instance.
+    coords: [max_axes]f32 = @splat(0),
+    /// The data slice, kept so deltas can be read lazily at blend time.
+    data: []const u8 = &.{},
+
+    pub const max_var_data = 64;
+    pub const max_axes = 4;
+
+    /// Parse the store starting at `at`. Layout: format (u16), variationRegionList
+    /// offset (u32), itemVariationDataCount (u16), then that many u32 offsets to
+    /// ItemVariationData, whose own layout is itemCount (u16), shortDeltaCount
+    /// (u16), regionIndexCount (u16), then region indices.
+    pub fn init(d: []const u8, at: usize) Error!VarStore {
+        var out = VarStore{};
+        const format = try u16At(d, at);
+        if (format != 1) return error.Unsupported;
+        const n = try u16At(d, at + 6);
+        const base = at + 8;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (i >= max_var_data) return error.Unsupported;
+            const rel = try u32At(d, base + i * 4);
+            const vd = at + @as(usize, rel);
+            // itemCount is at +0, shortDeltaCount at +2, regionIndexCount at +4.
+            const item_count = try u16At(d, vd);
+            const short_cnt = try u16At(d, vd + 2);
+            const ric = try u16At(d, vd + 4);
+            out.regions[i] = ric;
+            out.short_count[i] = short_cnt;
+            // Deltas follow the region index array, one row per item.
+            out.delta_at[i] = vd + 6 + @as(usize, ric) * 2;
+            _ = item_count;
+        }
+        out.count = n;
+        out.data = d;
+
+        // The region list is what turns a delta into an actual adjustment: each
+        // region is a set of (start, peak, end) triples, one per axis, and its
+        // scalar is the product over axes of how far the current coordinate has
+        // moved toward that peak. Parsed rather than skipped so a face with a
+        // real region is not silently drawn at its base outline.
+        // VariationRegionList: axisCount (u16), regionCount (u16), then
+        // regionCount*axisCount triples of F2Dot14 (start, peak, end).
+        // axisCount and regionCount are SEPARATE fields read in that order;
+        // taking the first word as the region count happens to work only when
+        // a font's axis count equals its region count.
+        const rl = at + @as(usize, try u32At(d, at + 2));
+        const n_axes = try u16At(d, rl);
+        const n_regions = try u16At(d, rl + 2);
+        if (n_regions > max_var_data or n_axes > max_axes) return error.Unsupported;
+        out.n_axes = n_axes;
+        var rp = rl + 4;
+        var r: usize = 0;
+        while (r < n_regions) : (r += 1) {
+            var ax: usize = 0;
+            while (ax < n_axes) : (ax += 1) {
+                out.triples[r * max_axes + ax] = .{
+                    try i16At(d, rp),
+                    try i16At(d, rp + 2),
+                    try i16At(d, rp + 4),
+                };
+                rp += 6;
+            }
+        }
+        out.n_regions = n_regions;
+        return out;
+    }
+
+    /// One delta from ItemVariationData `vs`, row `item`, column `col`.
+    /// Rows are `itemCount` long; the first `short_count` columns of a row are
+    /// signed bytes, the rest signed 16-bit.
+    pub fn deltaAt(self: VarStore, vs: usize, item: usize, col: usize) f32 {
+        if (vs >= self.count) return 0;
+        const row = self.regions[vs];
+        if (col >= row) return 0;
+        const short_cnt: usize = self.short_count[vs];
+        const stride = row * 2 - @min(short_cnt, row);
+        const short_bytes = @min(short_cnt, row);
+        const base = self.delta_at[vs] + item * stride;
+        if (col < short_bytes) {
+            const at = base + col;
+            if (at >= self.data.len) return 0;
+            return @floatFromInt(@as(i8, @bitCast(self.data[at])));
+        }
+        const at = base + short_bytes + (col - short_bytes) * 2;
+        if (at + 1 >= self.data.len) return 0;
+        const v = (@as(i16, self.data[at]) << 8) | self.data[at + 1];
+        return @floatFromInt(v);
+    }
+
+    /// The scalar for region-list entry `region` at the stored coordinates:
+    /// the product over axes of each axis's own scalar.
+    pub fn blendScalar(self: VarStore, region: usize) f32 {
+        if (region >= self.n_regions) return 0;
+        var s: f32 = 1;
+        var ax: usize = 0;
+        const max_ax = if (self.n_axes == 0) 1 else self.n_axes;
+        while (ax < max_ax) : (ax += 1) {
+            const t = self.triples[region * max_axes + ax];
+            const start: f32 = @as(f32, @floatFromInt(t[0])) / 16384.0;
+            const peak: f32 = @as(f32, @floatFromInt(t[1])) / 16384.0;
+            const end: f32 = @as(f32, @floatFromInt(t[2])) / 16384.0;
+            // A peak of 0 means the region does not constrain this axis.
+            if (peak == 0) continue;
+            const c = self.coords[ax];
+            // Checked BEFORE the range test: at the peak the scalar is 1 even
+            // when the peak sits on an end coordinate, which is how these
+            // regions are built (0, 1, 1).
+            if (c == peak) continue;
+            if (c <= start or c >= end) return 0;
+            if (c < peak) {
+                if (peak == start) return 0;
+                s *= (c - start) / (peak - start);
+            } else {
+                if (end == peak) return 0;
+                s *= (end - c) / (end - peak);
+            }
+        }
+        return s;
+    }
+
+    pub fn regionsFor(self: VarStore, vsindex: usize) Error!usize {
+        if (vsindex >= self.count) return error.Unsupported;
+        return self.regions[vsindex];
+    }
+};
+
 /// Decode the integer operands of a DICT entry, in order.
 ///
-/// Reals are refused rather than approximated: every operator read here takes
-/// integers by spec, so a real in one of them means the font is doing
-/// something unexpected and a rounded number would hide it.
+/// A real keeps only its integer part. Every operator read here takes integers
+/// by spec, so a fractional value is a font doing something unexpected.
 pub fn dictNumbers(operands: []const u8, out: []i32) Error!usize {
     var i: usize = 0;
     var n: usize = 0;
@@ -197,6 +398,36 @@ pub fn dictNumbers(operands: []const u8, out: []i32) Error!usize {
         } else if (b == 29) {
             out[n] = @bitCast(try u32At(operands, i + 1));
             i += 5;
+        } else if (b == 30) {
+            // Real: nibbles, MSB first, 0xf terminating either half-byte.
+            // Only the integer part is kept -- every operator read here takes
+            // integers by spec, so a fractional value is a font doing something
+            // unexpected and silently separating the operands would hide it.
+            var neg = false;
+            var int_part: i32 = 0;
+            var seen_dot = false;
+            i += 1;
+            while (i < operands.len) {
+                const byte = operands[i];
+                i += 1;
+                var half: usize = 0;
+                while (half < 2) : (half += 1) {
+                    const nib = if (half == 0) byte >> 4 else byte & 0x0f;
+                    if (nib == 0x0f) break;
+                    if (nib == 0x0c) {
+                        neg = true;
+                        continue;
+                    }
+                    if (nib == 0x0e) {
+                        seen_dot = true;
+                        continue;
+                    }
+                    if (nib > 9) return error.Unsupported;
+                    if (!seen_dot) int_part = int_part * 10 + @as(i32, @intCast(nib));
+                }
+                if ((byte & 0x0f) == 0x0f) break;
+            }
+            out[n] = if (neg) -int_part else int_part;
         } else {
             return error.Unsupported;
         }
@@ -222,7 +453,7 @@ pub const Private = struct {
     /// Null when the DICT declares no Subrs operator, which is legal.
     local_subrs: ?Index = null,
 
-    fn read(d: []const u8, size: usize, offset: usize) Error!Private {
+    fn read(d: []const u8, size: usize, offset: usize, cff2: bool) Error!Private {
         if (offset > d.len or size > d.len - offset) return error.Truncated;
         const dict = d[offset .. offset + size];
         var p = Private{ .size = size, .offset = offset };
@@ -231,7 +462,14 @@ pub const Private = struct {
         if (try dictFind(dict, op.subrs)) |v| {
             const rel = try dictOne(v);
             if (rel < 0) return error.Truncated;
-            p.local_subrs = try indexAt(d, offset + @as(usize, @intCast(rel)));
+            // `Subrs` is measured from the Private DICT's own start. CFF2
+            // INDEXes carry a u32 count -- reading a u16 sees the high half of
+            // a 542-entry INDEX and concludes it is empty, which then makes
+            // every `callsubr` in the face unreachable.
+            p.local_subrs = if (cff2)
+                try indexAt32(d, offset + @as(usize, @intCast(rel)))
+            else
+                try indexAt(d, offset + @as(usize, @intCast(rel)));
         }
         return p;
     }
@@ -250,6 +488,91 @@ pub const Font = struct {
     fd_array: ?Index = null,
     fd_select_at: ?usize = null,
     charstring_type: u16 = 2,
+    /// CFF2 differs from CFF1 in three ways that reach the interpreter: no
+    /// leading width operand, no `endchar`, and no NAME INDEX to skip.
+    is_cff2: bool = false,
+    /// The face's ItemVariationStore, if any. Null means `blend` keeps base
+    /// values, which is correct only at the default instance.
+    var_store: ?VarStore = null,
+
+    /// Read a CFF2 table.
+    ///
+    /// Kept separate from `init` because the layout genuinely differs: CFF2 has
+    /// no NAME INDEX, so sharing `init` would take the Top DICT from the wrong
+    /// place and misread every INDEX after it.
+    ///
+    /// The store is parsed here; `charstringAt` positions it and `blend`
+    /// weights deltas by it. `charstring` leaves every coordinate at 0, which
+    /// is the default instance.
+    pub fn initCff2(data: []const u8) Error!Font {
+        if (data.len < 5) return error.Truncated;
+        if (data[0] != 2) return error.NotCff;
+        const hdr_size = data[2];
+        if (hdr_size < 5 or hdr_size > data.len) return error.Truncated;
+        const top_len = try u16At(data, 3);
+        if (hdr_size + top_len > data.len) return error.Truncated;
+        const top_dict = data[hdr_size .. hdr_size + top_len];
+
+        // CharStrings, FDArray and FDSelect offsets are ABSOLUTE within the
+        // CFF2 table. Measured on AdobeVFPrototype, SourceHanSansJP-VF and
+        // NotoSerifJP-VF: reading these from +2 turns CharStrings' plausible
+        // count of 313 into 20513280 and FDArray's single entry into 65793.
+        // The one exception is vstore, which IS relative (see below).
+
+        // CFF2 can omit `vstore`; the default instance needs no deltas.
+        var var_store: ?VarStore = null;
+        if (try dictFindMax(top_dict, op.vstore, 24)) |v| {
+            const rel = try dictOne(v);
+            if (rel < 0) return error.Truncated;
+            // vstore is the ONE offset measured from byte 2 rather than 0:
+            // its operand reads 21/24 in these fonts while the ItemVariation-
+            // Store format word only lands on the valid value 1 at +2.
+            var_store = try VarStore.init(data, 2 + @as(usize, @intCast(rel)));
+        }
+
+        const cs = (try dictFindMax(top_dict, op.char_strings, 24)) orelse return error.MissingTable;
+        const cs_rel = try dictOne(cs);
+        if (cs_rel < 0) return error.Truncated;
+
+        var f = Font{
+            .data = data,
+            .top_dict = top_dict,
+            .var_store = var_store,
+            .char_strings = undefined,
+            .global_subrs = undefined,
+            .is_cff2 = true,
+        };
+        f.char_strings = try indexAt32(data, @intCast(cs_rel));
+
+        // The Global Subr INDEX follows CharStrings directly; there is no
+        // String INDEX to skip first, unlike CFF1.
+        f.global_subrs = try indexAt32(data, f.char_strings.end());
+
+        // A Private DICT is optional in CFF2 and carries only local subrs here.
+        // Its absence is normal, not an error.
+        if (try dictFind(top_dict, op.private)) |v| {
+            var nums: [4]i32 = undefined;
+            const n = try dictNumbers(v, &nums);
+            if (n != 2) return error.Unsupported;
+            if (nums[0] < 0 or nums[1] < 0) return error.Truncated;
+            f.private = try Private.read(data, @intCast(nums[0]), @intCast(nums[1]), true);
+        }
+
+        // FDArray/FDSelect exist in CFF2 too, at the same operator numbers.
+        if (try dictFindMax(top_dict, op.fd_array, 24)) |v| {
+            const rel = try dictOne(v);
+            if (rel < 0) return error.Truncated;
+            f.fd_array = try indexAt32(data, @intCast(rel));
+            f.is_cid = true;
+        }
+        if (try dictFindMax(top_dict, op.fd_select, 24)) |v| {
+            const rel = try dictOne(v);
+            if (rel < 0) return error.Truncated;
+            f.fd_select_at = @intCast(rel);
+        }
+
+        return f;
+    }
 
     pub fn init(data: []const u8) Error!Font {
         if (data.len < 4) return error.Truncated;
@@ -287,7 +610,7 @@ pub const Font = struct {
             const n = try dictNumbers(v, &nums);
             if (n != 2) return error.Unsupported;
             if (nums[0] < 0 or nums[1] < 0) return error.Truncated;
-            f.private = try Private.read(data, @intCast(nums[0]), @intCast(nums[1]));
+            f.private = try Private.read(data, @intCast(nums[0]), @intCast(nums[1]), false);
         }
 
         f.is_cid = (try dictFind(top_dict, op.ros)) != null;
@@ -353,12 +676,17 @@ pub const Font = struct {
         const fd = try self.fdIndex(gid);
         if (fd >= fds.count) return error.MissingTable;
         const font_dict = try fds.get(self.data, fd);
-        const v = (try dictFind(font_dict, op.private)) orelse return null;
+        // `private` is a single-byte key, but the Font DICT also carries escaped
+        // operators (12 36 FontMatrix, 12 38 FontName). Scanning with the CFF1
+        // bound stops on the `12` of those and hands the following bytes to
+        // dictNumbers, so the escaped form has to be admitted even though the
+        // key being sought is a plain one.
+        const v = (try dictFindMax(font_dict, op.private, 24)) orelse return null;
         var nums: [4]i32 = undefined;
         const n = try dictNumbers(v, &nums);
         if (n != 2) return error.Unsupported;
         if (nums[0] < 0 or nums[1] < 0) return error.Truncated;
-        return try Private.read(self.data, @intCast(nums[0]), @intCast(nums[1]));
+        return try Private.read(self.data, @intCast(nums[0]), @intCast(nums[1]), self.is_cff2);
     }
 };
 
@@ -483,12 +811,32 @@ test "the container never reads past a truncated table" {
     try expect(parsed < full.len);
 }
 
-test "a face that is not CFF is refused, not misread" {
-    // CFF2 starts 0x02 and has no NAME INDEX; reading it as CFF1 would take
-    // the Top DICT INDEX from the wrong place.
+test "the operand stack is CFF2-sized, not CFF1-sized" {
+    // CFF2 raises maxstack to 513 because one `blend` routes every delta
+    // through the stack; a face declaring no maxstack gets that default, not
+    // CFF1's 48. Pinned here because the failure is a bare `error.Unsupported`
+    // deep in `push` on the first blend-heavy glyph, with nothing pointing at
+    // the limit (Source Han Sans VF, gid 6373).
+    try expect(stack_max >= 513);
+    var run: Run = .{
+        .data = &.{},
+        .pen = .{ .out = null },
+        .local = null,
+        .global_subrs = .{ .count = 0, .off_size = 0, .offsets_at = 0, .data_at = 0, .end_at = 0 },
+    };
+    var i: usize = 0;
+    while (i < stack_max) : (i += 1) try run.push(1);
+    try expectError(error.Unsupported, run.push(1));
+}
+
+test "a CFF2 table is refused by the CFF1 reader, not misread" {
+    // CFF2 starts 0x02 and has no NAME INDEX, so the CFF1 reader must refuse it
+    // rather than take the Top DICT INDEX from the wrong place.
     const fake = [_]u8{ 2, 0, 5, 2, 0, 0, 0, 0 };
     try expectError(error.NotCff, Font.init(&fake));
     try expectError(error.Truncated, Font.init(&[_]u8{ 1, 0 }));
+    // ...and the CFF2 reader must refuse a CFF1 header in turn.
+    try expectError(error.NotCff, Font.initCff2(&[_]u8{ 1, 0, 4, 0, 0 }));
 }
 
 test "a private dict yields its widths and local subroutines" {
@@ -647,8 +995,11 @@ pub const Pen = struct {
     }
 };
 
-/// The spec allows 48 operands on the stack.
-const stack_max = 48;
+/// The stack is 48 operands in CFF1, but CFF2 raises it to 513 because a single
+/// `blend` operator can push thousands of deltas through one stack. A CFF2 face
+/// that declares no `maxstack` gets the CFF2 default, not CFF1's 48 -- using 48
+/// there fails on the first blend-heavy glyph (Source Han Sans VF, gid 6373).
+const stack_max = 513;
 /// The spec allows 10 nested subroutine calls.
 const call_max = 10;
 /// Transient storage used by put/get.
@@ -664,6 +1015,18 @@ const Run = struct {
     local: ?Index,
     global_subrs: Index,
     transient: [transient_max]f32 = @splat(0),
+    /// CFF2 has no leading width operand: every width comes from `hmtx`. With
+    /// this set `widthShift` never consumes a value, so one edit covers all six
+    /// call sites instead of six that can drift apart.
+    cff2: bool = false,
+    /// Which ItemVariationData the next `blend` reads.
+    vsindex: usize = 0,
+    /// Region count for the selected ItemVariationData. `blend` needs it to size
+    /// the delta block: numOps = numBlends * (regions + 1).
+    regions: usize = 0,
+    /// The variation store, or null when the face has none. Null means blend
+    /// keeps base values, which is correct only at the default instance.
+    vs: ?VarStore = null,
 
     fn push(self: *Run, v: f32) Error!void {
         if (self.sp >= stack_max) return error.Unsupported;
@@ -680,6 +1043,7 @@ const Run = struct {
     /// arguments; hmoveto and vmoveto take one, so they pass false and land
     /// here with two.
     fn widthShift(self: *Run, odd_means_width: bool) usize {
+        if (self.cff2) return 0;
         if (self.width_seen) return 0;
         self.width_seen = true;
         const n = self.sp;
@@ -709,10 +1073,51 @@ pub fn charstring(f: Font, gid: usize, out: []Segment) Error![]Segment {
         .pen = .{ .out = out },
         .local = if (priv) |p| p.local_subrs else null,
         .global_subrs = f.global_subrs,
+        .cff2 = f.is_cff2,
+        .regions = if (f.var_store) |vs| (vs.regionsFor(0) catch 0) else 0,
+        .vs = f.var_store,
     };
     _ = try exec(&run, code, 0);
     if (run.pen.open) try run.pen.push(.close);
     return out[0..run.pen.n];
+}
+
+/// The same outline at a varied instance. `coords` is one normalised axis
+/// coordinate per variation axis; all zero is the default instance.
+pub fn charstringAt(f: Font, gid: usize, coords: []const f32, out: []Segment) Error![]Segment {
+    var run = try openRun(f, gid, coords, .{ .out = out });
+    const code = try f.charString(gid);
+    _ = try exec(&run, code, 0);
+    if (run.pen.open) try run.pen.push(.close);
+    return out[0..run.pen.n];
+}
+
+/// The bounds at a varied instance.
+pub fn charstringBoxAt(f: Font, gid: usize, coords: []const f32) Error!?Bounds {
+    var run = try openRun(f, gid, coords, .{ .out = null });
+    const code = try f.charString(gid);
+    _ = try exec(&run, code, 0);
+    if (!run.pen.any) return null;
+    return .{ .x0 = run.pen.min_x, .y0 = run.pen.min_y, .x1 = run.pen.max_x, .y1 = run.pen.max_y };
+}
+
+/// A Run with the face's store positioned at `coords`.
+fn openRun(f: Font, gid: usize, coords: []const f32, pen: Pen) Error!Run {
+    const priv = try f.privateFor(gid);
+    var vs = f.var_store;
+    if (vs) |*store| {
+        var i: usize = 0;
+        while (i < store.n_axes and i < coords.len) : (i += 1) store.coords[i] = coords[i];
+    }
+    return Run{
+        .data = f.data,
+        .pen = pen,
+        .local = if (priv) |p| p.local_subrs else null,
+        .global_subrs = f.global_subrs,
+        .cff2 = f.is_cff2,
+        .regions = if (vs) |v| (v.regionsFor(0) catch 0) else 0,
+        .vs = vs,
+    };
 }
 
 /// The glyph's bounds in font units, control points included, without needing
@@ -725,6 +1130,9 @@ pub fn charstringBox(f: Font, gid: usize) Error!?Bounds {
         .pen = .{ .out = null },
         .local = if (priv) |p| p.local_subrs else null,
         .global_subrs = f.global_subrs,
+        .cff2 = f.is_cff2,
+        .regions = if (f.var_store) |vs| (vs.regionsFor(0) catch 0) else 0,
+        .vs = f.var_store,
     };
     _ = try exec(&run, code, 0);
     if (!run.pen.any) return null;
@@ -917,11 +1325,61 @@ fn exec(run: *Run, code: []const u8, depth: u8) Error!bool {
             },
             11 => return false, // return
             14 => { // endchar; a 4-argument endchar is the seac composite
+                // CFF2 removed `endchar` and `return` outright: a glyph ends
+                // when its charstring runs out, and op 14 is not defined. It is
+                // also NOT recycled as the `blend`/`vsindex` pair -- those are
+                // ops 16 and 15. So there is nothing to interpret here.
+                if (run.cff2) return false;
                 const shift = run.widthShift(true);
                 const n = run.sp - shift;
                 if (n >= 4) return error.Unsupported;
                 run.sp = 0;
                 return true;
+            },
+            15 => { // vsindex: selects an ItemVariationData for later blends
+                if (!run.cff2) return error.Unsupported;
+                if (run.sp != 1) return error.Truncated;
+                const v = run.st[0];
+                if (v < 0) return error.Truncated;
+                run.vsindex = @intFromFloat(v);
+                run.sp = 0;
+            },
+            16 => { // blend
+                // Without a store every delta contributes nothing, so the base
+                // values stand.
+                if (!run.cff2) return error.Unsupported;
+                if (run.sp < 1) return error.Truncated;
+                const n_float = run.st[run.sp - 1];
+                if (n_float < 0) return error.Truncated;
+                const num_blends: usize = @intFromFloat(n_float);
+                run.sp -= 1;
+                if (num_blends == 0) return error.Truncated;
+                // numOps counts the bases AND the deltas together; the count of
+                // stacked values is what tells us how many there are.
+                const regions = run.regions;
+                const num_ops = num_blends * (regions + 1);
+                if (num_ops > run.sp) return error.Truncated;
+                // Keep the first num_blends of the numOps-strong group.
+                const base_start = run.sp - num_ops;
+                if (base_start < 0) return error.Truncated;
+                // The deltas are INLINE on the stack, not in the variation
+                // store: fontTools' blender(region, deltas) simply weights the
+                // stacked numbers by each region's scalar at the current
+                // coordinate. The store supplies the regions only.
+                if (run.vs) |vs_store| {
+                    var item: usize = 0;
+                    while (item < num_blends) : (item += 1) {
+                        var acc = run.st[base_start + item];
+                        var r: usize = 0;
+                        while (r < regions) : (r += 1) {
+                            const sc = vs_store.blendScalar(r);
+                            if (sc == 0) continue;
+                            acc += sc * run.st[base_start + num_blends + item * regions + r];
+                        }
+                        run.st[base_start + item] = acc;
+                    }
+                }
+                run.sp = base_start + num_blends;
             },
             12 => {
                 const second = try charAt(code, pc);

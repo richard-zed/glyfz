@@ -36,9 +36,10 @@
 //! 2/3 and Apple's version 1 layout, vertical layout, and Unicode normalisation
 //! or line breaking.
 //!
-//! Two of those are ROADMAP rather than refused, and the README says what each
-//! needs: CFF2 (the variable flavour of CFF -- `glyf` variations are read, CFF2
-//! is not) and GSUB beyond Arabic and Thai.
+//! GSUB beyond Arabic and Thai is ROADMAP; the README says what it needs.
+//! CFF2 is read, including `blend`/`vsindex`, but only against a face whose
+//! Top DICT carries the default instance -- a `vstore` is refused rather than
+//! drawn wrong.
 
 const std = @import("std");
 const cff = @import("cff.zig");
@@ -342,6 +343,7 @@ const tag_gpos = tag("GPOS");
 const tag_gsub = tag("GSUB");
 const tag_gdef = tag("GDEF");
 const tag_cff = tag("CFF ");
+const tag_cff2 = tag("CFF2");
 const tag_colr = tag("COLR");
 const tag_fvar = tag("fvar");
 const tag_avar = tag("avar");
@@ -391,6 +393,7 @@ pub const Font = struct {
     gsub_span: Span = .{},
     gdef_span: Span = .{},
     cff_span: Span = .{},
+    cff2_span: Span = .{},
     colr_span: Span = .{},
     fvar_span: Span = .{},
     avar_span: Span = .{},
@@ -427,8 +430,8 @@ pub const Font = struct {
                 if (index >= count) return error.UnknownFontIndex;
                 base = try u32At(bytes, 12 + @as(usize, index) * 4);
             },
-            // OTTO means CFF outlines. Loadable now; `CFF2` (a different,
-            // variable-font format) is still refused below, by tag.
+            // OTTO means CFF outlines. Loadable now, in both flavours: the
+            // `CFF ` and `CFF2` containers are dispatched on tag below.
             tag("OTTO") => is_cff = true,
             else => return error.NotSfnt,
         }
@@ -457,6 +460,7 @@ pub const Font = struct {
             if (t == tag_gsub) self.gsub_span = span;
             if (t == tag_gdef) self.gdef_span = span;
             if (t == tag_cff) self.cff_span = span;
+            if (t == tag_cff2) self.cff2_span = span;
             if (t == tag_colr) self.colr_span = span;
             if (t == tag_fvar) self.fvar_span = span;
             if (t == tag_avar) self.avar_span = span;
@@ -504,7 +508,13 @@ pub const Font = struct {
         // but the cmap selection below is NOT, because it is what maps a
         // codepoint to a glyph and it applies to both outline formats.
         if (self.is_cff) {
-            self.cff = cff.Font.init(try self.slice(self.cff_span)) catch |e| return switch (e) {
+            // CFF2 is a separate container: no NAME INDEX, so its Top DICT sits
+            // at a different offset. A face may ship either table, never both.
+            // A face ships one or the other; the absent table is an empty span,
+            // not an error.
+            const is_cff2 = self.cff_span.len == 0;
+            const cff_data = try self.slice(if (is_cff2) self.cff2_span else self.cff_span);
+            self.cff = (if (is_cff2) cff.Font.initCff2(cff_data) else cff.Font.init(cff_data)) catch |e| return switch (e) {
                 error.NotCff => error.CffNotSupported,
                 error.Truncated => error.Truncated,
                 error.MissingTable => error.MissingTable,
@@ -3781,6 +3791,9 @@ fn utf16beToUtf8(s: []const u8, out: []u8) []const u8 {
     return out[0..n];
 }
 
+fn w8(b: []u8, at: usize, v: u8) void {
+    b[at] = v;
+}
 fn w16(b: []u8, at: usize, v: u16) void {
     std.mem.writeInt(u16, b[at..][0..2], v, .big);
 }
@@ -4479,9 +4492,8 @@ test "outline says so when the caller's buffer is too small" {
 test "rejects what it cannot read" {
     try std.testing.expectError(error.Truncated, Font.init(""));
     try std.testing.expectError(error.Truncated, Font.init("\x00\x01\x00"));
-    // OTTO is CFF outlines, which load now; without a CFF table the face has no
-    // outlines at all, which is what this pins. A CFF2 table is still refused,
-    // and `cff.zig` covers that directly.
+    // OTTO is CFF outlines, which load now; without a CFF or CFF2 table the
+    // face has no outlines at all, which is what this pins.
     try std.testing.expectError(error.MissingTable, Font.init("OTTO\x00\x00\x00\x00"));
     try std.testing.expectError(error.NotSfnt, Font.init("junkjunkjunk"));
 
@@ -5952,6 +5964,388 @@ fn buildCffTestFont(buf: []u8) []const u8 {
     for (tags, recs, 0..) |t, r, i| patchRec(buf, 12 + i * 16, t, r.at, r.len);
 
     return buf[0..w.at];
+}
+
+/// One Type2 operand byte: 139+v, legal for v in -107..107.
+fn op2(w: *W, v: u8) void {
+    w.u8v(139 + v);
+}
+
+fn buildCff2TestFont(buf: []u8) []const u8 {
+    const ntables: usize = 6;
+    var w = W{ .buf = buf };
+
+    w.u32v(tag("OTTO"));
+    w.u16v(@intCast(ntables));
+    w.u16v(0);
+    w.u16v(0);
+    w.u16v(0);
+    w.zeros(ntables * 16);
+
+    // --- cmap: format 4, A -> gid 1 ---
+    const cmap_start = w.at;
+    w.u16v(0);
+    w.u16v(1);
+    const rec0 = w.at;
+    w.u16v(3);
+    w.u16v(1);
+    w.u32v(0);
+    const f4 = w.at;
+    w.u16v(4);
+    const len4_at = w.at;
+    w.u16v(0);
+    w.u16v(0);
+    w.u16v(4); // segCountX2: two segments
+    w.u16v(4);
+    w.u16v(1);
+    w.u16v(0); // rangeShift
+    w.u16v(0x41); // endCode
+    w.u16v(0xFFFF);
+    w.u16v(0); // reservedPad
+    w.u16v(0x41); // startCode
+    w.u16v(0xFFFF);
+    w.i16v(@bitCast(@as(u16, 0xFFC0)));
+    w.i16v(1);
+    w.u16v(0); // idRangeOffset
+    w.u16v(0);
+    w16(buf, len4_at, @intCast(w.at - f4));
+    w32(buf, rec0 + 4, @intCast(f4 - cmap_start));
+    const r_cmap = Rec{ .at = cmap_start, .len = w.at - cmap_start };
+
+    // --- CFF2: header, Top DICT INDEX, Global Subr INDEX, CharStrings ---
+    // No NAME INDEX, so the Top DICT INDEX follows the header directly.
+    const cff_start = w.at;
+    // CFF2 header is 5 bytes: major, minor, hdrSize, topDictLength (u16).
+    // The Top DICT follows IMMEDIATELY and is read as a raw slice, not as an
+    // INDEX -- there is no NAME INDEX to offset it, and no INDEX header.
+    w.u8v(2); // major: the only thing distinguishing the flavours
+    w.u8v(0);
+    w.u8v(5); // hdrSize
+    w.u16v(6); // topDictLength: 29 + u32 + op = 6 bytes
+    w.u8v(29); // 32-bit operand
+    const cs_off_at = w.at;
+    w.u32v(0); // CharStrings offset, patched
+    w.u8v(17); // op char_strings
+    // Type2 charstrings. "abc"/"def" would be numbers and operators, not
+    // drawing, so each glyph is a real triangle: rmoveto, two rlinetos.
+    // CFF2 has no endchar -- a glyph ends when its charstring runs out.
+    const cs_at = w.at;
+    w.u32v(2); // CharStrings: two glyphs
+    w.u8v(1);
+    w.u8v(1);
+    w.u8v(10); // end of glyph 1 (9 bytes: 100,0,21,50,0,5,0,60,5)
+    w.u8v(19); // one past glyph 2
+    // Operands must be 0..99: 108..1131 would need the two-byte form, and
+    // 12..99 overlap the operator range (100 is `dotsection`, banned in CFF2).
+    // Type2 encodes operand v as the single byte 139+v (32..246), so every
+    // value here is written through `n()`. Bare small ints would be operators.
+    op2(&w, 99); // rmoveto: dx
+    op2(&w, 0); //           dy
+    w.u8v(21);
+    op2(&w, 50); // rlineto
+    op2(&w, 0);
+    w.u8v(5);
+    op2(&w, 0); // rlineto
+    op2(&w, 60);
+    w.u8v(5);
+    op2(&w, 99); // glyph 2: same shape, narrower
+    op2(&w, 0);
+    w.u8v(21);
+    op2(&w, 40);
+    op2(&w, 0);
+    w.u8v(5);
+    op2(&w, 0);
+    op2(&w, 50);
+    w.u8v(5);
+    w32(buf, cs_off_at, @intCast(cs_at - cff_start));
+    // Global Subr INDEX follows CharStrings directly -- that is where
+    // initCff2 looks for it, since CFF2 has no String INDEX to skip.
+    w.u32v(0); // empty
+    const r_cff2 = Rec{ .at = cff_start, .len = w.at - cff_start };
+
+    const head_start = w.at;
+    w.u32v(0x0001_0000);
+    w.u32v(0x0001_0000);
+    w.u32v(0);
+    w.u32v(0x5F0F_3CF5);
+    w.u16v(0);
+    w.u16v(1000);
+    w.zeros(16);
+    w.zeros(8);
+    w.u16v(0);
+    w.u16v(8);
+    w.i16v(2);
+    w.i16v(0);
+    w.i16v(0);
+    const r_head = Rec{ .at = head_start, .len = w.at - head_start };
+
+    const hhea_start = w.at;
+    w.u32v(0x0001_0000);
+    w.i16v(880);
+    w.i16v(-120);
+    w.i16v(0);
+    w.u16v(600);
+    w.zeros(6);
+    w.zeros(6);
+    w.zeros(8);
+    w.i16v(0);
+    w.u16v(2);
+    const r_hhea = Rec{ .at = hhea_start, .len = w.at - hhea_start };
+
+    const hmtx_start = w.at;
+    w.u16v(600);
+    w.i16v(10);
+    w.u16v(500);
+    w.i16v(20);
+    const r_hmtx = Rec{ .at = hmtx_start, .len = w.at - hmtx_start };
+
+    const maxp_start = w.at;
+    w.u32v(0x0000_5000);
+    w.u16v(2);
+    const r_maxp = Rec{ .at = maxp_start, .len = w.at - maxp_start };
+
+    const tags: [ntables]u32 = .{ tag_cmap, tag_cff2, tag_head, tag_hhea, tag_hmtx, tag_maxp };
+    const recs: [ntables]Rec = .{ r_cmap, r_cff2, r_head, r_hhea, r_hmtx, r_maxp };
+    for (tags, recs, 0..) |t, r, i| patchRec(buf, 12 + i * 16, t, r.at, r.len);
+
+    return buf[0..w.at];
+}
+
+/// A CFF2 face whose glyph 1 moves with the axis: `blend` adjusts dx by a
+/// delta weighted by one region peaking at coordinate 1.0.
+///
+/// The region is (0, 1, 1) on a single axis, so its scalar is the coordinate
+/// itself: at the default (0) the glyph is the base outline, at 1.0 it has
+/// shifted by the delta. Any other weight would make a broken scalar look
+/// correct at the default instance, which is exactly how the avar bug hid.
+fn buildCff2BlendTestFont(buf: []u8) []const u8 {
+    const ntables: usize = 6;
+    var w = W{ .buf = buf };
+
+    w.u32v(tag("OTTO"));
+    w.u16v(@intCast(ntables));
+    w.u16v(0);
+    w.u16v(0);
+    w.u16v(0);
+    w.zeros(ntables * 16);
+
+    // --- cmap: format 4, A -> gid 1 ---
+    const cmap_start = w.at;
+    w.u16v(0);
+    w.u16v(1);
+    const rec0 = w.at;
+    w.u16v(3);
+    w.u16v(1);
+    w.u32v(0);
+    const f4 = w.at;
+    w.u16v(4);
+    const len4_at = w.at;
+    w.u16v(0);
+    w.u16v(0);
+    w.u16v(4);
+    w.u16v(4);
+    w.u16v(1);
+    w.u16v(0);
+    w.u16v(0x41);
+    w.u16v(0xFFFF);
+    w.u16v(0);
+    w.u16v(0x41);
+    w.u16v(0xFFFF);
+    w.i16v(@bitCast(@as(u16, 0xFFC0)));
+    w.i16v(1);
+    w.u16v(0);
+    w.u16v(0);
+    w16(buf, len4_at, @intCast(w.at - f4));
+    w32(buf, rec0 + 4, @intCast(f4 - cmap_start));
+    const r_cmap = Rec{ .at = cmap_start, .len = w.at - cmap_start };
+
+    // --- CFF2 with a vstore and a blend ---
+    const cff_start = w.at;
+    // Top DICT: two 6-byte entries, `29 u32 op` each = 12 bytes.
+    w.u8v(2);
+    w.u8v(0);
+    w.u8v(5);
+    w.u16v(12);
+    w.u8v(29); // 32-bit operand
+    w.u32v(0); // CharStrings, patched
+    const cs_off_at = w.at - 4;
+    w.u8v(17);
+    w.u8v(29); // 32-bit operand
+    w.u32v(0); // vstore, patched
+    const vs_off_at = w.at - 4;
+    w.u8v(24);
+
+    const cs_at = w.at;
+    w.u32v(2); // CharStrings INDEX: two glyphs
+    w.u8v(1); // offSize: byte offsets
+    w.u8v(1); // offset 0: glyph 1 starts at data byte 1
+    w.u8v(0); // offset 1: past glyph 1, patched
+    const off1_at = w.at - 1;
+    w.u8v(0); // offset 2: past glyph 2, patched
+    const off2_at = w.at - 1;
+    const g1 = w.at;
+    // rmoveto dx=50 dy=0. dx is a blend of base 50 and delta +50.
+    // Stack for one blended operand: base, delta, n.  numBlends=1, 1 region.
+    op2(&w, 50); // base
+    op2(&w, 50); // delta for region 0
+    op2(&w, 1); // numBlends
+    w.u8v(16); // op blend
+    op2(&w, 0);
+    w.u8v(21); // rmoveto
+    op2(&w, 50); // rlineto
+    op2(&w, 0);
+    w.u8v(5);
+    op2(&w, 0); // rlineto
+    op2(&w, 60);
+    w.u8v(5);
+    const g1_len = w.at - g1;
+    const g2 = w.at;
+    op2(&w, 50);
+    op2(&w, 0);
+    w.u8v(21);
+    op2(&w, 40);
+    op2(&w, 0);
+    w.u8v(5);
+    op2(&w, 0);
+    op2(&w, 50);
+    w.u8v(5);
+    const g2_len = w.at - g2;
+    // Offsets are 1-based from the data area, so glyph 1 starts at 1.
+    w8(buf, off1_at, @intCast(1 + g1_len));
+    w8(buf, off2_at, @intCast(1 + g1_len + g2_len));
+    // CharStrings and vstore are absolute within the CFF2 table; only vstore
+    // reads from +2, so this one needs no adjustment.
+    w32(buf, cs_off_at, @intCast(cs_at - cff_start));
+
+    // Global Subr INDEX must follow CharStrings DIRECTLY -- initCff2 reads it
+    // from char_strings.end(), so anything in between is read as the INDEX.
+    w.u32v(0); // empty
+
+    // ItemVariationStore at its own offset.
+    const vs_at = w.at;
+    // format=1, regionListOffset(u32), dataCount(u16), then data offsets
+    w.u16v(1);
+    w.u32v(0); // regionListOffset, patched
+    const rl_off_at = w.at - 4;
+    w.u16v(1); // one ItemVariationData
+    w.u32v(0); // ItemVariationData offset, patched
+    const ivd_off_at = w.at - 4;
+    // ItemVariationData
+    const ivd = w.at;
+    w.u16v(1); // itemCount
+    w.u16v(1); // shortDeltaCount: one signed byte
+    w.u16v(1); // regionIndexCount
+    w.u16v(0); // region index 0
+    w.u8v(@intCast(@as(u8, @bitCast(@as(i8, 50))))); // the delta itself
+    w32(buf, ivd_off_at, @intCast(ivd - vs_at));
+    // VariationRegionList
+    const rl = w.at;
+    w.u16v(1); // axisCount
+    w.u16v(1); // regionCount
+    w.i16v(0); // start 0.0
+    w.i16v(16384); // peak 1.0
+    w.i16v(16384); // end 1.0
+    w32(buf, rl_off_at, @intCast(rl - vs_at));
+    const vs_len = w.at - vs_at;
+    // itemVariationData offsets are relative to the START of the store, so the
+    // patch above used vs_at correctly. vstore offsets in a Top DICT are
+    // relative to the start of the CFF2 table.
+    // vstore is the one offset measured from byte 2, not 0 (see initCff2).
+    w32(buf, vs_off_at, @intCast(vs_at - (cff_start + 2)));
+    _ = vs_len;
+
+    const r_cff2 = Rec{ .at = cff_start, .len = w.at - cff_start };
+
+    const head_start = w.at;
+    w.u32v(0x0001_0000);
+    w.u32v(0x0001_0000);
+    w.u32v(0);
+    w.u32v(0x5F0F_3CF5);
+    w.u16v(0);
+    w.u16v(1000);
+    w.zeros(16);
+    w.zeros(8);
+    w.u16v(0);
+    w.u16v(8);
+    w.i16v(2);
+    w.i16v(0);
+    w.i16v(0);
+    const r_head = Rec{ .at = head_start, .len = w.at - head_start };
+
+    const hhea_start = w.at;
+    w.u32v(0x0001_0000);
+    w.i16v(880);
+    w.i16v(-120);
+    w.i16v(0);
+    w.u16v(600);
+    w.zeros(6);
+    w.zeros(6);
+    w.zeros(8);
+    w.i16v(0);
+    w.u16v(2);
+    const r_hhea = Rec{ .at = hhea_start, .len = w.at - hhea_start };
+
+    const hmtx_start = w.at;
+    w.u16v(600);
+    w.i16v(10);
+    w.u16v(500);
+    w.i16v(20);
+    const r_hmtx = Rec{ .at = hmtx_start, .len = w.at - hmtx_start };
+
+    const maxp_start = w.at;
+    w.u32v(0x0000_5000);
+    w.u16v(2);
+    const r_maxp = Rec{ .at = maxp_start, .len = w.at - maxp_start };
+
+    const tags: [ntables]u32 = .{ tag_cmap, tag_cff2, tag_head, tag_hhea, tag_hmtx, tag_maxp };
+    const recs: [ntables]Rec = .{ r_cmap, r_cff2, r_head, r_hhea, r_hmtx, r_maxp };
+    for (tags, recs, 0..) |t, r, i| patchRec(buf, 12 + i * 16, t, r.at, r.len);
+
+    return buf[0..w.at];
+}
+
+test "a blend in a CFF2 charstring moves with the axis coordinate" {
+    // The regression this pins: `blend` is inline-delta maths weighted by a
+    // region scalar, and a reader that ignores the store draws the BASE values
+    // -- which is the correct outline at the default instance. So the default
+    // alone proves nothing; the instance has to move the outline.
+    var buf: [4096]u8 = undefined;
+    const f = try Font.init(buildCff2BlendTestFont(&buf));
+    try std.testing.expect(f.cff.?.is_cff2);
+    try std.testing.expect(f.cff.?.var_store != null);
+
+    // gid 0 carries the blend; it starts at the same base as the plain glyph.
+    const base = (try cff.charstringBoxAt(f.cff.?, 0, &.{0})).?;
+    const peak = (try cff.charstringBoxAt(f.cff.?, 0, &.{1.0})).?;
+    const half = (try cff.charstringBoxAt(f.cff.?, 0, &.{0.5})).?;
+
+    // The region peaks at 1.0, so the +50 delta applies in full there and at
+    // half strength halfway.
+    try std.testing.expect(@abs((peak.x1 - base.x1) - 50) < 1.0);
+    try std.testing.expect(@abs((half.x1 - base.x1) - 25) < 1.0);
+
+    // And a glyph with no blend ignores the coordinate entirely, so the test
+    // cannot pass by the coordinate leaking into every glyph.
+    const plain0 = (try cff.charstringBoxAt(f.cff.?, 1, &.{0})).?;
+    const plain1 = (try cff.charstringBoxAt(f.cff.?, 1, &.{1.0})).?;
+    try std.testing.expectEqual(plain0.x1, plain1.x1);
+}
+test "a CFF2-only face loads through the ordinary entry point" {
+    // Dispatch keys off which table is present, not off the caller. Before this
+    // existed a CFF2 face loaded through `Font.init` ended at MissingTable.
+    var buf: [4096]u8 = undefined;
+    const f = try Font.init(buildCff2TestFont(&buf));
+    try std.testing.expect(f.is_cff);
+    try std.testing.expectEqual(@as(u16, 2), f.num_glyphs);
+    try std.testing.expect(f.cff.?.is_cff2);
+    try std.testing.expectEqual(@as(u16, 1), try f.glyphIndex(0x41));
+    try std.testing.expectEqual(@as(u16, 600), (try f.hMetricsResolved(0)).advance);
+
+    // CFF2 has no width operand, so a charstring's numbers are all coordinates.
+    var pts: [16]Point = undefined;
+    var ends: [8]u16 = undefined;
+    const o = try f.outline(1, &pts, &ends);
+    try std.testing.expect(o.points.len > 0);
 }
 
 test "a CFF face resolves advances without glyf composite records" {

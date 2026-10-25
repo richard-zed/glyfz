@@ -437,7 +437,6 @@ pub const Font = struct {
         }
 
         var self: Font = .{ .data = bytes };
-        self.is_cff = is_cff;
         const n = try u16At(bytes, base + 4);
 
         var i: usize = 0;
@@ -467,6 +466,18 @@ pub const Font = struct {
             if (t == tag_gvar) self.gvar_span = span;
             if (t == tag_hvar) self.hvar_span = span;
             if (t == tag_cpal) self.cpal_span = span;
+        }
+
+        // OTTO is only a hint. A face inside a `ttcf` collection carries its
+        // own table directory, and a CFF face there has no `glyf` at all, so
+        // deciding from the file magic would send it looking for one. The
+        // tables are the authority; the magic only breaks a tie.
+        if (self.cff_span.len != 0 or self.cff2_span.len != 0) {
+            self.is_cff = true;
+        } else if (self.glyf.len != 0) {
+            self.is_cff = false;
+        } else {
+            self.is_cff = is_cff;
         }
 
         const head = try self.slice(self.head);
@@ -4639,6 +4650,53 @@ test "a font collection resolves its first face" {
     const f = try Font.init(buf[0 .. 16 + face.len]);
     try std.testing.expectEqual(@as(u16, 1024), f.units_per_em);
     try std.testing.expectError(error.UnknownFontIndex, Font.initIndex(buf[0 .. 16 + face.len], 1));
+}
+
+test "a CFF face inside a collection is not sent looking for glyf" {
+    // The bug this pins: `is_cff` used to be set from the sfnt magic alone, so
+    // a `ttcf` base left it false no matter what the face contained. A CFF face
+    // there has no `glyf`, and init demanded one -> MissingTable. Every CFF
+    // collection was unloadable. The tables are the authority, not the magic.
+    var inner: [2048]u8 = undefined;
+    const face = buildTestFont(&inner, false);
+
+    var buf: [4096]u8 = undefined;
+    @memset(&buf, 0);
+    w32(buf[0..], 0, tag("ttcf"));
+    w32(buf[0..], 4, 0x0001_0000);
+    w32(buf[0..], 8, 1);
+    w32(buf[0..], 12, 16);
+    @memcpy(buf[16 .. 16 + face.len], face);
+
+    const ntab = std.mem.readInt(u16, buf[16 + 4 ..][0..2], .big);
+    var i: usize = 0;
+    var glyf_at: ?usize = null;
+    var loca_at: ?usize = null;
+    while (i < ntab) : (i += 1) {
+        const rec = 16 + 12 + i * 16;
+        w32(buf[0..], rec + 8, std.mem.readInt(u32, buf[rec + 8 ..][0..4], .big) + 16);
+        const t = buf[rec..][0..4];
+        if (std.mem.eql(u8, t, "glyf")) glyf_at = rec;
+        if (std.mem.eql(u8, t, "loca")) loca_at = rec;
+    }
+    // Retag `glyf` as `CFF ` and blank `loca`, so the face describes a CFF
+    // container instead of an outline table. The payload never gets parsed as
+    // CFF: the assertion is about WHICH BRANCH init takes.
+    try std.testing.expect(glyf_at != null and loca_at != null);
+    @memcpy(buf[glyf_at.?..][0..4], "CFF ");
+    @memcpy(buf[loca_at.?..][0..4], "zzzz");
+
+    // Now the directory has no `glyf`, which is the shape that used to fail.
+    // It must fail for a CFF reason, NOT MissingTable-on-glyf.
+    const r = Font.init(buf[0 .. 16 + face.len]);
+    if (r) |f| {
+        // If it loads, it loaded as CFF -- never as a TrueType face.
+        try std.testing.expect(f.is_cff);
+    } else |e| {
+        // A CFF container it cannot parse is CffNotSupported/BadValue/Truncated,
+        // never the "there is no glyf" path the bug took.
+        try std.testing.expect(e != error.MissingTable);
+    }
 }
 
 test "limits come from a maxp 1.0 table and are zero otherwise" {

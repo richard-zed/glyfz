@@ -425,7 +425,14 @@ pub const Font = struct {
         var is_cff = false;
         const v = try u32At(bytes, 0);
         switch (v) {
-            0x0001_0000, tag("true") => {},
+            0x0001_0000, tag("true") => {
+                // A single-face file has exactly one face, and it is face 0.
+                // Without this an index of 7 fell through to the sfnt header
+                // read below and produced an AVAILABLE face built from
+                // whatever bytes happened to follow -- a silent lie rather
+                // than a refusal.
+                if (index != 0) return error.UnknownFontIndex;
+            },
             tag("ttcf") => {
                 const count = try u32At(bytes, 8);
                 if (index >= count) return error.UnknownFontIndex;
@@ -433,7 +440,12 @@ pub const Font = struct {
             },
             // OTTO means CFF outlines. Loadable now, in both flavours: the
             // `CFF ` and `CFF2` containers are dispatched on tag below.
-            tag("OTTO") => is_cff = true,
+            tag("OTTO") => {
+                // Same one-face rule as TrueType: OTTO is not a collection
+                // unless it carries the ttcf magic, which is dispatched above.
+                if (index != 0) return error.UnknownFontIndex;
+                is_cff = true;
+            },
             else => return error.NotSfnt,
         }
 

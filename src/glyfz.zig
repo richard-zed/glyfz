@@ -6387,7 +6387,6 @@ fn buildCff2BlendTestFont(buf: []u8) []const u8 {
     w.u16v(256); // axisNameID
     const r_fvar = Rec{ .at = fvar_start, .len = w.at - fvar_start };
 
-
     const tags: [ntables]u32 = .{ tag_cmap, tag_cff2, tag_head, tag_hhea, tag_hmtx, tag_maxp, tag_fvar };
     const recs: [ntables]Rec = .{ r_cmap, r_cff2, r_head, r_hhea, r_hmtx, r_maxp, r_fvar };
     for (tags, recs, 0..) |t, r, i| patchRec(buf, 12 + i * 16, t, r.at, r.len);

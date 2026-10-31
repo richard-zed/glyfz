@@ -37,9 +37,10 @@
 //! or line breaking.
 //!
 //! GSUB beyond Arabic and Thai is ROADMAP; the README says what it needs.
-//! CFF2 is read, including `blend`/`vsindex`, but only against a face whose
-//! Top DICT carries the default instance -- a `vstore` is refused rather than
-//! drawn wrong.
+//! CFF2 is read, including `blend`/`vsindex` against an Item Variation Store.
+//! A variation store is weighted by the face's normalised coordinates, so a
+//! CFF2 face varies through `withCoords` exactly as a `glyf` face does -- the
+//! differences live in the charstring interpreter, not in the API.
 
 const std = @import("std");
 const cff = @import("cff.zig");
@@ -868,7 +869,14 @@ pub const Font = struct {
             // glyph measured is 626 segments in Source Han Serif and 459 in
             // Noto Sans CJK JP. A 256 buffered clipped 27 real CJK glyphs.
             var segs: [1024]cff.Segment = undefined;
-            const got = cff.charstring(cf, gid, &segs) catch |e| return cffGlyphError(e);
+            // A CFF2 face varies its OUTLINES, not a `gvar` delta array, so the
+            // coordinates have to reach the charstring interpreter. `gvar` never
+            // sees a CFF2 glyph, which made a vstore dead weight here: parsed,
+            // blended, and then never asked for a coordinate.
+            const got = if (cf.is_cff2 and self.n_coords != 0)
+                cff.charstringAt(cf, gid, self.coords[0..self.n_coords], &segs) catch |e| return cffGlyphError(e)
+            else
+                cff.charstring(cf, gid, &segs) catch |e| return cffGlyphError(e);
             const flat = cff.flatten(got, points, ends, 1.0) catch |e| return cffGlyphError(e);
             return .{ .points = flat.points, .ends = flat.ends };
         }
@@ -895,7 +903,10 @@ pub const Font = struct {
             // No per-glyph header exists in CFF, so the box is computed from
             // the control points. Still a declared-style integer box in font
             // units, so the bitmap sizing below is unchanged in shape.
-            const b = (cff.charstringBox(cf, gid) catch |e| return cffGlyphError(e)) orelse return null;
+            const b = (if (cf.is_cff2 and self.n_coords != 0)
+                cff.charstringBoxAt(cf, gid, self.coords[0..self.n_coords]) catch |e| return cffGlyphError(e)
+            else
+                cff.charstringBox(cf, gid) catch |e| return cffGlyphError(e)) orelse return null;
             return Box{
                 .x0 = @intFromFloat(@floor(b.x0)),
                 .y0 = @intFromFloat(@floor(b.y0)),
@@ -6177,7 +6188,7 @@ fn buildCff2TestFont(buf: []u8) []const u8 {
 /// shifted by the delta. Any other weight would make a broken scalar look
 /// correct at the default instance, which is exactly how the avar bug hid.
 fn buildCff2BlendTestFont(buf: []u8) []const u8 {
-    const ntables: usize = 6;
+    const ntables: usize = 7;
     var w = W{ .buf = buf };
 
     w.u32v(tag("OTTO"));
@@ -6355,8 +6366,30 @@ fn buildCff2BlendTestFont(buf: []u8) []const u8 {
     w.u16v(2);
     const r_maxp = Rec{ .at = maxp_start, .len = w.at - maxp_start };
 
-    const tags: [ntables]u32 = .{ tag_cmap, tag_cff2, tag_head, tag_hhea, tag_hmtx, tag_maxp };
-    const recs: [ntables]Rec = .{ r_cmap, r_cff2, r_head, r_hhea, r_hmtx, r_maxp };
+    // fvar: one weight axis, 400 default, 700 max, so a user 700 normalises to
+    // 1.0 and the region in the vstore peaks there. Without it the face has no
+    // axes, `withCoords` returns early, and the CFF2 variation path is never
+    // asked for a coordinate -- the fix would be dead code guarded by a test
+    // that never reaches it.
+    const fvar_start = w.at;
+    w.u32v(0x0001_0000);
+    w.u16v(16); // axesArrayOffset
+    w.u16v(2); // reserved
+    w.u16v(1); // axisCount
+    w.u16v(20); // axisSize
+    w.u16v(0); // instanceCount
+    w.u16v(0); // instanceSize
+    w.u32v(tag("wght"));
+    w.u32v(400 << 16); // min
+    w.u32v(400 << 16); // default
+    w.u32v(700 << 16); // max
+    w.u16v(0); // flags
+    w.u16v(256); // axisNameID
+    const r_fvar = Rec{ .at = fvar_start, .len = w.at - fvar_start };
+
+
+    const tags: [ntables]u32 = .{ tag_cmap, tag_cff2, tag_head, tag_hhea, tag_hmtx, tag_maxp, tag_fvar };
+    const recs: [ntables]Rec = .{ r_cmap, r_cff2, r_head, r_hhea, r_hmtx, r_maxp, r_fvar };
     for (tags, recs, 0..) |t, r, i| patchRec(buf, 12 + i * 16, t, r.at, r.len);
 
     return buf[0..w.at];
@@ -6388,6 +6421,42 @@ test "a blend in a CFF2 charstring moves with the axis coordinate" {
     const plain1 = (try cff.charstringBoxAt(f.cff.?, 1, &.{1.0})).?;
     try std.testing.expectEqual(plain0.x1, plain1.x1);
 }
+test "a CFF2 face at a non-default coordinate draws the blended outline" {
+    // The gap this pins: `gvar` gets the coordinates but a CFF2 glyph has no
+    // gvar entry, so the face-level variation was parsed, blended, and then
+    // never asked for. `outline` and `headerBox` both called the DEFAULT-
+    // instance charstring, which is the correct outline at wght 400 -- so a
+    // test at the default alone proves nothing at all.
+    var buf: [4096]u8 = undefined;
+    const f = try Font.init(buildCff2BlendTestFont(&buf));
+    try std.testing.expect(f.cff.?.is_cff2);
+    try std.testing.expect(f.fvar_span.len != 0);
+
+    var p0: [128]Point = undefined;
+    var e0: [16]u16 = undefined;
+    var p1: [128]Point = undefined;
+    var e1: [16]u16 = undefined;
+
+    const at_default = try f.outline(0, &p0, &e0);
+    const at_max = try f.withCoords(&.{700}).outline(0, &p1, &e1);
+
+    // gid 0 blends dx 50 -> 100, so its right edge has to move by 50 units.
+    const b0 = outlineBounds(at_default);
+    const b1 = outlineBounds(at_max);
+    // Integer font-unit box, so the 50-unit delta is exact.
+    try std.testing.expectEqual(b0.x1 + 50, b1.x1);
+    try std.testing.expectEqual(b0.y1, b1.y1);
+
+    // And the plain glyph stays put, so this cannot pass by every glyph moving.
+    var q0: [128]Point = undefined;
+    var eq0: [16]u16 = undefined;
+    var q1: [128]Point = undefined;
+    var eq1: [16]u16 = undefined;
+    const plain_default = outlineBounds(try f.outline(1, &q0, &eq0));
+    const plain_max = outlineBounds(try f.withCoords(&.{700}).outline(1, &q1, &eq1));
+    try std.testing.expectEqual(plain_default.x1, plain_max.x1);
+}
+
 test "a CFF2-only face loads through the ordinary entry point" {
     // Dispatch keys off which table is present, not off the caller. Before this
     // existed a CFF2 face loaded through `Font.init` ended at MissingTable.

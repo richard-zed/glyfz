@@ -63,7 +63,7 @@ Two properties are the whole point:
 | colour: COLRv0 layers with CPAL palettes | done |
 | Arabic and Thai shaping, over GSUB features | done |
 | hinting, COLRv1, kern formats 2/3 | out of scope |
-| CFF2 outlines | not implemented |
+| CFF2 outlines, including `blend` against a variation store | done |
 | GSUB beyond Arabic and Thai, and GSUB 1.1 FeatureVariations | not implemented |
 | GPOS beyond pair adjustment: contextual positioning, GDEF mark filtering, Device tables | out of scope |
 
@@ -132,9 +132,9 @@ does not select an italic face. `fsSelection` does that, and it is already read.
 
 ## Scope
 
-`glyf` and CFF outlines. An OTTO face is read through its `CFF ` table, and one
-that carries neither outline table -- only `CFF2`, say -- is refused rather than
-half-loaded. The reference implementation
+`glyf`, CFF and CFF2 outlines. An OTTO face is read through its `CFF ` table
+when it has one and its `CFF2` table when it does not, so a CFF2-only face
+loads; one carrying neither outline table is refused rather than half-loaded. The reference implementation
 during development was stb_truetype; **it is not vendored here**, so neither the
 differential nor the per-glyph comparison can be re-run from this repository.
 What they found is recorded below.
@@ -290,7 +290,10 @@ number of glyph-scale pairs you expect hot.
   `outline` hands back CFF curves **already flattened to line points**. The
   tolerance is one font unit, far below one device pixel at any normal size,
   but the curve data itself is not preserved.
-- CFF2 (the variable-font flavour) is still refused.
+- CFF2 (the variable-font flavour) is read, and a `blend` against an Item
+  Variation Store moves the outline with the face's coordinates. A CFF2 glyph
+  has no `gvar` entry, so its deltas live in the charstring itself; the
+  variation API is the same `withCoords` a `glyf` face uses.
 
 - **The external check is not reproducible here.** The differential and the
   comparison numbers came from a harness against stb_truetype that no longer
